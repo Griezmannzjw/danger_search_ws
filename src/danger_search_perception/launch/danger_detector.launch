@@ -1,8 +1,7 @@
 <launch>
   <arg name="config_file" default="$(find danger_search_perception)/config/default.yaml" />
 
-  <rosparam command="load" file="$(arg config_file)" />
-
   <node name="danger_detector" pkg="danger_search_perception" type="danger_detector.py" output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
   </node>
 </launch>

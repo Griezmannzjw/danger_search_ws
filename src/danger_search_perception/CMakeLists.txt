@@ -6,10 +6,14 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
   geometry_msgs
   cv_bridge
-  image_geometry
+  message_filters
   tf2_ros
+  tf2_geometry_msgs
+  image_geometry
   danger_search_common
 )
+
+catkin_python_setup()
 
 catkin_package(
   CATKIN_DEPENDS
@@ -17,8 +21,10 @@ catkin_package(
   sensor_msgs
   geometry_msgs
   cv_bridge
-  image_geometry
+  message_filters
   tf2_ros
+  tf2_geometry_msgs
+  image_geometry
   danger_search_common
 )
 
@@ -30,3 +36,7 @@ catkin_install_python(PROGRAMS
   scripts/danger_detector.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test)
+endif()
