@@ -1,0 +1,35 @@
+# 探索规划模块参数
+# 探索规划接口规范 v1.0 对齐 - move_base Action 客户端模式
+
+# 输入话题
+map_topic: /map
+pose_topic: /localization/pose
+localization_status_topic: /localization/status
+mapping_status_topic: /mapping/status
+navigation_health_topic: /navigation/health
+detections_topic: /danger_detector/detections
+detection_status_topic: /danger_detector/status
+
+# Action
+move_base_action_name: /move_base
+
+# 控制服务
+start_service: /danger_search/start_exploration
+stop_service: /danger_search/stop_exploration
+
+# 坐标系
+map_frame: map
+
+# 探索参数（首版随机游走占位）
+replan_interval: 3.0
+goal_reach_timeout: 30.0
+coverage_threshold: 0.95
+
+# 返航点（出发点）
+home_x: 0.0
+home_y: 0.0
+home_yaw: 0.0
+
+# 随机游走范围（首版占位）
+random_range_x: 5.0
+random_range_y: 5.0

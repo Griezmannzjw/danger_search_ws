@@ -1,0 +1,61 @@
+# 全局参数配置
+# 探索规划接口规范 v1.0 对齐
+
+# 坐标系
+map_frame: map
+odom_frame: odom
+base_frame: base
+
+# 当前楼层（首版单楼层）
+current_floor: 0
+
+# 出发点（世界坐标系原点）
+home_position:
+  x: 0.0
+  y: 0.0
+  z: 0.0
+  yaw: 0.0
+
+# 传感器话题（来自 SimEnv）
+topics:
+  lidar: /livox/Pointcloud2
+  lidar_raw: /scan
+  trunk_imu: /trunk_imu
+  livox_imu: /livox/imu
+  rgb_image: /real_sense/rgb/image_raw
+  depth_image: /real_sense/depth/image_raw
+  rgb_camera_info: /real_sense/rgb/camera_info
+  cmd_vel: /cmd_vel
+
+# 内部话题（按探索规范统一命名）
+internal_topics:
+  # 定位建图
+  pose: /localization/pose
+  localization_status: /localization/status
+  map: /map
+  mapping_status: /mapping/status
+  current_floor: /mapping/current_floor
+  # 导航
+  move_base_action: /move_base
+  nav_cmd_vel: /danger_search/nav_cmd_vel
+  navigation_path: /navigation/path
+  navigation_health: /navigation/health
+  # 感知
+  detections: /danger_detector/detections
+  detection_status: /danger_detector/status
+  # 任务
+  mission_status: /mission/status
+  mission_active: /mission/active
+
+# 控制参数
+control:
+  cmd_timeout: 0.5
+  max_accel_linear: 1.0
+  max_accel_angular: 2.0
+  output_rate: 50
+
+# 任务参数
+mission:
+  exploration_timeout: 600.0
+  dedup_distance: 0.8
+  result_file: results/detected_danger.json

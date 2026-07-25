@@ -1,0 +1,8 @@
+<launch>
+  <arg name="config_file" default="$(find danger_search_localization)/config/default.yaml" />
+
+  <rosparam command="load" file="$(arg config_file)" />
+
+  <node name="pose_estimator" pkg="danger_search_localization" type="pose_estimator.py" output="screen">
+  </node>
+</launch>

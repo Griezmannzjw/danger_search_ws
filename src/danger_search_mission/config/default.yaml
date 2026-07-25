@@ -1,0 +1,35 @@
+# 任务总控模块参数
+# 探索规划接口规范 v1.0 对齐
+
+# 输入话题
+detections_topic: /danger_detector/detections
+mapping_status_topic: /mapping/status
+navigation_health_topic: /navigation/health
+
+# 输出话题
+status_topic: /mission/status
+active_topic: /mission/active
+
+# 服务
+start_service: /danger_search/start
+finish_service: /danger_search/finish
+return_home_service: /danger_search/return_home
+start_exploration_service: /danger_search/start_exploration
+stop_exploration_service: /danger_search/stop_exploration
+
+# Action
+move_base_action_name: /move_base
+
+# 坐标系
+map_frame: map
+
+# 任务参数
+exploration_timeout: 600.0
+dedup_distance_threshold: 0.8
+min_detections_to_confirm: 2
+result_file: results/detected_danger.json
+
+# 返航点
+home_x: 0.0
+home_y: 0.0
+home_yaw: 0.0

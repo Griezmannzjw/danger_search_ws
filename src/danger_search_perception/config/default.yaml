@@ -1,0 +1,52 @@
+# 危险源检测模块参数
+# 探索规划接口规范 v1.0 对齐
+
+# 传感器话题
+rgb_topic: /real_sense/rgb/image_raw
+depth_topic: /real_sense/depth/image_raw
+camera_info_topic: /real_sense/rgb/camera_info
+camera_frame: real_sense
+
+# 目标坐标系（输出坐标）
+target_frame: map
+
+# 输出话题
+detections_topic: /danger_detector/detections
+status_topic: /danger_detector/status
+
+# 红色球体检测参数
+red_h_low_1: 0
+red_h_high_1: 10
+red_h_low_2: 170
+red_h_high_2: 180
+red_s_low: 120
+red_v_low: 80
+
+# 形态学操作
+morph_open_ksize: 3
+morph_close_ksize: 5
+
+# 过滤参数
+min_blob_area: 50
+max_blob_area: 100000
+min_circularity: 0.5
+
+# 深度过滤
+min_depth_m: 0.4
+max_depth_m: 8.0
+
+# 发布频率
+publish_rate: 10
+status_publish_rate: 5
+
+# 感知能力参数（供探索模块规划使用）
+capability:
+  horizontal_fov: 69.4       # RealSense D415 水平视场角（度）
+  vertical_fov: 42.5         # 垂直视场角（度）
+  reliable_min_range: 0.4    # 可靠检测最近距离 (m)
+  reliable_max_range: 5.0    # 可靠检测最远距离 (m)
+  observable_height_min: 0.0 # 可观测目标最小高度 (m)
+  observable_height_max: 2.0 # 可观测目标最大高度 (m)
+  required_stable_duration: 0.3  # 需要稳定观察时间 (s)
+  max_scan_angular_speed: 0.5    # 最大扫描角速度 (rad/s)
+  capability_version: 1

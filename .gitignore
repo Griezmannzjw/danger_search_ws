@@ -1,0 +1,44 @@
+# Build & Devel
+build/
+devel/
+install/
+logs/
+
+# ROS
+*.bag
+*.bag.active
+*.rosinstall
+.rosinstall
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.so.*
+
+# Generated scenes (SimEnv style)
+generated_building/
+results/*.json
+!results/.gitkeep
+
+# Logs
+*.log

@@ -1,0 +1,5 @@
+# 开始任务请求（空）
+---
+# 开始任务响应
+bool success
+string message

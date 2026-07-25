@@ -1,0 +1,25 @@
+<launch>
+  <!-- 危险源自主搜索系统 - 完整启动文件 -->
+  <!-- 探索规划接口规范 v1.0 对齐 -->
+
+  <!-- 全局参数 -->
+  <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
+
+  <!-- 1. 定位与建图模块 -->
+  <include file="$(find danger_search_localization)/launch/localization.launch" />
+
+  <!-- 2. 危险源感知模块 -->
+  <include file="$(find danger_search_perception)/launch/danger_detector.launch" />
+
+  <!-- 3. 导航控制模块 (move_base Action 服务器) -->
+  <include file="$(find danger_search_navigation)/launch/navigation.launch" />
+
+  <!-- 4. 探索规划模块 (move_base Action 客户端) -->
+  <include file="$(find danger_search_exploration)/launch/exploration.launch" />
+
+  <!-- 5. 控制执行与安全模块 -->
+  <include file="$(find danger_search_control)/launch/cmd_mux.launch" />
+
+  <!-- 6. 任务总控模块 -->
+  <include file="$(find danger_search_mission)/launch/mission.launch" />
+</launch>

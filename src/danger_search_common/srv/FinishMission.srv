@@ -1,0 +1,7 @@
+# 结束任务请求（空）
+---
+# 结束任务响应
+bool success
+string message
+int32 detected_count    # 检测到的危险源数量
+float32 exploration_time # 探索耗时（秒）

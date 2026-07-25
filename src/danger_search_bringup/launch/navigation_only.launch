@@ -1,0 +1,7 @@
+<launch>
+  <!-- 仅启动导航+定位模块（调试用） -->
+  <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
+  <include file="$(find danger_search_localization)/launch/localization.launch" />
+  <include file="$(find danger_search_navigation)/launch/navigation.launch" />
+  <include file="$(find danger_search_control)/launch/cmd_mux.launch" />
+</launch>
