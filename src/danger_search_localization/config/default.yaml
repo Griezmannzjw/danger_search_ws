@@ -1,39 +1,26 @@
 # 定位与建图模块参数
-# 探索规划接口规范 v1.0 对齐
-
-# 输入话题
-imu_topic: /trunk_imu
-cmd_vel_topic: /danger_search/cmd_vel_sent
-pointcloud_topic: /livox/Pointcloud2
-
-# 输出话题
-pose_topic: /localization/pose
-status_topic: /localization/status
-map_topic: /map
-mapping_status_topic: /mapping/status
-current_floor_topic: /mapping/current_floor
+# 对齐接口规范 v1.1-p0
 
 # 坐标系
 map_frame: map
 odom_frame: odom
 base_frame: base
+world_frame: world
 
-# 航位推算参数（首版占位，SLAM接入后替换）
-initial_x: 0.0
-initial_y: 0.0
-initial_yaw: 0.0
+# 话题
+map_topic: /map
+pose_topic: /localization/pose
+mapping_status_topic: /mapping/status
+lidar_topic: /livox/Pointcloud2
+imu_topic: /trunk_imu
 
-# 状态发布频率
-pose_publish_rate: 50
-status_publish_rate: 10
-map_publish_rate: 1
+# 地图参数
+map_resolution: 0.05      # 5cm分辨率
+map_width: 400            # 20m
+map_height: 720           # 36m
+map_origin_x: -10.0       # 地图原点X
+map_origin_y: -18.0       # 地图原点Y
 
-# 地图参数（首版占位）
-map_resolution: 0.05
-map_width: 800
-map_height: 800
-map_origin_x: -20.0
-map_origin_y: -20.0
-
-# 当前楼层（首版单楼层）
-current_floor: 0
+# 激光参数
+lidar_max_range: 5.0
+lidar_min_range: 0.1

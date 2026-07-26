@@ -1,208 +1,312 @@
 #!/usr/bin/env python3
 """
-位姿估计与建图节点
-对齐探索规划接口规范 v1.0
+定位与建图节点 - P0最小可运行版本
+对齐接口规范 v1.1-p0
 
-首版：简易航位推算 + 占位地图
-升级路线：FAST-LIO / Cartographer / GMapping
+功能：
+  1. IMU积分航位推算（不用cmd_vel_sent作为正式里程计）
+  2. 基于Livox激光的2D占据栅格地图构建
+  3. 发布完整TF链: world -> map -> odom -> base
+  4. 发布带协方差位姿 /localization/pose
+  5. 发布占据地图 /map
+  6. 发布建图状态 /mapping/status
 
-输出：
-  - /localization/pose (PoseWithCovarianceStamped) 带协方差位姿
-  - /localization/status (LocalizationStatus) 定位健康状态
-  - /map (nav_msgs/OccupancyGrid) 栅格地图
-  - /mapping/status (MappingStatus) 建图状态
-  - /mapping/current_floor (std_msgs/Int32) 当前楼层
-  - TF: map -> odom -> base
+P0要求：
+  - 唯一发布map->odom->base TF
+  - 地图必须有可用于选点的已知自由区域（不能全未知）
+  - 定位基于IMU和激光传感器，不用cmd_vel作为正式里程计
+  - 所有话题名从参数读取
 """
 
 import rospy
-import tf2_ros
-import math
 import numpy as np
-from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped, Twist
-from sensor_msgs.msg import Imu
-from nav_msgs.msg import OccupancyGrid
-from std_msgs.msg import Int32
-from danger_search_common.msg import LocalizationStatus, MappingStatus, FloorMapInfo
+import tf2_ros
+import tf.transformations
+from sensor_msgs.msg import Imu, PointCloud2, PointField
+from nav_msgs.msg import OccupancyGrid, Odometry
+from geometry_msgs.msg import (
+    PoseWithCovarianceStamped, Pose, Point, Quaternion,
+    TransformStamped, Vector3
+)
+from std_msgs.msg import Header, Int32
+from danger_search_common.msg import MappingStatus
+import sensor_msgs.point_cloud2 as pc2
 
 
-class PoseEstimator:
+class LocalizationNode:
     def __init__(self):
         rospy.init_node("pose_estimator", anonymous=False)
 
-        # 参数
-        self.imu_topic = rospy.get_param("~imu_topic", "/trunk_imu")
-        self.cmd_vel_topic = rospy.get_param("~cmd_vel_topic", "/danger_search/cmd_vel_sent")
-        self.pose_topic = rospy.get_param("~pose_topic", "/localization/pose")
-        self.status_topic = rospy.get_param("~status_topic", "/localization/status")
-        self.map_topic = rospy.get_param("~map_topic", "/map")
-        self.mapping_status_topic = rospy.get_param("~mapping_status_topic", "/mapping/status")
-        self.current_floor_topic = rospy.get_param("~current_floor_topic", "/mapping/current_floor")
+        # ========== 从参数读取所有话题名 ==========
         self.map_frame = rospy.get_param("~map_frame", "map")
         self.odom_frame = rospy.get_param("~odom_frame", "odom")
         self.base_frame = rospy.get_param("~base_frame", "base")
-        self.pose_rate = rospy.get_param("~pose_publish_rate", 50)
-        self.current_floor = rospy.get_param("~current_floor", 0)
+        self.world_frame = rospy.get_param("~world_frame", "world")
 
-        # 状态
-        self.x = rospy.get_param("~initial_x", 0.0)
-        self.y = rospy.get_param("~initial_y", 0.0)
-        self.yaw = rospy.get_param("~initial_yaw", 0.0)
+        self.map_topic = rospy.get_param("~map_topic", "/map")
+        self.pose_topic = rospy.get_param("~pose_topic", "/localization/pose")
+        self.mapping_status_topic = rospy.get_param("~mapping_status_topic", "/mapping/status")
+
+        # 传感器话题
+        self.lidar_topic = rospy.get_param("~lidar_topic", "/livox/Pointcloud2")
+        self.imu_topic = rospy.get_param("~imu_topic", "/trunk_imu")
+
+        # 地图参数
+        self.map_resolution = rospy.get_param("~map_resolution", 0.05)  # 5cm
+        self.map_width = rospy.get_param("~map_width", 400)  # 20m
+        self.map_height = rospy.get_param("~map_height", 720)  # 36m
+        self.map_origin_x = rospy.get_param("~map_origin_x", -10.0)
+        self.map_origin_y = rospy.get_param("~map_origin_y", -18.0)
+        self.lidar_max_range = rospy.get_param("~lidar_max_range", 5.0)
+        self.lidar_min_range = rospy.get_param("~lidar_min_range", 0.1)
+
+        # ========== 状态 ==========
+        # 位姿: x, y, yaw (odom->base)
+        self.x = 0.0
+        self.y = 0.0
+        self.yaw = 0.0
         self.vx = 0.0
-        self.vyaw = 0.0
+        self.vy = 0.0
+        self.last_imu_time = None
 
-        self.last_time = rospy.Time.now()
-        self.last_cmd_time = rospy.Time.now()
-        self.correction_version = 0
-        self.last_stable_time = rospy.Time.now()
+        # 地图: -1=未知, 0=自由, 100=占用
+        self.map_data = np.full((self.map_height, self.map_width), -1, dtype=np.int8)
+        # 机器人周围标记为自由区域（出发点附近）
+        self._init_free_area()
 
-        # TF发布
+        # 建图状态
+        self.mapping_ready = False
+        self.mapping_stable = False
+        self.mapping_lost = False
+        self.current_floor = 0
+
+        # ========== TF发布器 ==========
         self.tf_broadcaster = tf2_ros.TransformBroadcaster()
         self.tf_static_broadcaster = tf2_ros.StaticTransformBroadcaster()
 
-        # 发布者
-        self.pose_pub = rospy.Publisher(self.pose_topic, PoseWithCovarianceStamped, queue_size=10)
-        self.status_pub = rospy.Publisher(self.status_topic, LocalizationStatus, queue_size=10, latch=True)
-        self.map_pub = rospy.Publisher(self.map_topic, OccupancyGrid, queue_size=1, latch=True)
-        self.mapping_status_pub = rospy.Publisher(self.mapping_status_topic, MappingStatus, queue_size=10, latch=True)
-        self.floor_pub = rospy.Publisher(self.current_floor_topic, Int32, queue_size=10, latch=True)
+        # 发布world->map静态TF（首版重合，出发点为原点）
+        self._publish_world_to_map()
 
-        # 订阅者
-        self.imu_sub = rospy.Subscriber(self.imu_topic, Imu, self.imu_callback)
-        self.cmd_vel_sub = rospy.Subscriber(self.cmd_vel_topic, Twist, self.cmd_vel_callback)
+        # ========== 发布者 ==========
+        self.pose_pub = rospy.Publisher(
+            self.pose_topic, PoseWithCovarianceStamped, queue_size=10
+        )
+        self.map_pub = rospy.Publisher(
+            self.map_topic, OccupancyGrid, queue_size=1, latch=True
+        )
+        self.status_pub = rospy.Publisher(
+            self.mapping_status_topic, MappingStatus, queue_size=10, latch=True
+        )
 
-        # 定时器
-        self.pose_timer = rospy.Timer(rospy.Duration(1.0 / self.pose_rate), self.publish_pose)
-        self.status_timer = rospy.Timer(rospy.Duration(0.1), self.publish_status)
-        self.map_timer = rospy.Timer(rospy.Duration(1.0), self.publish_map)
+        # ========== 订阅者 ==========
+        self.imu_sub = rospy.Subscriber(
+            self.imu_topic, Imu, self.imu_callback, queue_size=100
+        )
+        self.lidar_sub = rospy.Subscriber(
+            self.lidar_topic, PointCloud2, self.lidar_callback, queue_size=5
+        )
 
-        # 发布静态TF: map -> odom
-        self._publish_static_map_odom()
+        # ========== 定时器 ==========
+        self.pose_timer = rospy.Timer(rospy.Duration(0.05), self.publish_pose)  # 20Hz
+        self.map_timer = rospy.Timer(rospy.Duration(1.0), self.publish_map)  # 1Hz
+        self.status_timer = rospy.Timer(rospy.Duration(0.5), self.publish_status)  # 2Hz
 
-        # 发布初始楼层
-        self.floor_pub.publish(Int32(data=self.current_floor))
+        rospy.loginfo("[localization] P0 localization node started")
+        rospy.loginfo(f"[localization] map frame: {self.map_frame}, odom frame: {self.odom_frame}")
 
-        rospy.loginfo("[localization] pose_estimator started (skeleton: dead reckoning)")
-        rospy.loginfo("[localization] Output: %s, %s, %s", self.pose_topic, self.status_topic, self.map_topic)
+    def _init_free_area(self):
+        """初始化出发点周围为自由区域，确保有可用于选点的已知区域"""
+        cx = int((0 - self.map_origin_x) / self.map_resolution)
+        cy = int((0 - self.map_origin_y) / self.map_resolution)
+        radius = int(2.0 / self.map_resolution)  # 2m半径
+        for i in range(-radius, radius + 1):
+            for j in range(-radius, radius + 1):
+                if i*i + j*j <= radius*radius:
+                    mx = cx + i
+                    my = cy + j
+                    if 0 <= mx < self.map_width and 0 <= my < self.map_height:
+                        self.map_data[my, mx] = 0
 
-    def _publish_static_map_odom(self):
+    def _publish_world_to_map(self):
+        """发布world->map静态TF（首版world和map重合，出发点为原点）"""
         t = TransformStamped()
         t.header.stamp = rospy.Time.now()
-        t.header.frame_id = self.map_frame
-        t.child_frame_id = self.odom_frame
-        t.transform.translation.x = 0.0
-        t.transform.translation.y = 0.0
-        t.transform.translation.z = 0.0
-        t.transform.rotation.w = 1.0
+        t.header.frame_id = self.world_frame
+        t.child_frame_id = self.map_frame
+        t.transform.translation = Vector3(0, 0, 0)
+        t.transform.rotation = Quaternion(0, 0, 0, 1)
         self.tf_static_broadcaster.sendTransform(t)
 
     def imu_callback(self, msg):
-        self.vyaw = msg.angular_velocity.z
+        """IMU回调：角速度积分更新航向，加速度积分更新位置"""
+        if self.last_imu_time is None:
+            self.last_imu_time = msg.header.stamp
+            return
 
-    def cmd_vel_callback(self, msg):
-        self.vx = msg.linear.x
-        self.last_cmd_time = rospy.Time.now()
+        dt = (msg.header.stamp - self.last_imu_time).to_sec()
+        if dt <= 0 or dt > 0.1:
+            self.last_imu_time = msg.header.stamp
+            return
 
-    def _integrate(self):
+        # 角速度积分更新航向 (只取yaw角速度)
+        # IMU在trunk坐标系，首版假设近似水平
+        self.yaw += msg.angular_velocity.z * dt
+
+        # 简单加速度积分（去除重力）
+        ax = msg.linear_acceleration.x
+        ay = msg.linear_acceleration.y
+
+        # 转换到odom坐标系
+        cos_yaw = np.cos(self.yaw)
+        sin_yaw = np.sin(self.yaw)
+        ax_world = ax * cos_yaw - ay * sin_yaw
+        ay_world = ax * sin_yaw + ay * cos_yaw
+
+        # 简单积分（会漂移，但P0够用）
+        self.vx += ax_world * dt
+        self.vy += ay_world * dt
+        # 简单速度衰减（模拟摩擦，防止无限漂移）
+        self.vx *= 0.95
+        self.vy *= 0.95
+
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+
+        self.last_imu_time = msg.header.stamp
+
+        # 收到IMU数据后标记为就绪
+        if not self.mapping_ready:
+            self.mapping_ready = True
+            self.mapping_stable = True
+            rospy.loginfo("[localization] Localization ready")
+
+    def lidar_callback(self, msg):
+        """激光点云回调：更新2D占据栅格地图"""
+        if not self.mapping_ready:
+            return
+
+        cos_yaw = np.cos(self.yaw)
+        sin_yaw = np.sin(self.yaw)
+
+        # 机器人在地图中的像素坐标
+        robot_cx = int((self.x - self.map_origin_x) / self.map_resolution)
+        robot_cy = int((self.y - self.map_origin_y) / self.map_resolution)
+
+        # 遍历点云
+        for point in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
+            px, py, pz = point
+
+            # 只取一定高度范围内的点（地面以上）
+            if pz < -0.1 or pz > 1.0:
+                continue
+
+            dist = np.sqrt(px*px + py*py)
+            if dist < self.lidar_min_range or dist > self.lidar_max_range:
+                continue
+
+            # 转换到odom坐标系
+            world_x = self.x + px * cos_yaw - py * sin_yaw
+            world_y = self.y + px * sin_yaw + py * cos_yaw
+
+            # 转换到像素坐标
+            mx = int((world_x - self.map_origin_x) / self.map_resolution)
+            my = int((world_y - self.map_origin_y) / self.map_resolution)
+
+            if 0 <= mx < self.map_width and 0 <= my < self.map_height:
+                # 射线投射：从机器人到点之间标记为自由
+                self._ray_cast(robot_cx, robot_cy, mx, my)
+                # 终点标记为占用
+                self.map_data[my, mx] = 100
+
+    def _ray_cast(self, x0, y0, x1, y1):
+        """Bresenham直线算法，标记射线经过的格子为自由"""
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+
+        x, y = x0, y0
+        while True:
+            if 0 <= x < self.map_width and 0 <= y < self.map_height:
+                if self.map_data[y, x] == -1 or self.map_data[y, x] == 100:
+                    self.map_data[y, x] = 0
+            if x == x1 and y == y1:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+
+    def publish_pose(self, event=None):
+        """发布位姿和TF"""
         now = rospy.Time.now()
-        dt = (now - self.last_time).to_sec()
-        self.last_time = now
-        if dt > 0 and dt < 0.1:
-            self.x += self.vx * math.cos(self.yaw) * dt
-            self.y += self.vx * math.sin(self.yaw) * dt
-            self.yaw += self.vyaw * dt
 
-    def publish_pose(self, event):
-        self._integrate()
-        now = rospy.Time.now()
-
-        # odom -> base TF
+        # 1. 发布odom->base TF
         t = TransformStamped()
         t.header.stamp = now
         t.header.frame_id = self.odom_frame
         t.child_frame_id = self.base_frame
-        t.transform.translation.x = self.x
-        t.transform.translation.y = self.y
-        t.transform.translation.z = 0.0
-        t.transform.rotation.z = math.sin(self.yaw / 2)
-        t.transform.rotation.w = math.cos(self.yaw / 2)
+        t.transform.translation = Vector3(self.x, self.y, 0.0)
+        q = tf.transformations.quaternion_from_euler(0, 0, self.yaw)
+        t.transform.rotation = Quaternion(*q)
         self.tf_broadcaster.sendTransform(t)
 
-        # 带协方差位姿
-        pose = PoseWithCovarianceStamped()
-        pose.header.stamp = now
-        pose.header.frame_id = self.map_frame
-        pose.pose.pose.position.x = self.x
-        pose.pose.pose.position.y = self.y
-        pose.pose.pose.position.z = 0.0
-        pose.pose.pose.orientation = t.transform.rotation
+        # 2. 发布map->odom TF（首版重合）
+        t_map = TransformStamped()
+        t_map.header.stamp = now
+        t_map.header.frame_id = self.map_frame
+        t_map.child_frame_id = self.odom_frame
+        t_map.transform.translation = Vector3(0, 0, 0)
+        t_map.transform.rotation = Quaternion(0, 0, 0, 1)
+        self.tf_broadcaster.sendTransform(t_map)
 
-        cov = np.zeros(36)
-        cov[0] = 0.05   # x
-        cov[7] = 0.05   # y
-        cov[14] = 0.1   # z
-        cov[21] = 0.01  # rx
-        cov[28] = 0.01  # ry
-        cov[35] = 0.1   # rz
-        pose.pose.covariance = cov.tolist()
+        # 3. 发布PoseWithCovarianceStamped
+        pose_msg = PoseWithCovarianceStamped()
+        pose_msg.header.stamp = now
+        pose_msg.header.frame_id = self.map_frame
+        pose_msg.pose.pose = Pose(
+            position=Point(self.x, self.y, 0.0),
+            orientation=Quaternion(*q)
+        )
+        # 保守协方差（P0占位）
+        cov = [0.0] * 36
+        cov[0] = 0.1   # x
+        cov[7] = 0.1   # y
+        cov[35] = 0.1  # yaw
+        pose_msg.pose.covariance = cov
+        self.pose_pub.publish(pose_msg)
 
-        self.pose_pub.publish(pose)
+    def publish_map(self, event=None):
+        """发布占据栅格地图"""
+        msg = OccupancyGrid()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = self.map_frame
+        msg.info.resolution = self.map_resolution
+        msg.info.width = self.map_width
+        msg.info.height = self.map_height
+        msg.info.origin.position.x = self.map_origin_x
+        msg.info.origin.position.y = self.map_origin_y
+        msg.info.origin.orientation.w = 1.0
+        msg.data = self.map_data.flatten().tolist()
+        self.map_pub.publish(msg)
 
-    def publish_status(self, event):
-        """发布定位状态"""
-        status = LocalizationStatus()
-        status.header.stamp = rospy.Time.now()
-        status.header.frame_id = self.map_frame
-        status.tracking_state = LocalizationStatus.STATE_TRACKING
-        status.pose_covariance_trace = 0.2
-        status.drift_warning = False
-        status.drift_rate_linear = 0.0
-        status.drift_rate_angular = 0.0
-        status.pose_jump_detected = False
-        status.last_correction_translation = 0.0
-        status.last_correction_rotation = 0.0
-        status.correction_version = self.correction_version
-        status.relocalization_event_id = ""
-        status.last_stable_time = self.last_stable_time
-        status.status_reason = "skeleton dead reckoning, SLAM TBD"
-        self.status_pub.publish(status)
-
-    def publish_map(self, event):
-        """发布建图状态和占位地图"""
-        now = rospy.Time.now()
-
-        # 建图状态
-        map_status = MappingStatus()
-        map_status.header.stamp = now
-        map_status.ready = True
-        map_status.stable = True
-        map_status.lost = False
-        map_status.current_floor = self.current_floor
-
-        floor_info = FloorMapInfo()
-        floor_info.floor_id = self.current_floor
-        floor_info.map_version = 1
-        floor_info.last_update = now
-        map_status.floor_maps = [floor_info]
-        map_status.status_reason = "skeleton empty map, SLAM TBD"
-        self.mapping_status_pub.publish(map_status)
-
-        # 占位地图（全未知）
-        grid = OccupancyGrid()
-        grid.header.stamp = now
-        grid.header.frame_id = self.map_frame
-        res = rospy.get_param("~map_resolution", 0.05)
-        width = rospy.get_param("~map_width", 800)
-        height = rospy.get_param("~map_height", 800)
-        grid.info.resolution = res
-        grid.info.width = width
-        grid.info.height = height
-        grid.info.origin.position.x = rospy.get_param("~map_origin_x", -20.0)
-        grid.info.origin.position.y = rospy.get_param("~map_origin_y", -20.0)
-        grid.info.origin.position.z = 0.0
-        grid.info.origin.orientation.w = 1.0
-        grid.data = [-1] * (width * height)
-        self.map_pub.publish(grid)
+    def publish_status(self, event=None):
+        """发布建图状态"""
+        msg = MappingStatus()
+        msg.header.stamp = rospy.Time.now()
+        msg.ready = self.mapping_ready
+        msg.stable = self.mapping_stable
+        msg.lost = self.mapping_lost
+        msg.current_floor = self.current_floor
+        if not self.mapping_ready:
+            msg.status_reason = "WAITING_FOR_IMU"
+        else:
+            msg.status_reason = "OK"
+        self.status_pub.publish(msg)
 
     def run(self):
         rospy.spin()
@@ -210,7 +314,7 @@ class PoseEstimator:
 
 if __name__ == "__main__":
     try:
-        node = PoseEstimator()
+        node = LocalizationNode()
         node.run()
     except rospy.ROSInterruptException:
         pass

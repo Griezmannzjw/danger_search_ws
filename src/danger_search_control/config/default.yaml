@@ -1,23 +1,16 @@
 # 控制执行层参数
+# 对齐接口规范 v1.1-p0
 
-# 输入话题
+# 话题
 nav_cmd_topic: /danger_search/nav_cmd_vel
-
-# 输出话题
 output_cmd_topic: /cmd_vel
-sent_cmd_topic: /danger_search/cmd_vel_sent
+safety_stop_topic: /danger_search/safety_stop
 
-# 安全监控
+# 安全参数
 enable_safety: true
-cmd_timeout_s: 0.5           # 速度指令超时时间（秒），超时自动停车
-max_linear_accel: 1.0        # 最大线加速度 m/s^2
-max_angular_accel: 2.0       # 最大角加速度 rad/s^2
-
-# 优先级
-# 数字越大优先级越高，高优先级可以抢占低优先级
-priority_nav: 10
-priority_safety: 100
-priority_manual: 50
+cmd_timeout_s: 0.5
+max_linear_accel: 1.0
+max_angular_accel: 2.0
 
 # 控制频率
 output_rate: 50

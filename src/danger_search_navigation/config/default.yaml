@@ -1,36 +1,26 @@
 # 导航控制模块参数
-# 探索规划接口规范 v1.0 对齐 - move_base Action 模式
-
-# 输入话题
-pose_topic: /localization/pose
-map_topic: /map
-pointcloud_topic: /livox/Pointcloud2
-
-# Action & 服务
-move_base_action_name: /move_base
-make_plan_service: /move_base/make_plan
-clear_costmaps_service: /move_base/clear_costmaps
-
-# 输出话题
-cmd_vel_topic: /danger_search/nav_cmd_vel
-path_topic: /navigation/path
-health_topic: /navigation/health
+# 对齐接口规范 v1.1-p0
 
 # 坐标系
 map_frame: map
 base_frame: base
 
+# 话题和服务
+cmd_vel_topic: /danger_search/nav_cmd_vel
+pose_topic: /localization/pose
+map_topic: /map
+health_topic: /navigation/health
+move_base_action_name: /move_base
+make_plan_service: /move_base/make_plan
+clear_costmaps_service: /move_base/clear_costmaps
+
 # 控制参数
-max_linear_speed: 0.8
-max_angular_speed: 1.0
-linear_gain: 0.8
-angular_gain: 1.5
-goal_tolerance_xy: 0.15
+linear_kp: 0.5
+angular_kp: 1.5
+max_linear_speed: 0.3
+max_angular_speed: 0.8
+goal_tolerance_xy: 0.3
 goal_tolerance_yaw: 0.2
-control_rate: 20
-
-# 避障参数（首版占位）
-obstacle_safety_dist: 0.5
-
-# 超时
-goal_timeout: 30.0
+goal_timeout: 60.0
+stuck_threshold: 5.0
+control_rate: 20.0

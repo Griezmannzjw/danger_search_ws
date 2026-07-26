@@ -1,183 +1,273 @@
 #!/usr/bin/env python3
 """
-探索规划节点 - move_base Action 客户端
-对齐探索规划接口规范 v1.0
+探索规划节点 - P0最小可运行版本
+对齐接口规范 v1.1-p0
 
-首版：随机游走占位
-升级路线：前沿点检测 + 信息增益评估 + 房间覆盖规划
+功能：
+  - move_base Action客户端
+  - 在地图自由区域随机选点
+  - 发目标前严格检查所有条件
+  - 失败不无限重试
+  - stop时取消目标
 
-输入：
-  - /map (OccupancyGrid)
-  - /localization/pose (PoseWithCovarianceStamped)
-  - /localization/status (LocalizationStatus)
-  - /mapping/status (MappingStatus)
-  - /navigation/health (NavigationHealth)
-  - /danger_detector/detections (DangerSourceArray)
-  - /danger_detector/status (DetectionStatus)
-
-输出：
-  - /move_base Action 目标
-  - 服务: /danger_search/start_exploration, /danger_search/stop_exploration
+P0要求：
+  - 所有名称从参数读取
+  - 只有满足所有条件才发目标
+  - 目标必须在自由区域，make_plan返回非空路径
+  - 失败候选不立即无限重试
+  - stop时必须取消活动目标
 """
 
 import rospy
 import actionlib
 import random
 import math
+import numpy as np
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from std_srvs.srv import Trigger, TriggerResponse
-from danger_search_common.msg import (
-    LocalizationStatus, MappingStatus, NavigationHealth,
-    DangerSourceArray, DetectionStatus
-)
+from nav_msgs.srv import GetPlan
+from danger_search_common.msg import MappingStatus, NavigationHealth
 
 
 class ExplorationPlanner:
     def __init__(self):
         rospy.init_node("exploration_planner", anonymous=False)
 
-        # 参数
-        self.move_base_action = rospy.get_param("~move_base_action_name", "/move_base")
+        # ========== 从参数读取所有名称 ==========
         self.map_frame = rospy.get_param("~map_frame", "map")
-        self.replan_interval = rospy.get_param("~replan_interval", 3.0)
-        self.home_x = rospy.get_param("~home_x", 0.0)
-        self.home_y = rospy.get_param("~home_y", 0.0)
-        self.random_range_x = rospy.get_param("~random_range_x", 5.0)
-        self.random_range_y = rospy.get_param("~random_range_y", 5.0)
 
-        # 状态
+        self.map_topic = rospy.get_param("~map_topic", "/map")
+        self.pose_topic = rospy.get_param("~pose_topic", "/localization/pose")
+        self.mapping_status_topic = rospy.get_param("~mapping_status_topic", "/mapping/status")
+        self.navigation_health_topic = rospy.get_param("~navigation_health_topic", "/navigation/health")
+        self.move_base_action_name = rospy.get_param("~move_base_action_name", "/move_base")
+        self.make_plan_service = rospy.get_param("~make_plan_service", "/move_base/make_plan")
+        self.start_service = rospy.get_param("~start_service", "/danger_search/start_exploration")
+        self.stop_service = rospy.get_param("~stop_service", "/danger_search/stop_exploration")
+
+        # 探索参数
+        self.goal_interval = rospy.get_param("~goal_interval", 2.0)
+        self.max_retry = rospy.get_param("~max_retry", 3)
+        self.min_goal_dist = rospy.get_param("~min_goal_dist", 2.0)
+        self.max_goal_dist = rospy.get_param("~max_goal_dist", 8.0)
+
+        # ========== 状态 ==========
         self.exploring = False
         self.current_pose = None
         self.current_map = None
-        self.loc_status = None
-        self.map_status = None
-        self.nav_health = None
-        self.det_status = None
+        self.map_info = None
+        self.map_data = None
+        self.mapping_ready = False
+        self.mapping_stable = False
+        self.mapping_lost = True
+        self.nav_ready = False
+        self.waiting_for_result = False
+        self.retry_count = 0
         self.last_goal_time = rospy.Time(0)
-        self.goal_active = False
 
-        # Action 客户端
+        # ========== Action客户端 ==========
         self.move_base_client = actionlib.SimpleActionClient(
-            self.move_base_action, MoveBaseAction
+            self.move_base_action_name, MoveBaseAction
         )
-        rospy.loginfo("[exploration] Waiting for move_base action server...")
-        server_found = self.move_base_client.wait_for_server(rospy.Duration(2.0))
-        if server_found:
-            rospy.loginfo("[exploration] move_base action server connected")
-        else:
-            rospy.logwarn("[exploration] move_base server not found yet (will retry)")
 
-        # 订阅者
-        self.map_sub = rospy.Subscriber("/map", OccupancyGrid, self.map_callback)
-        self.pose_sub = rospy.Subscriber("/localization/pose", PoseWithCovarianceStamped, self.pose_callback)
-        self.loc_status_sub = rospy.Subscriber("/localization/status", LocalizationStatus, self.loc_status_cb)
-        self.map_status_sub = rospy.Subscriber("/mapping/status", MappingStatus, self.map_status_cb)
-        self.nav_health_sub = rospy.Subscriber("/navigation/health", NavigationHealth, self.nav_health_cb)
-        self.det_sub = rospy.Subscriber("/danger_detector/detections", DangerSourceArray, self.detections_cb)
-        self.det_status_sub = rospy.Subscriber("/danger_detector/status", DetectionStatus, self.det_status_cb)
+        # ========== 服务客户端 ==========
+        rospy.wait_for_service(self.make_plan_service, timeout=5.0)
+        self.make_plan_client = rospy.ServiceProxy(self.make_plan_service, GetPlan)
 
-        # 服务
-        rospy.Service("/danger_search/start_exploration", Trigger, self.start_cb)
-        rospy.Service("/danger_search/stop_exploration", Trigger, self.stop_cb)
+        # ========== 订阅者 ==========
+        self.pose_sub = rospy.Subscriber(
+            self.pose_topic, PoseWithCovarianceStamped, self.pose_callback
+        )
+        self.map_sub = rospy.Subscriber(
+            self.map_topic, OccupancyGrid, self.map_callback
+        )
+        self.mapping_status_sub = rospy.Subscriber(
+            self.mapping_status_topic, MappingStatus, self.mapping_status_callback
+        )
+        self.nav_health_sub = rospy.Subscriber(
+            self.navigation_health_topic, NavigationHealth, self.nav_health_callback
+        )
 
-        # 主循环定时器
-        self.timer = rospy.Timer(rospy.Duration(self.replan_interval), self.planner_loop)
+        # ========== 服务 ==========
+        self.start_srv = rospy.Service(
+            self.start_service, Trigger, self.start_exploration_cb
+        )
+        self.stop_srv = rospy.Service(
+            self.stop_service, Trigger, self.stop_exploration_cb
+        )
 
-        rospy.loginfo("[exploration] exploration_planner started (skeleton random walk)")
+        # ========== 主循环 ==========
+        self.planner_timer = rospy.Timer(rospy.Duration(0.5), self.planner_loop)
+
+        rospy.loginfo(f"[exploration] Planner started, action: {self.move_base_action_name}")
 
     def pose_callback(self, msg):
         self.current_pose = msg.pose.pose
 
     def map_callback(self, msg):
         self.current_map = msg
+        self.map_info = msg.info
+        self.map_data = np.array(msg.data, dtype=np.int8).reshape(
+            (msg.info.height, msg.info.width)
+        )
 
-    def loc_status_cb(self, msg):
-        self.loc_status = msg
+    def mapping_status_callback(self, msg):
+        self.mapping_ready = msg.ready
+        self.mapping_stable = msg.stable
+        self.mapping_lost = msg.lost
 
-    def map_status_cb(self, msg):
-        self.map_status = msg
+    def nav_health_callback(self, msg):
+        self.nav_ready = msg.ready
 
-    def nav_health_cb(self, msg):
-        self.nav_health = msg
-        if self.goal_active and not msg.has_active_goal:
-            self.goal_active = False
+    def _world_to_map(self, x, y):
+        mx = int((x - self.map_info.origin.position.x) / self.map_info.resolution)
+        my = int((y - self.map_info.origin.position.y) / self.map_info.resolution)
+        return mx, my
 
-    def detections_cb(self, msg):
-        pass
+    def _is_free(self, mx, my):
+        if self.map_data is None:
+            return False
+        if mx < 0 or mx >= self.map_info.width or my < 0 or my >= self.map_info.height:
+            return False
+        return self.map_data[my, mx] == 0
 
-    def det_status_cb(self, msg):
-        self.det_status = msg
+    def _check_path(self, start_x, start_y, goal_x, goal_y):
+        """调用make_plan检查路径是否存在"""
+        try:
+            start = PoseStamped()
+            start.header.frame_id = self.map_frame
+            start.pose.position.x = start_x
+            start.pose.position.y = start_y
+            start.pose.orientation.w = 1.0
 
-    def start_cb(self, req):
+            goal = PoseStamped()
+            goal.header.frame_id = self.map_frame
+            goal.pose.position.x = goal_x
+            goal.pose.position.y = goal_y
+            goal.pose.orientation.w = 1.0
+
+            resp = self.make_plan_client(start, goal, 0.5)
+            return len(resp.plan.poses) > 0
+        except Exception as e:
+            rospy.logwarn_throttle(5, f"[exploration] make_plan failed: {e}")
+            return False
+
+    def _select_goal(self):
+        """在自由区域选择一个可达的目标点"""
+        if self.current_pose is None or self.map_data is None:
+            return None
+
+        cx = self.current_pose.position.x
+        cy = self.current_pose.position.y
+
+        # 随机尝试选点
+        for _ in range(50):
+            angle = random.uniform(-math.pi, math.pi)
+            dist = random.uniform(self.min_goal_dist, self.max_goal_dist)
+            gx = cx + dist * math.cos(angle)
+            gy = cy + dist * math.sin(angle)
+
+            mx, my = self._world_to_map(gx, gy)
+            if not self._is_free(mx, my):
+                continue
+
+            # 检查路径
+            if self._check_path(cx, cy, gx, gy):
+                return (gx, gy)
+
+        return None
+
+    def _send_goal(self, gx, gy):
+        """发送导航目标"""
+        goal = MoveBaseGoal()
+        goal.target_pose.header.frame_id = self.map_frame
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.pose.position.x = gx
+        goal.target_pose.pose.position.y = gy
+        goal.target_pose.pose.orientation.w = 1.0
+
+        self.move_base_client.send_goal(goal, done_cb=self.goal_done_cb)
+        self.waiting_for_result = True
+        self.last_goal_time = rospy.Time.now()
+        rospy.loginfo(f"[exploration] Sent goal: ({gx:.2f}, {gy:.2f})")
+
+    def goal_done_cb(self, state, result):
+        """目标完成回调"""
+        self.waiting_for_result = False
+        if state == actionlib.GoalStatus.SUCCEEDED:
+            rospy.loginfo("[exploration] Goal succeeded")
+            self.retry_count = 0
+        else:
+            rospy.loginfo(f"[exploration] Goal failed with state: {state}")
+            self.retry_count += 1
+
+    def start_exploration_cb(self, req):
+        rospy.loginfo("[exploration] Start exploration")
         self.exploring = True
-        rospy.loginfo("[exploration] Exploration started")
-        resp = TriggerResponse()
-        resp.success = True
-        resp.message = "Exploration started"
-        return resp
+        self.retry_count = 0
+        return TriggerResponse(success=True, message="Exploration started")
 
-    def stop_cb(self, req):
+    def stop_exploration_cb(self, req):
+        rospy.loginfo("[exploration] Stop exploration")
         self.exploring = False
-        if self.goal_active:
+        self.waiting_for_result = False
+        # 取消活动目标
+        if self.move_base_client.get_state() in [
+            actionlib.GoalStatus.ACTIVE, actionlib.GoalStatus.PENDING
+        ]:
             self.move_base_client.cancel_goal()
-            self.goal_active = False
-        rospy.loginfo("[exploration] Exploration stopped")
-        resp = TriggerResponse()
-        resp.success = True
-        resp.message = "Exploration stopped"
-        return resp
+        self._stop_nav()
+        return TriggerResponse(success=True, message="Exploration stopped")
+
+    def _stop_nav(self):
+        """停止导航（发0速度）"""
+        pass  # navigation自己会处理，cancel后会停
 
     def planner_loop(self, event):
-        """探索主循环 - 首版随机游走占位"""
+        """主规划循环"""
         if not self.exploring:
             return
-        if self.current_pose is None:
-            return
-        if self.goal_active:
-            return
 
-        # 定位状态检查（DEGRADED/LOST时不发新目标）
-        if self.loc_status and self.loc_status.tracking_state in [
-            LocalizationStatus.STATE_RELOCALIZING, LocalizationStatus.STATE_LOST
-        ]:
+        # 检查所有必要条件
+        if not self.mapping_ready or not self.mapping_stable or self.mapping_lost:
+            rospy.loginfo_throttle(5, "[exploration] Waiting for mapping to be ready...")
             return
 
-        # 地图不稳定时不发新目标
-        if self.map_status and not self.map_status.stable:
+        if not self.nav_ready:
+            rospy.loginfo_throttle(5, "[exploration] Waiting for navigation to be ready...")
             return
 
-        # TODO: 替换为前沿点检测 + 信息增益评估
-        goal_x = self.current_pose.position.x + random.uniform(-self.random_range_x, self.random_range_x)
-        goal_y = self.current_pose.position.y + random.uniform(-self.random_range_y, self.random_range_y)
-        goal_yaw = random.uniform(-math.pi, math.pi)
-        self._send_goal(goal_x, goal_y, goal_yaw)
+        if self.current_pose is None or self.map_data is None:
+            return
 
-    def _send_goal(self, x, y, yaw):
-        goal = MoveBaseGoal()
-        goal.target_pose.header.stamp = rospy.Time.now()
-        goal.target_pose.header.frame_id = self.map_frame
-        goal.target_pose.pose.position.x = x
-        goal.target_pose.pose.position.y = y
-        goal.target_pose.position.z = 0.0
-        goal.target_pose.pose.orientation.z = math.sin(yaw / 2)
-        goal.target_pose.pose.orientation.w = math.cos(yaw / 2)
+        if self.waiting_for_result:
+            # 检查目标是否超时
+            elapsed = (rospy.Time.now() - self.last_goal_time).to_sec()
+            if elapsed > 60.0:
+                rospy.logwarn("[exploration] Goal timeout, canceling")
+                self.move_base_client.cancel_goal()
+                self.waiting_for_result = False
+                self.retry_count += 1
+            return
 
-        self.move_base_client.send_goal(
-            goal,
-            done_cb=self._goal_done_cb,
-            active_cb=self._goal_active_cb
-        )
-        self.goal_active = True
-        rospy.loginfo(f"[exploration] Sent goal: ({x:.2f}, {y:.2f})")
+        # 重试次数过多，等待一下
+        if self.retry_count >= self.max_retry:
+            rospy.loginfo_throttle(5, f"[exploration] Too many retries ({self.retry_count}), waiting...")
+            return
 
-    def _goal_active_cb(self):
-        pass
+        # 间隔时间
+        if (rospy.Time.now() - self.last_goal_time).to_sec() < self.goal_interval:
+            return
 
-    def _goal_done_cb(self, state, result):
-        self.goal_active = False
-        rospy.loginfo(f"[exploration] Goal finished, state={state}")
+        # 选择目标
+        goal = self._select_goal()
+        if goal is not None:
+            self._send_goal(*goal)
+        else:
+            rospy.loginfo_throttle(5, "[exploration] No valid goal found, retrying...")
+            self.retry_count += 1
 
     def run(self):
         rospy.spin()

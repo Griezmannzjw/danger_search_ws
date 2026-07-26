@@ -1,25 +1,43 @@
 <launch>
-  <!-- 危险源自主搜索系统 - 完整启动文件 -->
-  <!-- 探索规划接口规范 v1.0 对齐 -->
+  <!-- 危险源自主搜索系统 - P0最小可运行版本 -->
+  <!-- 对齐接口规范 v1.1-p0 -->
 
-  <!-- 全局参数 -->
+  <!-- 加载全局参数到根命名空间 -->
   <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
 
   <!-- 1. 定位与建图模块 -->
-  <include file="$(find danger_search_localization)/launch/localization.launch" />
+  <node name="localization" pkg="danger_search_localization" type="pose_estimator.py" output="screen">
+    <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
+    <rosparam command="load" file="$(find danger_search_localization)/config/default.yaml" />
+  </node>
 
   <!-- 2. 危险源感知模块 -->
-  <include file="$(find danger_search_perception)/launch/danger_detector.launch" />
+  <node name="perception" pkg="danger_search_perception" type="danger_detector.py" output="screen">
+    <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
+    <rosparam command="load" file="$(find danger_search_perception)/config/default.yaml" />
+  </node>
 
   <!-- 3. 导航控制模块 (move_base Action 服务器) -->
-  <include file="$(find danger_search_navigation)/launch/navigation.launch" />
+  <node name="navigation" pkg="danger_search_navigation" type="nav_controller.py" output="screen">
+    <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
+    <rosparam command="load" file="$(find danger_search_navigation)/config/default.yaml" />
+  </node>
 
   <!-- 4. 探索规划模块 (move_base Action 客户端) -->
-  <include file="$(find danger_search_exploration)/launch/exploration.launch" />
+  <node name="exploration" pkg="danger_search_exploration" type="exploration_planner.py" output="screen">
+    <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
+    <rosparam command="load" file="$(find danger_search_exploration)/config/default.yaml" />
+  </node>
 
   <!-- 5. 控制执行与安全模块 -->
-  <include file="$(find danger_search_control)/launch/cmd_mux.launch" />
+  <node name="control" pkg="danger_search_control" type="cmd_mux.py" output="screen">
+    <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
+    <rosparam command="load" file="$(find danger_search_control)/config/default.yaml" />
+  </node>
 
   <!-- 6. 任务总控模块 -->
-  <include file="$(find danger_search_mission)/launch/mission.launch" />
+  <node name="mission" pkg="danger_search_mission" type="mission_manager.py" output="screen">
+    <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
+    <rosparam command="load" file="$(find danger_search_mission)/config/default.yaml" />
+  </node>
 </launch>

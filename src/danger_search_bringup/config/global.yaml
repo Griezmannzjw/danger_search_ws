@@ -1,61 +1,47 @@
-# 全局参数配置
-# 探索规划接口规范 v1.0 对齐
+# 全局参数配置 - P0最小可运行版本
+# 对齐接口规范 v1.1-p0
+# 所有话题、服务、Action、frame统一在这里配置
 
-# 坐标系
+# ========== 坐标系 ==========
 map_frame: map
 odom_frame: odom
 base_frame: base
+world_frame: world
 
-# 当前楼层（首版单楼层）
-current_floor: 0
+# ========== 统一话题名 ==========
+map_topic: /map
+pose_topic: /localization/pose
+mapping_status_topic: /mapping/status
+health_topic: /navigation/health
+navigation_health_topic: /navigation/health
+detections_topic: /danger_detector/detections
+status_topic: /danger_detector/status
+detection_status_topic: /danger_detector/status
+mission_status_topic: /mission/status
+mission_active_topic: /mission/active
+output_cmd_topic: /cmd_vel
+cmd_vel_topic: /cmd_vel
+nav_cmd_topic: /danger_search/nav_cmd_vel
+cmd_vel_topic: /danger_search/nav_cmd_vel
+safety_stop_topic: /danger_search/safety_stop
 
-# 出发点（世界坐标系原点）
-home_position:
-  x: 0.0
-  y: 0.0
-  z: 0.0
-  yaw: 0.0
+# ========== 传感器话题 ==========
+lidar_topic: /livox/Pointcloud2
+imu_topic: /trunk_imu
+rgb_topic: /real_sense/rgb/image_raw
+depth_topic: /real_sense/depth/image_raw
+camera_info_topic: /real_sense/rgb/camera_info
 
-# 传感器话题（来自 SimEnv）
-topics:
-  lidar: /livox/Pointcloud2
-  lidar_raw: /scan
-  trunk_imu: /trunk_imu
-  livox_imu: /livox/imu
-  rgb_image: /real_sense/rgb/image_raw
-  depth_image: /real_sense/depth/image_raw
-  rgb_camera_info: /real_sense/rgb/camera_info
-  cmd_vel: /cmd_vel
+# ========== 统一服务/Action名 ==========
+move_base_action_name: /move_base
+make_plan_service: /move_base/make_plan
+clear_costmaps_service: /move_base/clear_costmaps
+start_service: /danger_search/start_exploration
+stop_service: /danger_search/stop_exploration
+start_exploration_service: /danger_search/start_exploration
+stop_exploration_service: /danger_search/stop_exploration
 
-# 内部话题（按探索规范统一命名）
-internal_topics:
-  # 定位建图
-  pose: /localization/pose
-  localization_status: /localization/status
-  map: /map
-  mapping_status: /mapping/status
-  current_floor: /mapping/current_floor
-  # 导航
-  move_base_action: /move_base
-  nav_cmd_vel: /danger_search/nav_cmd_vel
-  navigation_path: /navigation/path
-  navigation_health: /navigation/health
-  # 感知
-  detections: /danger_detector/detections
-  detection_status: /danger_detector/status
-  # 任务
-  mission_status: /mission/status
-  mission_active: /mission/active
-
-# 控制参数
-control:
-  cmd_timeout: 0.5
-  max_accel_linear: 1.0
-  max_accel_angular: 2.0
-  output_rate: 50
-
-# 任务参数
-mission:
-  exploration_timeout: 600.0
-  dedup_distance: 0.8
-  result_file: results/detected_danger.json
+# ========== 任务参数 ==========
+# 结果文件绝对路径（部署时根据实际用户名修改）
+result_file: /home/$USER/SimEnv/results/detected_danger.json
+dedup_distance: 0.8

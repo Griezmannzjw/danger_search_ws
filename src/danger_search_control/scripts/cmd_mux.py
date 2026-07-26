@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-速度仲裁节点 cmd_mux
+速度仲裁节点 cmd_mux - P0最小可运行版本
+对齐接口规范 v1.1-p0
+
 功能：
-  1. 接收多路速度指令，按优先级仲裁输出
+  1. 接收导航速度指令，安全仲裁输出
   2. 指令超时自动停车（安全保护）
   3. 加速度限制（平滑输出）
-  4. 回显已发送的速度指令（供定位模块使用）
-输入：导航速度指令 / 安全停车指令 / 手动指令
-输出：/cmd_vel（最终输出给机器人控制器）
-      /danger_search/cmd_vel_sent（已发送指令回显）
+
+P0要求：
+  - 唯一发布/cmd_vel
+  - 所有名称从参数读取
+  - 超时自动停车
 """
 
 import rospy
@@ -19,6 +22,11 @@ from std_msgs.msg import Bool
 class CmdMux:
     def __init__(self):
         rospy.init_node("cmd_mux", anonymous=False)
+
+        # ========== 从参数读取所有名称 ==========
+        self.nav_cmd_topic = rospy.get_param("~nav_cmd_topic", "/danger_search/nav_cmd_vel")
+        self.output_cmd_topic = rospy.get_param("~output_cmd_topic", "/cmd_vel")
+        self.safety_stop_topic = rospy.get_param("~safety_stop_topic", "/danger_search/safety_stop")
 
         # 参数
         self.output_rate = rospy.get_param("~output_rate", 50)
@@ -35,17 +43,14 @@ class CmdMux:
         self.last_output_time = rospy.Time.now()
 
         # 发布者
-        self.cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
-        self.sent_pub = rospy.Publisher(
-            "/danger_search/cmd_vel_sent", Twist, queue_size=10
-        )
+        self.cmd_pub = rospy.Publisher(self.output_cmd_topic, Twist, queue_size=10)
 
         # 订阅者
         self.nav_sub = rospy.Subscriber(
-            "/danger_search/nav_cmd_vel", Twist, self.nav_cmd_callback
+            self.nav_cmd_topic, Twist, self.nav_cmd_callback
         )
         self.safety_sub = rospy.Subscriber(
-            "/danger_search/safety_stop", Bool, self.safety_callback
+            self.safety_stop_topic, Bool, self.safety_callback
         )
 
         # 输出定时器
@@ -53,7 +58,7 @@ class CmdMux:
             rospy.Duration(1.0 / self.output_rate), self.output_loop
         )
 
-        rospy.loginfo("[control] cmd_mux node started")
+        rospy.loginfo(f"[control] cmd_mux started, output: {self.output_cmd_topic}")
 
     def nav_cmd_callback(self, msg):
         self.nav_cmd = msg
@@ -75,19 +80,16 @@ class CmdMux:
         # 1. 安全停车：最高优先级
         if self.safety_stop:
             self.cmd_pub.publish(output)
-            self.sent_pub.publish(output)
             self.last_output = output
             return
 
         # 2. 指令超时检查
         nav_age = (current_time - self.last_nav_time).to_sec()
         if self.enable_safety and nav_age > self.cmd_timeout:
-            # 超时停车
             if nav_age < self.cmd_timeout + 0.1:
                 rospy.logwarn_throttle(1,
                     f"[control] Nav cmd timeout ({nav_age:.2f}s), stopping")
             self.cmd_pub.publish(output)
-            self.sent_pub.publish(output)
             self.last_output = output
             return
 
@@ -95,7 +97,7 @@ class CmdMux:
         target_linear = self.nav_cmd.linear.x
         target_angular = self.nav_cmd.angular.z
 
-        # 4. 加速度限制（平滑处理）
+        # 4. 加速度限制
         delta_linear = target_linear - self.last_output.linear.x
         max_delta_linear = self.max_linear_accel * dt
         if abs(delta_linear) > max_delta_linear:
@@ -110,7 +112,6 @@ class CmdMux:
 
         # 5. 发布
         self.cmd_pub.publish(output)
-        self.sent_pub.publish(output)
         self.last_output = output
 
     def run(self):
