@@ -38,6 +38,8 @@ start_service: /danger_search/start_exploration
 stop_service: /danger_search/stop_exploration
 start_exploration_service: /danger_search/start_exploration
 stop_exploration_service: /danger_search/stop_exploration
+start_mission_service: /danger_search/start
+finish_mission_service: /danger_search/finish
 
 # ========== 任务参数 ==========
 # 结果文件绝对路径（部署时根据实际用户名修改）

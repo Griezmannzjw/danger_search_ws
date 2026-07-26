@@ -1,15 +1,13 @@
 # 导航控制模块参数
 # 对齐接口规范 v1.1-p0
 
-# 坐标系
-map_frame: map
-base_frame: base
-
-# 话题和服务
-cmd_vel_topic: /danger_search/nav_cmd_vel
+# 话题
+nav_cmd_topic: /danger_search/nav_cmd_vel
 pose_topic: /localization/pose
 map_topic: /map
 health_topic: /navigation/health
+
+# 服务/Action
 move_base_action_name: /move_base
 make_plan_service: /move_base/make_plan
 clear_costmaps_service: /move_base/clear_costmaps

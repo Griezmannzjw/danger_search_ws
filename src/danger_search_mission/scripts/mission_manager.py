@@ -51,6 +51,12 @@ class MissionManager:
         self.stop_exploration_service = rospy.get_param(
             "~stop_exploration_service", "/danger_search/stop_exploration"
         )
+        self.start_mission_service = rospy.get_param(
+            "~start_mission_service", "/danger_search/start"
+        )
+        self.finish_mission_service = rospy.get_param(
+            "~finish_mission_service", "/danger_search/finish"
+        )
         self.move_base_action_name = rospy.get_param("~move_base_action_name", "/move_base")
 
         # 结果文件（必须是绝对路径，展开环境变量）
@@ -109,10 +115,10 @@ class MissionManager:
 
         # ========== 服务 ==========
         self.start_srv = rospy.Service(
-            "/danger_search/start", Trigger, self.start_mission_cb
+            self.start_mission_service, Trigger, self.start_mission_cb
         )
         self.finish_srv = rospy.Service(
-            "/danger_search/finish", Trigger, self.finish_mission_cb
+            self.finish_mission_service, Trigger, self.finish_mission_cb
         )
 
         # ========== 定时器 ==========

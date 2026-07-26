@@ -39,7 +39,7 @@ class NavController:
         self.map_frame = rospy.get_param("~map_frame", "map")
         self.base_frame = rospy.get_param("~base_frame", "base")
 
-        self.cmd_vel_topic = rospy.get_param("~cmd_vel_topic", "/danger_search/nav_cmd_vel")
+        self.nav_cmd_topic = rospy.get_param("~nav_cmd_topic", "/danger_search/nav_cmd_vel")
         self.pose_topic = rospy.get_param("~pose_topic", "/localization/pose")
         self.map_topic = rospy.get_param("~map_topic", "/map")
         self.health_topic = rospy.get_param("~health_topic", "/navigation/health")
@@ -79,7 +79,7 @@ class NavController:
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
         # ========== 发布者 ==========
-        self.cmd_pub = rospy.Publisher(self.cmd_vel_topic, Twist, queue_size=10)
+        self.cmd_pub = rospy.Publisher(self.nav_cmd_topic, Twist, queue_size=10)
         self.health_pub = rospy.Publisher(self.health_topic, NavigationHealth, queue_size=10)
 
         # ========== 订阅者 ==========
