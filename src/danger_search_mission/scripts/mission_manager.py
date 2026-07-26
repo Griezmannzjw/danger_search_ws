@@ -53,11 +53,12 @@ class MissionManager:
         )
         self.move_base_action_name = rospy.get_param("~move_base_action_name", "/move_base")
 
-        # 结果文件（必须是绝对路径）
-        self.result_file = rospy.get_param(
-            "~result_file",
+        # 结果文件（必须是绝对路径，展开环境变量）
+        default_result = os.path.expandvars(
             os.path.expanduser("~/SimEnv/results/detected_danger.json")
         )
+        self.result_file = rospy.get_param("~result_file", default_result)
+        self.result_file = os.path.expandvars(os.path.expanduser(self.result_file))
         self.dedup_distance = rospy.get_param("~dedup_distance", 0.8)
 
         # ========== 状态 ==========
@@ -88,7 +89,8 @@ class MissionManager:
         self.active_pub.publish(Bool(data=False))
 
         # ========== 服务客户端 ==========
-        rospy.wait_for_service(self.start_exploration_service, timeout=10.0)
+        rospy.loginfo("[mission] Waiting for exploration services...")
+        rospy.wait_for_service(self.start_exploration_service)
         self.start_explore_client = rospy.ServiceProxy(
             self.start_exploration_service, Trigger
         )

@@ -20,12 +20,10 @@ detection_status_topic: /danger_detector/status
 mission_status_topic: /mission/status
 mission_active_topic: /mission/active
 output_cmd_topic: /cmd_vel
-cmd_vel_topic: /cmd_vel
 nav_cmd_topic: /danger_search/nav_cmd_vel
-cmd_vel_topic: /danger_search/nav_cmd_vel
 safety_stop_topic: /danger_search/safety_stop
 
-# ========== 传感器话题 ==========
+# ========== 传感器话题（来自SimEnv） ==========
 lidar_topic: /livox/Pointcloud2
 imu_topic: /trunk_imu
 rgb_topic: /real_sense/rgb/image_raw

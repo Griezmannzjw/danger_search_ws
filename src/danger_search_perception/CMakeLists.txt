@@ -6,6 +6,7 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
   geometry_msgs
   cv_bridge
+  image_geometry
   tf2_ros
   danger_search_common
 )
@@ -16,6 +17,7 @@ catkin_package(
   sensor_msgs
   geometry_msgs
   cv_bridge
+  image_geometry
   tf2_ros
   danger_search_common
 )

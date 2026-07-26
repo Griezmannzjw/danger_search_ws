@@ -21,13 +21,7 @@ add_message_files(
   NavigationHealth.msg
 )
 
-## Generate services in the 'srv' folder
-add_service_files(
-  FILES
-  StartMission.srv
-  FinishMission.srv
-  ReturnHome.srv
-)
+## P0统一使用std_srvs/Trigger，不需要自定义srv
 
 ## Generate added messages and services with any dependencies listed here
 generate_messages(

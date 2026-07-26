@@ -73,7 +73,8 @@ class ExplorationPlanner:
         )
 
         # ========== 服务客户端 ==========
-        rospy.wait_for_service(self.make_plan_service, timeout=5.0)
+        rospy.loginfo("[exploration] Waiting for make_plan service...")
+        rospy.wait_for_service(self.make_plan_service)
         self.make_plan_client = rospy.ServiceProxy(self.make_plan_service, GetPlan)
 
         # ========== 订阅者 ==========
