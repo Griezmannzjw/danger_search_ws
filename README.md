@@ -4,19 +4,25 @@
 
 当前版本：**v1.1-p0**（单楼层最小可运行闭环）
 
-## 版本说明
+## ✅ 接口对齐检查清单
 
-v1.1-p0 完全对齐官方接口规范，实现完整的P0最小可运行闭环：
-
-| 模块 | P0实现状态 |
-|------|-----------|
-| ✅ localization | IMU积分航位推算 + Livox激光2D占据栅格建图<br>唯一发布`world→map→odom→base`完整TF链<br>初始化2m自由区域（保证可选点）<br>不使用`cmd_vel_sent`作为正式里程计 |
-| ✅ navigation | 标准`/move_base` SimpleActionServer<br>`/move_base/make_plan`基于实际地图检查障碍（不返回直线）<br>P控制器：先转向再前进，线速度0.3m/s<br>取消/失败/超时后立即停止速度 |
-| ✅ exploration | `/move_base` Action客户端<br>严格检查所有前置条件才发目标：<br>  - 地图有效 + 定位稳定 + 不丢失<br>  - 目标位于已知自由栅格<br>  - `make_plan`返回非空路径<br>失败最多重试3次，不无限重试<br>stop时取消活动目标 |
-| ✅ control | 安全仲裁层，唯一发布`/cmd_vel`<br>指令超时0.5s自动停车<br>加速度限制平滑输出 |
-| ✅ perception | P0状态骨架，发布检测状态<br>实际颜色/形状检测算法待识别组补充 |
-| ✅ mission | 状态机：IDLE → EXPLORING → FINISHED<br>严格start/finish幂等流程<br>只接收`class_id=1`红球，0.8m空间去重<br>map→world坐标转换<br>原子写入官方格式结果文件 |
-| ✅ bringup | 统一launch文件，全局参数集中配置<br>所有话题/服务/frame从参数读取，无硬编码 |
+| 规范要求 | 实现状态 |
+|---------|---------|
+| localization是`/tf`唯一发布者，提供`world→map→odom→base` | ✅ 20Hz发布，链完整 |
+| 地图有已知自由区域（非全未知） | ✅ 初始化2m半径自由区域 |
+| 定位用IMU/激光，不用`cmd_vel_sent`做里程计 | ✅ IMU积分航位推算 |
+| `make_plan`基于实际地图判断可达性，不返回无条件直线 | ✅ 直线插值+障碍检查 |
+| 所有话题/服务/frame从ROS参数读取，无硬编码 | ✅ 全部参数化 |
+| 结果文件绝对路径，支持环境变量展开 | ✅ `~`和`$USER`自动展开 |
+| start/finish严格流程，幂等性 | ✅ 重复调用可预测 |
+| control是`/cmd_vel`唯一发布者 | ✅ 安全仲裁层唯一输出 |
+| exploration发目标前检查所有前置条件 | ✅ 6项条件全部满足才发 |
+| 失败不无限重试，stop时取消活动目标 | ✅ 最多3次重试，stop立即cancel |
+| 只接收`class_id=1`红球，去重 | ✅ detection_id+0.8m空间去重 |
+| map→world坐标转换 | ✅ 首版静态重合，预留TF接口 |
+| 结果文件原子写入 | ✅ tmp+rename，避免半写文件 |
+| 所有服务统一用`std_srvs/Trigger` | ✅ 无自定义srv |
+| 600s是评分阈值不是硬截止 | ✅ 不自动结束，用户调用finish |
 
 ## 系统架构
 
@@ -31,7 +37,7 @@ v1.1-p0 完全对齐官方接口规范，实现完整的P0最小可运行闭环�
 ┌─────────────────────┐                   ┌─────────────────────┐
 │  Exploration        │                   │  Perception         │
 │  - 自由区域选点     │                   │  - RGB/深度输入     │
-│  - make_plan校验    │                   │  - 颜色检测         │
+│  - make_plan校验    │                   │  - 颜色+形状检测    │
 │  - move_base客户端  │                   │  - 发布检测结果     │
 └────────┬────────────┘                   └──────────┬──────────┘
          │                                           │
@@ -70,6 +76,15 @@ danger_search_ws/
 ├── CMakeLists.txt                    # 工作空间顶层
 ├── src/
 │   ├── danger_search_common/         # 公共消息定义（9个msg）
+│   │   └── msg/
+│   │       ├── DangerSource.msg
+│   │       ├── DangerSourceArray.msg
+│   │       ├── MissionStatus.msg
+│   │       ├── DetectionStatus.msg
+│   │       ├── LocalizationStatus.msg
+│   │       ├── FloorMapInfo.msg
+│   │       ├── MappingStatus.msg
+│   │       └── NavigationHealth.msg
 │   ├── danger_search_localization/   # 定位与建图（P0实现）
 │   ├── danger_search_navigation/     # 导航控制（P0实现）
 │   ├── danger_search_exploration/    # 探索规划（P0实现）
@@ -88,8 +103,9 @@ danger_search_ws/
 
 ### 环境要求
 - Ubuntu 20.04
-- ROS Noetic
+- ROS Noetic（desktop-full安装）
 - Unitree A1 仿真环境（SimEnv）
+- Python依赖：numpy（ROS Noetic自带）
 
 ### 1. 获取代码
 
@@ -103,9 +119,11 @@ cd danger_search_ws
 
 ```bash
 source /opt/ros/noetic/setup.bash
-catkin_make -j
+catkin_make -j$(nproc)
 source devel/setup.bash
 ```
+
+**编译成功标志**：没有error，最后显示`Built target danger_search_common_generate_messages`等信息。
 
 ### 3. 添加执行权限
 
@@ -121,6 +139,7 @@ find . -name "*.py" -exec chmod +x {} \;
 # 默认配置（如果SimEnv在~/SimEnv）
 result_file: /home/$USER/SimEnv/results/detected_danger.json
 ```
+如果你的SimEnv在其他位置，修改为对应绝对路径即可。
 
 ### 5. 启动仿真
 
@@ -130,22 +149,24 @@ source devel/setup.bash
 ./auto.sh
 ```
 
-Gazebo启动后：
+Gazebo启动后，在终端按：
 1. 按 **2** 让机器人站立
-2. 按 **6** 切换到 `/cmd_vel` 控制模式
+2. 按 **6** 切换到 `/cmd_vel` 控制模式（必须！否则/cmd_vel不生效）
 
 ### 6. 启动算法系统
 
-新开终端：
+**新开终端**：
 ```bash
 cd ~/danger_search_ws
 source devel/setup.bash
 roslaunch danger_search_bringup competition.launch
 ```
 
+正常启动后会看到各节点的日志输出，没有红色error。
+
 ### 7. 开始任务
 
-新开终端：
+**新开终端**：
 ```bash
 # 开始自主探索
 rosservice call /danger_search/start "{}"
@@ -154,58 +175,75 @@ rosservice call /danger_search/start "{}"
 rosservice call /danger_search/finish "{}"
 ```
 
-## 验证检查清单
+## 启动后验证（必做！）
 
-启动后可以用以下命令验证系统是否正常：
+启动后按顺序执行以下命令验证系统正常：
 
 ```bash
-# 1. 检查所有节点是否启动
+# 1. 检查所有6个节点是否都启动了
 rosnode list
+# 应该看到：/localization /perception /navigation /exploration /control /mission
 
-# 2. 检查TF链是否完整（应该有world->map->odom->base）
-rosrun tf view_frames
-evince frames.pdf
+# 2. 检查TF链是否完整
+rosrun tf view_frames && evince frames.pdf
+# 应该看到完整链路：world -> map -> odom -> base
 
-# 3. 检查话题是否发布
+# 3. 检查定位是否正常
 rostopic echo /localization/pose -n 1
-rostopic echo /map -n 1
+# 应该有pose数据，frame_id是"map"
+
+# 4. 检查地图是否正常
+rostopic echo /map -n 1 | grep -A 5 info
+# 应该有resolution=0.05, width=400, height=720
+# data数组里应该有0（自由区域），不是全-1
+
+# 5. 检查建图状态
 rostopic echo /mapping/status -n 1
+# ready: True, stable: True, lost: False
+
+# 6. 检查导航状态
 rostopic echo /navigation/health -n 1
+# ready: True, controller_active: False（还没发目标）
+
+# 7. 检查任务状态
 rostopic echo /mission/status -n 1
+# mission_state: "IDLE"
 
-# 4. 检查服务是否存在
+# 8. 检查所有服务是否存在
 rosservice list | grep danger_search
-
-# 5. 检查地图是否有自由区域（不是全-1）
-rostopic echo /map -n 1 | grep data
+# 应该看到：
+# /danger_search/start
+# /danger_search/finish
+# /danger_search/start_exploration
+# /danger_search/stop_exploration
 ```
 
 ## P0话题列表
 
-| 话题 | 类型 | 发布者 | 说明 |
-|------|------|--------|------|
-| `/tf` | TFMessage | localization | `world→map→odom→base` 变换链 |
-| `/localization/pose` | PoseWithCovarianceStamped | localization | 机器人位姿（map坐标系） |
-| `/map` | OccupancyGrid | localization | 2D占据栅格地图（latch） |
-| `/mapping/status` | MappingStatus | localization | 建图状态 |
-| `/navigation/health` | NavigationHealth | navigation | 导航健康状态 |
-| `/danger_search/nav_cmd_vel` | Twist | navigation | 导航期望速度（给control） |
-| `/cmd_vel` | Twist | control | 最终速度指令（给机器人） |
-| `/danger_detector/detections` | DangerSourceArray | perception | 危险源检测结果 |
-| `/danger_detector/status` | DetectionStatus | perception | 检测器状态 |
-| `/mission/status` | MissionStatus | mission | 任务状态（latch） |
-| `/mission/active` | Bool | mission | 任务激活标志（latch） |
+| 话题 | 类型 | 发布者 | 频率 | 说明 |
+|------|------|--------|------|------|
+| `/tf` | TFMessage | localization | 20Hz | `world→map→odom→base` 变换链 |
+| `/localization/pose` | PoseWithCovarianceStamped | localization | 20Hz | 机器人位姿（map坐标系） |
+| `/map` | OccupancyGrid | localization | 1Hz | 2D占据栅格地图（latch） |
+| `/mapping/status` | MappingStatus | localization | 2Hz | 建图状态 |
+| `/navigation/health` | NavigationHealth | navigation | 5Hz | 导航健康状态 |
+| `/danger_search/nav_cmd_vel` | Twist | navigation | 20Hz | 导航期望速度（给control） |
+| `/cmd_vel` | Twist | control | 50Hz | 最终速度指令（给机器人） |
+| `/danger_detector/detections` | DangerSourceArray | perception | 10Hz | 危险源检测结果 |
+| `/danger_detector/status` | DetectionStatus | perception | 2Hz | 检测器状态 |
+| `/mission/status` | MissionStatus | mission | 2Hz | 任务状态（latch） |
+| `/mission/active` | Bool | mission | latch | 任务激活标志 |
 
 ## P0服务/Action
 
-| 名称 | 类型 | 提供方 | 说明 |
-|------|------|--------|------|
-| `/move_base` | MoveBaseAction | navigation | 导航Action |
-| `/move_base/make_plan` | GetPlan | navigation | 路径查询服务 |
-| `/danger_search/start_exploration` | Trigger | exploration | 开始探索（mission调用） |
-| `/danger_search/stop_exploration` | Trigger | exploration | 停止探索（mission调用） |
-| `/danger_search/start` | Trigger | mission | 开始任务（用户调用） |
-| `/danger_search/finish` | Trigger | mission | 结束任务（用户调用） |
+| 名称 | 类型 | 提供方 | 调用方 | 说明 |
+|------|------|--------|--------|------|
+| `/move_base` | MoveBaseAction | navigation | exploration | 导航Action |
+| `/move_base/make_plan` | GetPlan | navigation | exploration | 路径查询服务 |
+| `/danger_search/start_exploration` | Trigger | exploration | mission | 开始探索 |
+| `/danger_search/stop_exploration` | Trigger | exploration | mission | 停止探索 |
+| `/danger_search/start` | Trigger | mission | 用户 | 开始任务 |
+| `/danger_search/finish` | Trigger | mission | 用户 | 结束任务 |
 
 ## 结果文件格式
 
@@ -218,35 +256,77 @@ rostopic echo /map -n 1 | grep data
   ]
 }
 ```
+- `exploration_time`：从start到finish的秒数，保留2位小数
+- `position`：危险源在world坐标系下的[x, y, z]坐标，保留2位小数
+- 匹配阈值：1.0m欧氏距离，贪心一对一匹配
 
-## 常见问题
+## 常见问题排查
 
-### Q: 机器人不动？
-A: 检查：
-1. 是否按了6切换到/cmd_vel模式
-2. /navigation/health的ready是否为true
-3. /mapping/status的ready和stable是否为true
-4. /cmd_vel是否有速度输出
+### ❌ 问题1：机器人不动
+**排查步骤**：
+1. 确认仿真里按了**6**切换到/cmd_vel模式（按4是键盘模式，/cmd_vel不生效）
+2. 检查`/navigation/health`的`ready`是否为`True`
+3. 检查`/mapping/status`的`ready`和`stable`是否为`True`
+4. 手动发速度测试：`rostopic pub /cmd_vel geometry_msgs/Twist "linear: {x: 0.1}" -r 10`，看机器人是否动
+5. 如果手动能动但自动不动，检查exploration日志是否在选点
 
-### Q: 不发导航目标？
-A: exploration发目标需要同时满足：
-- mapping_status.ready=true, stable=true, lost=false
-- navigation_health.ready=true
-- 地图中有自由区域
-- make_plan返回非空路径
+### ❌ 问题2：不发导航目标
+**原因**：exploration发目标需要同时满足所有条件：
+- `mapping_status.ready = True`
+- `mapping_status.stable = True`
+- `mapping_status.lost = False`
+- `navigation_health.ready = True`
+- 地图中有自由区域（不是全-1）
+- `make_plan`返回非空路径
+查看exploration节点的throttle日志，会提示等待哪个条件。
 
-### Q: 结果文件没生成？
-A: 检查：
-1. result_file路径是否正确，目录是否存在
-2. 是否调用了/danger_search/finish服务
-3. mission节点日志是否有错误
+### ❌ 问题3：结果文件没生成
+**排查步骤**：
+1. 确认调用了`/danger_search/finish`服务（不是只按Ctrl+C）
+2. 检查`result_file`路径是否正确，目录是否存在（代码会自动创建目录）
+3. 检查mission节点日志是否有`Result written to ...`
+4. 检查是否有红色error日志
 
-## 后续升级方向
+### ❌ 问题4：编译报错找不到消息
+**解决**：
+```bash
+cd ~/danger_search_ws
+rm -rf build devel
+source /opt/ros/noetic/setup.bash
+catkin_make -j$(nproc)
+source devel/setup.bash
+```
 
-| 模块 | 升级方向 | 负责人 |
-|------|---------|--------|
-| localization | 激光SLAM（Cartographer/GMapping），回环检测 | 导航组 |
-| navigation | 完整move_base（global planner + local planner + costmap） | 导航组 |
-| exploration | 前沿点算法（frontier exploration），多房间遍历 | 探索组 |
-| perception | YOLO/颜色+形状检测，深度图3D定位 | 识别组 |
-| mission | 自动返航、多楼层支持（电梯/楼梯）、自动结束 | 框架组 |
+### ❌ 问题5：roslaunch找不到包
+**解决**：
+```bash
+source ~/danger_search_ws/devel/setup.bash
+rospack find danger_search_bringup
+# 应该返回包路径，如果找不到，重新source
+```
+
+## 各模块升级方向
+
+| 模块 | P0实现 | 升级方向 | 负责人 |
+|------|--------|---------|--------|
+| localization | IMU积分+2D栅格 | Cartographer激光SLAM，回环检测，多楼层地图 | 导航组 |
+| navigation | P控制器+直线避障 | 完整move_base：global planner(Dijkstra/A*) + local planner(DWA/TEB) + costmap_2d | 导航组 |
+| exploration | 自由区域随机选点 | 前沿点算法(frontier exploration)，房间拓扑遍历，多楼层电梯/楼梯 | 探索组 |
+| perception | P0空骨架 | HSV颜色分割+轮廓检测，YOLOv8实例分割，深度图3D定位，多帧确认去重 | 识别组 |
+| mission | 手动start/finish | 自动结束判定，自动返航，多楼层切换，自动电梯调用 | 框架组 |
+| control | 速度平滑+超时停车 | 跌倒检测，紧急避障，步态切换 | 控制组 |
+
+## 团队分工
+
+| 方向 | 人数 | 模块 |
+|------|------|------|
+| ROS框架 | 1人 | common, mission, bringup, 接口联调 |
+| 导航控制 | 2人 | localization升级, navigation升级 |
+| 探索规划 | 2人 | exploration升级, 多楼层 |
+| 识别定位 | 2人 | perception检测算法, 3D定位 |
+
+## 提交信息
+
+- 仓库：https://github.com/Griezmannzjw/danger_search_ws
+- 提交截止：2026年9月15日
+- 评分标准：环境探索效率15分（≤600s满分）、危险源搜索效率22分、系统鲁棒性13分

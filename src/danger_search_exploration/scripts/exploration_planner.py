@@ -71,6 +71,8 @@ class ExplorationPlanner:
         self.move_base_client = actionlib.SimpleActionClient(
             self.move_base_action_name, MoveBaseAction
         )
+        rospy.loginfo("[exploration] Waiting for move_base action server...")
+        self.move_base_client.wait_for_server()
 
         # ========== 服务客户端 ==========
         rospy.loginfo("[exploration] Waiting for make_plan service...")

@@ -107,6 +107,8 @@ class MissionManager:
         self.move_base_client = actionlib.SimpleActionClient(
             self.move_base_action_name, MoveBaseAction
         )
+        rospy.loginfo("[mission] Waiting for move_base action server...")
+        self.move_base_client.wait_for_server()
 
         # ========== 订阅者 ==========
         self.detections_sub = rospy.Subscriber(

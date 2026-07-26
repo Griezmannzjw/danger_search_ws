@@ -13,6 +13,8 @@ mission_status_topic: /mission/status
 mission_active_topic: /mission/active
 start_exploration_service: /danger_search/start_exploration
 stop_exploration_service: /danger_search/stop_exploration
+start_mission_service: /danger_search/start
+finish_mission_service: /danger_search/finish
 move_base_action_name: /move_base
 
 # 结果文件（绝对路径）
