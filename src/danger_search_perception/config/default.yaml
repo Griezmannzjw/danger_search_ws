@@ -1,8 +1,10 @@
 # 危险源感知模块参数
 # 对齐接口规范 v1.1-p0
 
-# 坐标系
+# 坐标系与当前楼层
 map_frame: map
+target_frame: map
+floor_id: 0
 
 # 话题
 rgb_topic: /real_sense/rgb/image_raw
@@ -11,11 +13,56 @@ camera_info_topic: /real_sense/rgb/camera_info
 detections_topic: /danger_detector/detections
 status_topic: /danger_detector/status
 
-# 检测参数
+# RGB、深度和内参近似时间同步
+sync_queue_size: 10
+sync_slop_s: 0.05
+
+# 感知能力与状态
 reliable_min_range: 0.4
 reliable_max_range: 5.0
-red_h_min: 0
-red_h_max: 10
-green_h_min: 40
-green_h_max: 80
-min_contour_area: 100
+input_fresh_timeout_s: 1.0
+capability_version: 1
+
+# HSV 红色双区间
+red_h_low_1: 0
+red_h_high_1: 10
+red_h_low_2: 170
+red_h_high_2: 180
+red_s_low: 120
+red_v_low: 80
+
+# 形态学操作
+morph_open_ksize: 3
+morph_close_ksize: 5
+
+# 二维候选过滤
+min_blob_area: 50
+max_blob_area: 100000
+min_circularity: 0.65
+min_circle_fill_ratio: 0.72
+min_aspect_ratio: 0.65
+max_aspect_ratio: 1.50
+reject_border_candidates: true
+border_margin_px: 2
+
+# 深度过滤；与当前 P0 可靠检测范围保持一致
+min_depth_m: 0.4
+max_depth_m: 5.0
+min_valid_depth_ratio: 0.45
+depth_mad_scale: 3.5
+max_points_per_candidate: 1500
+
+# 已知半径球面验证与红色平面（方块）排除
+expected_radius_m: 0.15
+radius_tolerance_m: 0.07
+sphere_inlier_threshold_m: 0.035
+max_sphere_residual_m: 0.035
+min_sphere_inlier_ratio: 0.55
+enable_plane_rejection: true
+max_plane_residual_m: 0.006
+plane_vs_sphere_ratio: 0.45
+
+# TF 与发布
+confidence_threshold: 0.60
+tf_timeout_s: 0.10
+publish_empty_array: true

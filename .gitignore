@@ -1,41 +1,44 @@
-# Build & Devel
-build/
-devel/
-install/
-logs/
+# Catkin build products
+/build/
+/devel/
+/install/
+/logs/
+/.catkin_workspace
+/src/CMakeLists.txt
 
-# ROS
+# ROS runtime files
+/.ros/
 *.bag
 *.bag.active
 *.rosinstall
 .rosinstall
 
-# Python
+# Python bytecode and test caches
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 *.egg-info/
 .eggs/
+.pytest_cache/
+.coverage
+htmlcov/
 
-# IDE
+# Editor and operating-system metadata
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
 Thumbs.db
 
-# Build artifacts
+# Compiled artifacts
 *.o
 *.a
 *.so
 *.so.*
 
-# Generated scenes (SimEnv style)
+# Generated scenes and results
 generated_building/
 results/*.json
 !results/.gitkeep
