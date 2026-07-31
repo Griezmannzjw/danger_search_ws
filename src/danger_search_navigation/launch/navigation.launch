@@ -1,8 +1,7 @@
 <launch>
   <arg name="config_file" default="$(find danger_search_navigation)/config/default.yaml" />
 
-  <rosparam command="load" file="$(arg config_file)" />
-
   <node name="nav_controller" pkg="danger_search_navigation" type="nav_controller.py" output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
   </node>
 </launch>

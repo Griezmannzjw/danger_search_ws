@@ -8,6 +8,7 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
   std_msgs
   std_srvs
+  tf
   tf2_ros
   actionlib
   actionlib_msgs
@@ -23,6 +24,7 @@ catkin_package(
   sensor_msgs
   std_msgs
   std_srvs
+  tf
   tf2_ros
   actionlib
   actionlib_msgs
@@ -36,5 +38,10 @@ include_directories(
 
 catkin_install_python(PROGRAMS
   scripts/nav_controller.py
+  scripts/navigation_core.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test/test_navigation_core.py)
+endif()

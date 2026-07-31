@@ -1,61 +1,76 @@
 # danger_search_navigation
 
-导航控制模块。
+`nav_controller.py` is the only navigation entry point and the only provider
+of `/move_base`, `/move_base/make_plan`, and `/danger_search/nav_cmd_vel`.
+It never publishes `/cmd_vel`; `danger_search_control` remains the only final
+velocity publisher.
 
-## 职责
+## Inputs
 
-1. 接收上层（探索模块）下发的目标点
-2. 基于地图进行全局路径规划
-3. 结合传感器进行局部避障与路径跟踪
-4. 输出速度指令给控制层
+| Interface | Type | Purpose |
+|---|---|---|
+| `/localization/pose` | `geometry_msgs/PoseWithCovarianceStamped` | Fresh robot pose in `map` |
+| `/map` | `nav_msgs/OccupancyGrid` | Global planning map |
+| `/mapping/status` | `danger_search_common/MappingStatus` | Localization readiness and loss gate |
+| `/scan` | `sensor_msgs/PointCloud` | Raw local dynamic-obstacle check only |
+| `/danger_search/safety_stop` | `std_msgs/Bool` | External safety stop gate |
 
-## 当前状态
+`/scan` is consumed directly. This package does not subscribe to
+`/Odometry_gazebo`, `/ground_truth/*`, `/livox/lidar2`, `/livox/Pointcloud2`,
+or any truth/layout file.
 
-**骨架版本**：简易 P 控制器 + 占位式避障，仅用于框架联调。
-正式版本需要接入完整的导航栈。
+## Outputs
 
-## 节点
+| Interface | Type | Meaning |
+|---|---|---|
+| `/move_base` | `move_base_msgs/MoveBaseAction` | Navigation Action server |
+| `/move_base/make_plan` | `nav_msgs/GetPlan` | Plan query using the same planner as Action execution |
+| `/danger_search/nav_cmd_vel` | `geometry_msgs/Twist` | Navigation-only velocity request for control |
+| `/navigation/health` | `danger_search_common/NavigationHealth` | Actual action and controller health |
 
-### nav_controller.py
-导航控制器主节点。
+`/move_base/clear_costmaps` is retained as an existing compatibility service.
+It requests a route refresh from the newest map; it does not create a second
+costmap or Action server.
 
-#### 订阅话题
-| 话题 | 类型 | 说明 |
-|------|------|------|
-| `/danger_search/exploration_goal` | `geometry_msgs/PoseStamped` | 探索目标点 |
-| `/danger_search/odom` | `nav_msgs/Odometry` | 机器人里程计 |
-| `/map` | `nav_msgs/OccupancyGrid` | 栅格地图 |
-| `/livox/Pointcloud2` | `sensor_msgs/PointCloud2` | 激光点云（局部避障） |
+## Planning And Control
 
-#### 发布话题
-| 话题 | 类型 | 说明 |
-|------|------|------|
-| `/danger_search/nav_cmd_vel` | `geometry_msgs/Twist` | 导航速度指令 |
+The controller builds one conservative planning grid from `/map`:
 
-## 配置参数
+1. Unknown cells, map exterior, all non-free cells, occupied cells, and
+   occupied-cell inflation for the configured robot radius are non-traversable.
+2. A* is used by both `make_plan` and Action execution. The Action follows
+   the exact route computed by that shared planner instead of driving directly
+   at its final goal.
+3. The current raw `/scan` is transformed with YAML LiDAR-to-base extrinsics,
+   checked in front of the robot, and overlaid as temporary inflated obstacles
+   for replanning. A stale or invalid required cloud stops an active goal.
+4. A non-holonomic pure-pursuit controller tracks a path lookahead point,
+   rotates in place for large heading error, and separately satisfies final
+   position and yaw tolerances.
 
-见 `config/default.yaml`，主要包括：
-- 最大线速度 / 角速度限制
-- 到达目标阈值
-- 障碍物安全距离
-- 控制频率
+Action requests must contain a fresh `map`-frame pose, a valid quaternion, a
+free inflated goal cell, and an A* route. Cancellation, timeout, no route,
+stuck progress, localization loss, and safety stop publish zero navigation
+velocity and report only the frozen `NavigationHealth.failure_code` values.
 
-## 升级路线
+## Configuration
 
-推荐方案：
+All names, frames, thresholds, timeouts, and LiDAR extrinsics are private ROS
+parameters in `config/default.yaml`. `competition.launch` already loads that
+file inside the `navigation` node namespace. The package-local
+`navigation.launch` now does the same, so standalone launches use exactly the
+same private parameters:
 
-1. **move_base 架构**（ROS 标准）
-   - global_planner: Dijkstra / A* 全局规划
-   - local_planner: DWA / TEB 局部规划
-   - costmap_2d: 全局 + 局部代价地图
+```bash
+roslaunch danger_search_navigation navigation.launch
+```
 
-2. **自定义实现**
-   - 全局：A* / RRT* 路径规划
-   - 局部：DWA 动态窗口法
-   - 代价地图：膨胀障碍物
+## Static Tests
 
-## 与探索模块的边界
+`test/test_navigation_core.py` is ROS-independent and covers A* detours,
+robot-radius inflation, unreachable goals, dynamic obstacle inflation, Action
+cancellation state, and the zero-velocity result. It can run with:
 
-- **探索模块**：决定"去哪里"（目标点决策）
-- **导航模块**：决定"怎么去"（路径规划与跟踪）
-- 接口：`/danger_search/exploration_goal` (PoseStamped)
+```bash
+python3 test/test_navigation_core.py
+```
