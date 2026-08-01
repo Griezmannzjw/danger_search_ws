@@ -38,3 +38,7 @@ catkin_install_python(PROGRAMS
   scripts/exploration_planner.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test/test_simple_frontier.py)
+endif()

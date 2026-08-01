@@ -17,5 +17,10 @@ stop_service: /danger_search/stop_exploration
 # 探索参数
 goal_interval: 2.0
 max_retry: 3
-min_goal_dist: 2.0
-max_goal_dist: 8.0
+min_frontier_length: 0.6
+max_frontier_candidates: 20
+goal_timeout: 60.0
+plan_tolerance: 0.5
+failed_goal_cooldown: 30.0
+failed_goal_radius: 0.75
+dependency_check_timeout: 0.1
