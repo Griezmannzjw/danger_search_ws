@@ -2,6 +2,7 @@
   <arg name="config_file" default="$(find danger_search_navigation)/config/default.yaml" />
 
   <node name="nav_controller" pkg="danger_search_navigation" type="nav_controller.py" output="screen">
+    <!-- 必须在节点内加载，保证所有配置均为 ~ 私有参数。 -->
     <rosparam command="load" file="$(arg config_file)" />
   </node>
 </launch>

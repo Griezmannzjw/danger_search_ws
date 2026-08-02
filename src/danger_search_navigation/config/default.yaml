@@ -1,12 +1,9 @@
-# Private parameters for nav_controller.py.  competition.launch loads this
-# file inside the navigation node namespace.
+# nav_controller.py 的节点私有参数。competition.launch 已在 navigation 节点内加载本文件。
 
-# Frames
+# 坐标系和冻结接口
 map_frame: map
 base_frame: base
 lidar_frame: laser_livox
-
-# Frozen interfaces
 nav_cmd_topic: /danger_search/nav_cmd_vel
 pose_topic: /localization/pose
 map_topic: /map
@@ -18,14 +15,14 @@ move_base_action_name: /move_base
 make_plan_service: /move_base/make_plan
 clear_costmaps_service: /move_base/clear_costmaps
 
-# Global planning on the same inflated OccupancyGrid used by Action execution.
+# 共享 OccupancyGrid A*。未知、占据和所有非自由格均不可通行。
 occupied_threshold: 65
 robot_radius: 0.30
 inflation_padding: 0.10
 allow_diagonal: true
 max_planner_expansions: 75000
 
-# Message validity and freshness
+# 消息合法性和新鲜度门
 pose_timeout: 0.50
 map_timeout: 2.00
 mapping_status_timeout: 1.50
@@ -33,10 +30,10 @@ obstacle_cloud_timeout: 0.50
 goal_stamp_timeout: 2.00
 max_future_stamp_skew: 0.05
 quaternion_norm_tolerance: 0.05
+# 若为 true，缺失、过期或帧错误的 /scan 会安全结束活动目标。
 require_obstacle_cloud: true
 
-# Raw /scan LiDAR pose in base.  Keep these explicit; no TF or truth odometry
-# is consumed by navigation.
+# /scan 到 base 的部署外参与局部动态障碍筛选。点云仅做障碍保护，不用于定位。
 lidar_x: 0.20
 lidar_y: 0.00
 lidar_z: 0.08
@@ -52,7 +49,7 @@ obstacle_max_points: 2000
 dynamic_stop_distance: 0.60
 dynamic_front_half_angle: 0.52
 
-# Non-holonomic path tracking and action lifecycle
+# 非完整底盘的路径跟踪、最终朝向和有限频率重规划。
 control_rate: 20.0
 health_rate: 5.0
 goal_timeout: 60.0
@@ -62,9 +59,6 @@ lookahead_distance: 0.60
 cruise_speed: 0.20
 max_linear_speed: 0.30
 max_angular_speed: 0.80
-max_linear_accel: 0.40
-max_angular_accel: 0.80
-max_decel: 0.50
 rotate_in_place_angle: 0.45
 rotate_in_place_gain: 1.50
 final_yaw_gain: 1.20
