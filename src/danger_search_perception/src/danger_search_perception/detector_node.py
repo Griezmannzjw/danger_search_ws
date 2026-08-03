@@ -3,6 +3,7 @@
 import message_filters
 import rospy
 import tf2_ros
+import threading
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import PointStamped
 from image_geometry import PinholeCameraModel
@@ -13,6 +14,7 @@ from danger_search_common.msg import (
     DangerSource,
     DangerSourceArray,
     DetectionStatus,
+    MappingStatus,
 )
 
 from .color_detector import RedCandidateDetector
@@ -45,6 +47,11 @@ class DangerDetectorNode:
             "~status_topic", "/danger_detector/status"
         )
         self.floor_id = int(rospy.get_param("~floor_id", 0))
+        self.current_floor = self.floor_id
+        self.floor_lock = threading.Lock()
+        self.mapping_status_topic = rospy.get_param(
+            "~mapping_status_topic", "/mapping/status"
+        )
         self.input_fresh_timeout_s = float(
             rospy.get_param("~input_fresh_timeout_s", 1.0)
         )
@@ -77,6 +84,12 @@ class DangerDetectorNode:
         )
         self.status_pub = rospy.Publisher(
             self.status_topic, DetectionStatus, queue_size=10
+        )
+        self.mapping_status_sub = rospy.Subscriber(
+            self.mapping_status_topic,
+            MappingStatus,
+            self._mapping_status_callback,
+            queue_size=5,
         )
         self.rgb_sub = message_filters.Subscriber(self.rgb_topic, Image)
         self.depth_sub = message_filters.Subscriber(self.depth_topic, Image)
@@ -158,6 +171,10 @@ class DangerDetectorNode:
             )
             if geometry is None:
                 continue
+            if not self.pipeline_config.is_reliable_range(
+                geometry.center_camera
+            ):
+                continue
 
             confidence = observation_confidence(
                 candidate, geometry, self.geometry_config
@@ -219,10 +236,22 @@ class DangerDetectorNode:
         )
         danger.class_id = DangerSource.CLASS_DANGER_RED_SPHERE
         danger.position = point_target
-        danger.floor_id = self.floor_id
+        with self.floor_lock:
+            danger.floor_id = self.current_floor
         danger.confidence = float(confidence)
         danger.source_time = stamp
         return danger
+
+    def _mapping_status_callback(self, message):
+        if message.current_floor < 0:
+            rospy.logwarn_throttle(
+                2.0,
+                "[perception] ignoring invalid floor id %d",
+                message.current_floor,
+            )
+            return
+        with self.floor_lock:
+            self.current_floor = int(message.current_floor)
 
     def _lookup_transform(self, camera_frame, stamp):
         try:

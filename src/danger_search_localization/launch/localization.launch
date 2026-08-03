@@ -1,8 +1,40 @@
 <launch>
   <arg name="config_file" default="$(find danger_search_localization)/config/default.yaml" />
 
-  <rosparam command="load" file="$(arg config_file)" />
+  <!-- 只读取官方原始 /scan；不读取 /Odometry_gazebo 或真值变换后的点云。 -->
+  <node name="local_scan_projector"
+        pkg="danger_search_localization"
+        type="scan_projector.py"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+  </node>
 
-  <node name="pose_estimator" pkg="danger_search_localization" type="pose_estimator.py" output="screen">
+  <!-- navigation 位姿使用三维点云 GICP，不使用 Gazebo 真值。 -->
+  <node name="lidar_odometry"
+        pkg="danger_search_localization"
+        type="lidar_odometry_node"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+  </node>
+
+  <!-- Hector 只作为可替换的 SLAM 后端，公共话题和 TF 由 adapter 统一发布。 -->
+  <node name="hector_mapping"
+        pkg="hector_mapping"
+        type="hector_mapping"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <remap from="scan" to="/localization/scan" />
+    <remap from="poseupdate" to="/localization/hector_pose" />
+    <remap from="map" to="/localization/raw_map" />
+    <param name="pub_map_odom_transform" value="false" />
+    <param name="use_tf_scan_transformation" value="true" />
+    <param name="use_tf_pose_start_estimate" value="false" />
+  </node>
+
+  <node name="localization_adapter"
+        pkg="danger_search_localization"
+        type="pose_estimator.py"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
   </node>
 </launch>

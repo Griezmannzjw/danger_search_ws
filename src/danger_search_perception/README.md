@@ -72,6 +72,11 @@ map -> odom -> base -> camera
 当前传统视觉实现是无需训练数据的可运行基线。阈值仍需使用多个随机场景继续
 标定；若遮挡、距离和光照变化导致效果不足，再评估实例分割或 YOLO。
 
+参数见 `config/default.yaml`。其中 `min_depth_m` / `max_depth_m` 是深度图的
+硬处理范围；`reliable_min_range` / `reliable_max_range` 是相机到拟合球心的
+三维可靠距离，超出该范围的候选不会发布。节点启动时会检查 HSV、面积、
+深度、半径、置信度和距离等参数；非法配置会直接报错，避免静默产生错误结果。
+
 ## 编译
 
 ```bash

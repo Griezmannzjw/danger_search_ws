@@ -5,6 +5,7 @@
 map_frame: map
 target_frame: map
 floor_id: 0
+mapping_status_topic: /mapping/status
 
 # 话题
 rgb_topic: /real_sense/rgb/image_raw
@@ -17,7 +18,7 @@ status_topic: /danger_detector/status
 sync_queue_size: 10
 sync_slop_s: 0.05
 
-# 感知能力与状态
+# 感知能力与状态；球心三维距离超出可靠范围时不发布检测
 reliable_min_range: 0.4
 reliable_max_range: 5.0
 input_fresh_timeout_s: 1.0
