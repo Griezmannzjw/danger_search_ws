@@ -39,7 +39,7 @@ class FakeCameraModel:
         )
 
 
-class DepthGeometryValidatorTest(unittest.TestCase):
+class TestDepthGeometryValidator(unittest.TestCase):
     def setUp(self):
         self.camera = FakeCameraModel()
         self.color_detector = RedCandidateDetector(ColorDetectionConfig())
@@ -69,6 +69,33 @@ class DepthGeometryValidatorTest(unittest.TestCase):
         self.assertAlmostEqual(result.center_camera[0], 0.0, delta=0.02)
         self.assertAlmostEqual(result.center_camera[1], 0.0, delta=0.02)
         self.assertAlmostEqual(result.center_camera[2], center_z, delta=0.04)
+
+    def test_missing_depth_is_rejected(self):
+        image, depth = self._synthetic_sphere(2.0, 0.15)
+        depth.fill(np.nan)
+
+        self.assertIsNone(self._validate_first_candidate(image, depth))
+
+    def test_flat_red_circle_is_rejected_as_plane(self):
+        image, depth = self._synthetic_sphere(2.0, 0.15)
+        depth[np.isfinite(depth)] = 2.0
+
+        self.assertIsNone(self._validate_first_candidate(image, depth))
+
+    def test_wrong_radius_sphere_is_rejected(self):
+        image, depth = self._synthetic_sphere(2.0, 0.30)
+
+        self.assertIsNone(self._validate_first_candidate(image, depth))
+
+    def _validate_first_candidate(self, image, depth):
+        _, candidates = self.color_detector.detect(image)
+        self.assertEqual(len(candidates), 1)
+        inner_mask = self.color_detector.make_inner_mask(
+            candidates[0], image.shape
+        )
+        return self.validator.validate(
+            candidates[0], inner_mask, depth, self.camera
+        )
 
     def _synthetic_sphere(self, center_z, radius):
         height, width = 480, 640

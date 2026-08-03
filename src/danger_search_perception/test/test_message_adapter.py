@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import unittest
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,10 +12,12 @@ from danger_search_common.msg import DangerSource
 from danger_search_perception.detector_node import DangerDetectorNode
 
 
-class P0MessageAdapterTest(unittest.TestCase):
+class TestP0MessageAdapter(unittest.TestCase):
     def test_detection_populates_required_p0_fields(self):
         node = DangerDetectorNode.__new__(DangerDetectorNode)
         node.floor_id = 0
+        node.current_floor = 0
+        node.floor_lock = threading.Lock()
         node.target_frame = "map"
 
         transform = TransformStamped()

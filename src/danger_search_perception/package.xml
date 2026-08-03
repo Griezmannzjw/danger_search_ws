@@ -27,6 +27,8 @@
   <exec_depend>tf2_geometry_msgs</exec_depend>
   <exec_depend>image_geometry</exec_depend>
   <exec_depend>danger_search_common</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
 
   <test_depend>python3-nose</test_depend>
 </package>

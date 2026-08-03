@@ -41,11 +41,12 @@ class DepthGeometryValidator:
 
         depths = depth_m[rows, cols]
         cfg = self.config
-        valid = (
-            np.isfinite(depths)
-            & (depths >= cfg.min_depth_m)
-            & (depths <= cfg.max_depth_m)
-        )
+        with np.errstate(invalid="ignore"):
+            valid = (
+                np.isfinite(depths)
+                & (depths >= cfg.min_depth_m)
+                & (depths <= cfg.max_depth_m)
+            )
         valid_ratio = float(np.count_nonzero(valid)) / float(depths.size)
         if valid_ratio < cfg.min_valid_depth_ratio:
             return None

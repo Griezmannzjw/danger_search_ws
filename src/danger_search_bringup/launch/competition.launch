@@ -5,11 +5,8 @@
   <!-- 加载全局参数到根命名空间 -->
   <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
 
-  <!-- 1. 定位与建图模块 -->
-  <node name="localization" pkg="danger_search_localization" type="pose_estimator.py" output="screen">
-    <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
-    <rosparam command="load" file="$(find danger_search_localization)/config/default.yaml" />
-  </node>
+  <!-- 1. 定位与建图模块（点云投影 + SLAM 后端 + 公共接口适配） -->
+  <include file="$(find danger_search_localization)/launch/localization.launch" />
 
   <!-- 2. 危险源感知模块 -->
   <node name="perception" pkg="danger_search_perception" type="danger_detector.py" output="screen">
