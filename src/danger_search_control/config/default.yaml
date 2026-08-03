@@ -4,13 +4,20 @@
 # 话题
 nav_cmd_topic: /danger_search/nav_cmd_vel
 output_cmd_topic: /cmd_vel
+sent_cmd_topic: /danger_search/cmd_vel_sent
 safety_stop_topic: /danger_search/safety_stop
 
 # 安全参数
 enable_safety: true
 cmd_timeout_s: 0.5
+
+# 速度和加速度上限
 max_linear_accel: 1.0
 max_angular_accel: 2.0
+max_linear_speed: 0.30
+max_lateral_speed: 0.25
+max_angular_speed: 0.80
+max_dt_s: 0.10
 
 # 控制频率
 output_rate: 50
