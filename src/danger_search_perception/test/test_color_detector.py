@@ -9,7 +9,7 @@ from danger_search_perception.color_detector import RedCandidateDetector
 from danger_search_perception.config import ColorDetectionConfig
 
 
-class RedCandidateDetectorTest(unittest.TestCase):
+class TestRedCandidateDetector(unittest.TestCase):
     def setUp(self):
         self.detector = RedCandidateDetector(ColorDetectionConfig())
 
@@ -33,6 +33,14 @@ class RedCandidateDetectorTest(unittest.TestCase):
     def test_green_circle_is_rejected(self):
         image = np.zeros((480, 640, 3), dtype=np.uint8)
         cv2.circle(image, (320, 240), 35, (0, 255, 0), thickness=-1)
+
+        _, candidates = self.detector.detect(image)
+
+        self.assertEqual(candidates, [])
+
+    def test_border_circle_is_rejected(self):
+        image = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.circle(image, (10, 240), 35, (0, 0, 255), thickness=-1)
 
         _, candidates = self.detector.detect(image)
 

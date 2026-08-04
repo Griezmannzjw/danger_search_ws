@@ -1,358 +1,792 @@
 #!/usr/bin/env python3
-"""
-导航控制节点 - P0最小可运行版本
-对齐接口规范 v1.1-p0
+"""导航控制节点。
 
-提供：
-  - Action: /move_base (move_base_msgs/MoveBaseAction)
-  - Service: /move_base/make_plan (nav_msgs/GetPlan)
-  - Topic: /navigation/health (NavigationHealth)
-  - Topic: /danger_search/nav_cmd_vel (Twist) 给控制层
-
-P0要求：
-  - 所有名称从参数读取
-  - make_plan基于实际地图判断可达性，不返回直线
-  - 取消/失败/超时后立即停止速度输出
-  - 只有navigation可以发nav_cmd_vel
+提供 MoveBaseAction 与 make_plan 服务。两者通过同一个 occupancy-aware A*
+规划入口使用同一份膨胀后占据栅格；Action 只跟踪该入口返回的路径。
 """
 
-import rospy
-import actionlib
 import math
-import numpy as np
-import tf2_ros
+import os
+import sys
+import threading
+
+import actionlib
+import rospy
 import tf.transformations
-from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
-from nav_msgs.msg import Path, OccupancyGrid
-from move_base_msgs.msg import MoveBaseAction, MoveBaseResult, MoveBaseFeedback
+from danger_search_common.msg import MappingStatus, NavigationHealth
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+from move_base_msgs.msg import MoveBaseAction, MoveBaseFeedback, MoveBaseResult
+from nav_msgs.msg import OccupancyGrid
 from nav_msgs.srv import GetPlan, GetPlanResponse
+from sensor_msgs.msg import PointCloud
+from std_msgs.msg import Bool
 from std_srvs.srv import Empty, EmptyResponse
-from danger_search_common.msg import NavigationHealth
-from actionlib_msgs.msg import GoalStatus
+
+# catkin 的 devel-space 会为可执行 Python 脚本生成 relay。该 relay 不适合作为
+# 被 import 的模块，因此先把本源码目录置于搜索路径最前，保证导入真实核心。
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+try:
+    sys.path.remove(_SCRIPT_DIR)
+except ValueError:
+    pass
+sys.path.insert(0, _SCRIPT_DIR)
+
+from navigation_core import (
+    GoalState,
+    InflatedOccupancyGrid,
+    goal_reached,
+    normalize_angle,
+    path_lengths,
+    path_progress,
+)
 
 
 class NavController:
+    """共享全局规划器和固定路径跟踪器的 ROS 适配层。"""
+
     def __init__(self):
         rospy.init_node("nav_controller", anonymous=False)
 
-        # ========== 从参数读取所有名称 ==========
+        # 所有名称均从节点私有参数读取。
         self.map_frame = rospy.get_param("~map_frame", "map")
         self.base_frame = rospy.get_param("~base_frame", "base")
-
         self.nav_cmd_topic = rospy.get_param("~nav_cmd_topic", "/danger_search/nav_cmd_vel")
         self.pose_topic = rospy.get_param("~pose_topic", "/localization/pose")
         self.map_topic = rospy.get_param("~map_topic", "/map")
+        self.mapping_status_topic = rospy.get_param("~mapping_status_topic", "/mapping/status")
         self.health_topic = rospy.get_param("~health_topic", "/navigation/health")
+        self.obstacle_cloud_topic = rospy.get_param("~obstacle_cloud_topic", "/scan")
+        self.safety_stop_topic = rospy.get_param("~safety_stop_topic", "/danger_search/safety_stop")
         self.move_base_action_name = rospy.get_param("~move_base_action_name", "/move_base")
         self.make_plan_service = rospy.get_param("~make_plan_service", "/move_base/make_plan")
-        self.clear_costmaps_service = rospy.get_param("~clear_costmaps_service", "/move_base/clear_costmaps")
+        self.clear_costmaps_service = rospy.get_param(
+            "~clear_costmaps_service", "/move_base/clear_costmaps"
+        )
 
-        # 控制参数
-        self.linear_kp = rospy.get_param("~linear_kp", 0.5)
-        self.angular_kp = rospy.get_param("~angular_kp", 1.5)
-        self.max_linear_speed = rospy.get_param("~max_linear_speed", 0.3)
-        self.max_angular_speed = rospy.get_param("~max_angular_speed", 0.8)
-        self.goal_tolerance_xy = rospy.get_param("~goal_tolerance_xy", 0.3)
-        self.goal_tolerance_yaw = rospy.get_param("~goal_tolerance_yaw", 0.2)
-        self.goal_timeout = rospy.get_param("~goal_timeout", 60.0)
-        self.stuck_threshold = rospy.get_param("~stuck_threshold", 5.0)
-        self.control_rate = rospy.get_param("~control_rate", 20.0)
+        # 所有规划、安全和控制阈值均从节点私有参数读取。
+        self.occupied_threshold = int(rospy.get_param("~occupied_threshold", 65))
+        self.robot_radius = float(rospy.get_param("~robot_radius", 0.30))
+        self.inflation_padding = float(rospy.get_param("~inflation_padding", 0.10))
+        self.allow_diagonal = bool(rospy.get_param("~allow_diagonal", True))
+        self.max_expansions = int(rospy.get_param("~max_planner_expansions", 75000))
+        self.pose_timeout = float(rospy.get_param("~pose_timeout", 0.50))
+        self.map_timeout = float(rospy.get_param("~map_timeout", 2.00))
+        self.mapping_status_timeout = float(rospy.get_param("~mapping_status_timeout", 1.50))
+        self.obstacle_cloud_timeout = float(rospy.get_param("~obstacle_cloud_timeout", 0.50))
+        self.goal_stamp_timeout = float(rospy.get_param("~goal_stamp_timeout", 2.00))
+        self.max_future_stamp_skew = float(rospy.get_param("~max_future_stamp_skew", 0.05))
+        self.quaternion_norm_tolerance = float(rospy.get_param("~quaternion_norm_tolerance", 0.05))
+        self.require_obstacle_cloud = bool(rospy.get_param("~require_obstacle_cloud", True))
+        self.lidar_frame = rospy.get_param("~lidar_frame", "laser_livox")
+        self.lidar_x = float(rospy.get_param("~lidar_x", 0.20))
+        self.lidar_y = float(rospy.get_param("~lidar_y", 0.0))
+        self.lidar_z = float(rospy.get_param("~lidar_z", 0.08))
+        self.lidar_roll = float(rospy.get_param("~lidar_roll", 0.0))
+        self.lidar_pitch = float(rospy.get_param("~lidar_pitch", 0.785))
+        self.lidar_yaw = float(rospy.get_param("~lidar_yaw", 0.0))
+        self.obstacle_min_z = float(rospy.get_param("~obstacle_min_z", -0.30))
+        self.obstacle_max_z = float(rospy.get_param("~obstacle_max_z", 0.80))
+        self.obstacle_range_min = float(rospy.get_param("~obstacle_range_min", 0.15))
+        self.obstacle_range_max = float(rospy.get_param("~obstacle_range_max", 8.00))
+        self.zero_point_radius = float(rospy.get_param("~zero_point_radius", 0.05))
+        self.obstacle_max_points = int(rospy.get_param("~obstacle_max_points", 2000))
+        self.dynamic_stop_distance = float(rospy.get_param("~dynamic_stop_distance", 0.60))
+        self.dynamic_front_half_angle = float(rospy.get_param("~dynamic_front_half_angle", 0.52))
+        self.lookahead_distance = float(rospy.get_param("~lookahead_distance", 0.60))
+        self.cruise_speed = float(rospy.get_param("~cruise_speed", 0.20))
+        self.max_linear_speed = float(rospy.get_param("~max_linear_speed", 0.30))
+        self.max_angular_speed = float(rospy.get_param("~max_angular_speed", 0.80))
+        self.rotate_in_place_angle = float(rospy.get_param("~rotate_in_place_angle", 0.45))
+        self.rotate_in_place_gain = float(rospy.get_param("~rotate_in_place_gain", 1.50))
+        self.final_yaw_gain = float(rospy.get_param("~final_yaw_gain", 1.20))
+        self.replan_period = float(rospy.get_param("~replan_period", 1.00))
+        self.replan_min_interval = float(rospy.get_param("~replan_min_interval", 0.25))
+        self.replan_deviation_distance = float(rospy.get_param("~replan_deviation_distance", 0.50))
+        self.goal_tolerance_xy = float(rospy.get_param("~goal_tolerance_xy", 0.30))
+        self.goal_tolerance_yaw = float(rospy.get_param("~goal_tolerance_yaw", 0.20))
+        self.goal_timeout = float(rospy.get_param("~goal_timeout", 60.0))
+        self.stuck_timeout = float(rospy.get_param("~stuck_timeout", 5.0))
+        self.progress_distance = float(rospy.get_param("~progress_distance", 0.10))
+        self.stuck_command_speed = float(rospy.get_param("~stuck_command_speed", 0.05))
+        self.control_rate = float(rospy.get_param("~control_rate", 20.0))
+        self.health_rate = float(rospy.get_param("~health_rate", 5.0))
+        self._validate_configuration()
 
-        # ========== 状态 ==========
-        self.current_pose = None  # (x, y, yaw)
-        self.current_map = None
-        self.map_info = None
+        self.lock = threading.RLock()
+        self.current_pose = None  # (x, y, yaw)，全部处于 map 坐标系。
+        self.pose_stamp = rospy.Time(0)
+        self.pose_valid = False
         self.map_data = None
+        self.planner = None
+        self.map_stamp = rospy.Time(0)
+        self.map_valid = False
+        self.map_generation = 0
+        self.mapping_status = None
+        self.mapping_status_stamp = rospy.Time(0)
+        self.latest_obstacles_base = []
+        self.obstacle_stamp = rospy.Time(0)
+        self.obstacle_frame_valid = False
+        self.safety_stop = False
+        self.clear_costmaps_requested = False
+        self.lidar_rotation = tf.transformations.euler_matrix(
+            self.lidar_roll, self.lidar_pitch, self.lidar_yaw
+        )[:3, :3]
 
+        self.goal_state = GoalState()
         self.has_active_goal = False
-        self.active_goal = None
         self.active_goal_id = ""
+        self.active_path = []
+        self.active_path_lengths = []
+        self.waypoint_index = 0
         self.goal_start_time = None
         self.last_progress_time = rospy.Time.now()
         self.last_position = None
         self.is_stuck = False
         self.failure_code = "NONE"
+        self.failure_detail = ""
         self.controller_active = False
+        self.last_cmd_time = rospy.Time(0)
 
-        # ========== TF ==========
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
-
-        # ========== 发布者 ==========
         self.cmd_pub = rospy.Publisher(self.nav_cmd_topic, Twist, queue_size=10)
         self.health_pub = rospy.Publisher(self.health_topic, NavigationHealth, queue_size=10)
 
-        # ========== 订阅者 ==========
         self.pose_sub = rospy.Subscriber(
             self.pose_topic, PoseWithCovarianceStamped, self.pose_callback
         )
-        self.map_sub = rospy.Subscriber(
-            self.map_topic, OccupancyGrid, self.map_callback
+        self.map_sub = rospy.Subscriber(self.map_topic, OccupancyGrid, self.map_callback)
+        self.mapping_status_sub = rospy.Subscriber(
+            self.mapping_status_topic, MappingStatus, self.mapping_status_callback
+        )
+        self.obstacle_sub = rospy.Subscriber(
+            self.obstacle_cloud_topic, PointCloud, self.obstacle_callback
+        )
+        self.safety_stop_sub = rospy.Subscriber(
+            self.safety_stop_topic, Bool, self.safety_stop_callback
         )
 
-        # ========== Action服务器 ==========
         self.action_server = actionlib.SimpleActionServer(
             self.move_base_action_name,
             MoveBaseAction,
             execute_cb=self.execute_cb,
-            auto_start=False
+            auto_start=False,
         )
         self.action_server.register_preempt_callback(self.preempt_cb)
         self.action_server.start()
 
-        # ========== 服务 ==========
-        self.make_plan_srv = rospy.Service(
-            self.make_plan_service, GetPlan, self.make_plan_cb
-        )
+        self.make_plan_srv = rospy.Service(self.make_plan_service, GetPlan, self.make_plan_cb)
         self.clear_costmaps_srv = rospy.Service(
             self.clear_costmaps_service, Empty, self.clear_costmaps_cb
         )
-
-        # ========== 控制循环 ==========
         self.control_timer = rospy.Timer(
             rospy.Duration(1.0 / self.control_rate), self.control_loop
         )
-        self.health_timer = rospy.Timer(rospy.Duration(0.2), self.publish_health)
+        self.health_timer = rospy.Timer(
+            rospy.Duration(1.0 / self.health_rate), self.publish_health
+        )
+        rospy.on_shutdown(self._stop_robot)
 
-        rospy.loginfo(f"[navigation] Nav controller started, action: {self.move_base_action_name}")
+        rospy.loginfo(
+            "[navigation] 已启动共享 A* 导航节点，action: %s", self.move_base_action_name
+        )
+
+    def _validate_configuration(self):
+        """在启动前拒绝会破坏安全语义的配置。"""
+        positive_values = (
+            self.max_expansions, self.pose_timeout, self.map_timeout,
+            self.mapping_status_timeout, self.obstacle_cloud_timeout,
+            self.goal_stamp_timeout, self.quaternion_norm_tolerance,
+            self.obstacle_range_max, self.obstacle_max_points,
+            self.dynamic_stop_distance, self.control_rate, self.health_rate,
+            self.goal_timeout, self.goal_tolerance_xy, self.goal_tolerance_yaw,
+            self.lookahead_distance, self.cruise_speed, self.max_linear_speed,
+            self.max_angular_speed, self.rotate_in_place_angle,
+            self.rotate_in_place_gain, self.final_yaw_gain, self.replan_period,
+            self.replan_min_interval, self.replan_deviation_distance,
+            self.stuck_timeout, self.progress_distance,
+        )
+        if any(not math.isfinite(value) or value <= 0.0 for value in positive_values):
+            raise rospy.ROSInitException("导航正数参数无效")
+        if (not math.isfinite(self.robot_radius) or not math.isfinite(self.inflation_padding)
+                or self.robot_radius < 0.0 or self.inflation_padding < 0.0):
+            raise rospy.ROSInitException("导航膨胀参数不能为负")
+        if not math.isfinite(self.max_future_stamp_skew) or self.max_future_stamp_skew < 0.0:
+            raise rospy.ROSInitException("消息未来时间容差无效")
+        if self.obstacle_min_z > self.obstacle_max_z:
+            raise rospy.ROSInitException("点云高度范围无效")
+        if self.obstacle_range_min < 0.0 or self.obstacle_range_min >= self.obstacle_range_max:
+            raise rospy.ROSInitException("点云距离范围无效")
+        if not 1 <= self.occupied_threshold <= 100:
+            raise rospy.ROSInitException("占据阈值必须位于 1..100")
 
     def pose_callback(self, msg):
-        """位姿回调"""
-        q = msg.pose.pose.orientation
-        _, _, yaw = tf.transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
-        self.current_pose = (
-            msg.pose.pose.position.x,
-            msg.pose.pose.position.y,
-            yaw
-        )
+        """仅保存时间、帧、数值和四元数均合法的 map 位姿。"""
+        pose, valid = self._pose_from_message(msg)
+        with self.lock:
+            self.current_pose = pose
+            self.pose_stamp = msg.header.stamp
+            self.pose_valid = valid
+            active = self.goal_state.active
+        if not valid and active:
+            self._stop_robot()
 
     def map_callback(self, msg):
-        """地图回调"""
-        self.current_map = msg
-        self.map_info = msg.info
-        self.map_data = np.array(msg.data, dtype=np.int8).reshape(
-            (msg.info.height, msg.info.width)
+        """原子替换经合法性检查的规划器快照。"""
+        planner = None
+        valid = False
+        if msg.header.frame_id == self.map_frame and not msg.header.stamp.is_zero():
+            origin = msg.info.origin
+            yaw = self._quaternion_yaw(origin.orientation)
+            if yaw is not None and self._finite(origin.position.x, origin.position.y):
+                try:
+                    planner = InflatedOccupancyGrid(
+                        msg.info.width, msg.info.height, msg.info.resolution,
+                        origin.position.x, origin.position.y, yaw, msg.data,
+                        occupied_threshold=self.occupied_threshold,
+                        robot_radius=self.robot_radius,
+                        inflation_padding=self.inflation_padding,
+                        allow_diagonal=self.allow_diagonal,
+                        max_expansions=self.max_expansions,
+                    )
+                    valid = True
+                except (TypeError, ValueError) as exc:
+                    rospy.logwarn_throttle(5.0, "[navigation] 地图无效，拒绝规划: %s", exc)
+        if not valid:
+            rospy.logwarn_throttle(5.0, "[navigation] 地图帧、时间戳、原点或几何无效")
+        with self.lock:
+            self.map_data = tuple(msg.data) if valid else None
+            self.planner = planner
+            self.map_stamp = msg.header.stamp
+            self.map_valid = valid
+            if valid:
+                self.map_generation += 1
+            active = self.goal_state.active
+        if not valid and active:
+            self._stop_robot()
+
+    def mapping_status_callback(self, msg):
+        """保存定位/建图模块明确声明的 ready、stable、lost 状态。"""
+        with self.lock:
+            self.mapping_status = msg
+            self.mapping_status_stamp = msg.header.stamp
+            active = self.goal_state.active
+        if active and (msg.lost or not msg.ready or not msg.stable):
+            self._stop_robot()
+
+    def obstacle_callback(self, cloud):
+        """把有效原始 /scan 转为 base 坐标下的临时障碍，不用作定位。"""
+        points = []
+        frame_valid = cloud.header.frame_id == self.lidar_frame and not cloud.header.stamp.is_zero()
+        if frame_valid:
+            count = len(cloud.points)
+            step = max(1, int(math.ceil(float(count) / self.obstacle_max_points)))
+            for point in cloud.points[::step]:
+                if not self._finite(point.x, point.y, point.z):
+                    continue
+                if point.x * point.x + point.y * point.y + point.z * point.z < self.zero_point_radius ** 2:
+                    continue
+                base_x, base_y, base_z = self._lidar_to_base(point.x, point.y, point.z)
+                distance = math.hypot(base_x, base_y)
+                if not self.obstacle_min_z <= base_z <= self.obstacle_max_z:
+                    continue
+                if not self.obstacle_range_min <= distance <= self.obstacle_range_max:
+                    continue
+                points.append((base_x, base_y, base_z))
+        else:
+            rospy.logwarn_throttle(
+                5.0, "[navigation] 点云帧或时间戳无效，期望帧: %s", self.lidar_frame
+            )
+        with self.lock:
+            self.latest_obstacles_base = points
+            self.obstacle_stamp = cloud.header.stamp
+            self.obstacle_frame_valid = frame_valid
+            active = self.goal_state.active
+        if self.require_obstacle_cloud and not frame_valid and active:
+            self._stop_robot()
+
+    def safety_stop_callback(self, msg):
+        """安全停车信号一到即停车；执行线程负责唯一的 Action 终态。"""
+        with self.lock:
+            self.safety_stop = bool(msg.data)
+            active = self.goal_state.active
+        if bool(msg.data) and active:
+            self._stop_robot()
+
+    def _plan_path(self, start_xy, goal_xy, dynamic_cells=()):
+        """make_plan 与 Action 唯一允许调用的共享规划入口。"""
+        with self.lock:
+            planner = self.planner
+        return None if planner is None else planner.plan(start_xy, goal_xy, dynamic_cells)
+
+    def _pose_from_message(self, msg):
+        if msg.header.frame_id != self.map_frame or msg.header.stamp.is_zero():
+            return None, False
+        position = msg.pose.pose.position
+        yaw = self._quaternion_yaw(msg.pose.pose.orientation)
+        if yaw is None or not self._finite(position.x, position.y, position.z):
+            return None, False
+        return (position.x, position.y, yaw), True
+
+    def _pose_stamped_to_xy_yaw(self, pose, allow_zero_stamp):
+        """验证 GetPlan 或 Action 的 map 位姿和时间要求。"""
+        if pose.header.frame_id != self.map_frame:
+            return None, False
+        if pose.header.stamp.is_zero():
+            if not allow_zero_stamp:
+                return None, False
+        elif not self._is_stamp_fresh(pose.header.stamp, self.goal_stamp_timeout, rospy.Time.now()):
+            return None, False
+        position = pose.pose.position
+        yaw = self._quaternion_yaw(pose.pose.orientation)
+        if yaw is None or not self._finite(position.x, position.y, position.z):
+            return None, False
+        return (position.x, position.y, yaw), True
+
+    def _quaternion_yaw(self, quaternion):
+        if not self._finite(quaternion.x, quaternion.y, quaternion.z, quaternion.w):
+            return None
+        norm = math.sqrt(
+            quaternion.x * quaternion.x + quaternion.y * quaternion.y
+            + quaternion.z * quaternion.z + quaternion.w * quaternion.w
         )
-
-    def _world_to_map(self, x, y):
-        """世界坐标转地图像素坐标"""
-        if self.map_info is None:
+        if abs(norm - 1.0) > self.quaternion_norm_tolerance:
             return None
-        mx = int((x - self.map_info.origin.position.x) / self.map_info.resolution)
-        my = int((y - self.map_info.origin.position.y) / self.map_info.resolution)
-        return mx, my
+        try:
+            return tf.transformations.euler_from_quaternion(
+                [quaternion.x, quaternion.y, quaternion.z, quaternion.w]
+            )[2]
+        except (TypeError, ValueError):
+            return None
 
-    def _is_free(self, mx, my):
-        """检查像素是否是自由区域"""
-        if self.map_data is None:
+    def _navigation_readiness(self, now, require_obstacles):
+        """统一给 Action、make_plan 和 health 使用的数据安全门。"""
+        with self.lock:
+            pose_ready = self.pose_valid and self._is_stamp_fresh(
+                self.pose_stamp, self.pose_timeout, now
+            )
+            map_ready = self.map_valid and self.planner is not None and self._is_stamp_fresh(
+                self.map_stamp, self.map_timeout, now
+            )
+            mapping = self.mapping_status
+            mapping_ready = mapping is not None and self._is_stamp_fresh(
+                self.mapping_status_stamp, self.mapping_status_timeout, now
+            )
+            obstacle_ready = self.obstacle_frame_valid and self._is_stamp_fresh(
+                self.obstacle_stamp, self.obstacle_cloud_timeout, now
+            )
+            safety_stop = self.safety_stop
+        if safety_stop:
+            return False, "SAFETY_STOP", "外部 safety_stop 信号为真"
+        if not pose_ready:
+            return False, "LOCALIZATION_LOST", "map 位姿缺失、过期、帧错误或数值非法"
+        if not map_ready:
+            return False, "LOCALIZATION_LOST", "占据地图缺失、过期、帧错误或几何非法"
+        if not mapping_ready:
+            return False, "LOCALIZATION_LOST", "mapping/status 缺失或过期"
+        if mapping.lost:
+            return False, "LOCALIZATION_LOST", mapping.status_reason or "定位/建图报告已丢失"
+        if not mapping.ready or not mapping.stable:
+            return False, "LOCALIZATION_LOST", mapping.status_reason or "定位/建图尚未 ready 且 stable"
+        if require_obstacles and self.require_obstacle_cloud and not obstacle_ready:
+            return False, "CONTROL_FAILED", "要求的 /scan 缺失、过期或坐标帧无效"
+        return True, "NONE", ""
+
+    def _dynamic_obstacle_snapshot(self, now):
+        """将当前点云临时障碍投到 map 栅格，并计算前方净空。"""
+        with self.lock:
+            planner = self.planner
+            pose = self.current_pose
+            obstacles = list(self.latest_obstacles_base)
+            fresh = self.obstacle_frame_valid and self._is_stamp_fresh(
+                self.obstacle_stamp, self.obstacle_cloud_timeout, now
+            )
+        if planner is None or pose is None or not fresh:
+            return set(), float("inf"), fresh
+        cos_yaw, sin_yaw = math.cos(pose[2]), math.sin(pose[2])
+        dynamic_cells = set()
+        front_clearance = float("inf")
+        for base_x, base_y, _ in obstacles:
+            if base_x > 0.0 and abs(math.atan2(base_y, base_x)) <= self.dynamic_front_half_angle:
+                front_clearance = min(front_clearance, math.hypot(base_x, base_y))
+            world_x = pose[0] + cos_yaw * base_x - sin_yaw * base_y
+            world_y = pose[1] + sin_yaw * base_x + cos_yaw * base_y
+            cell = planner.world_to_cell(world_x, world_y)
+            if cell is not None:
+                dynamic_cells.add(cell)
+        return dynamic_cells, front_clearance, True
+
+    def _apply_route_locked(self, route, now):
+        self.active_path = list(route)
+        self.active_path_lengths = path_lengths(self.active_path)
+        self.waypoint_index = 0
+        self.active_map_generation = self.map_generation
+        self.last_replan_time = now
+
+    def _route_snapshot(self):
+        with self.lock:
+            return list(self.active_path), self.active_map_generation, self.last_replan_time
+
+    def _map_generation_snapshot(self):
+        with self.lock:
+            return self.map_generation
+
+    def _current_pose_snapshot(self):
+        with self.lock:
+            return self.current_pose
+
+    def _goal_start_time(self):
+        with self.lock:
+            return self.goal_start_time
+
+    def _path_is_blocked(self, route, dynamic_cells):
+        with self.lock:
+            planner = self.planner
+        return planner is None or not planner.path_is_traversable(route, dynamic_cells)
+
+    def _current_goal_id(self):
+        try:
+            goal_id = self.action_server.current_goal.get_goal_id().id
+            if goal_id:
+                return goal_id
+        except AttributeError:
+            pass
+        return "goal-%d" % rospy.Time.now().to_nsec()
+
+    def _lidar_to_base(self, x, y, z):
+        rotated = self.lidar_rotation.dot((x, y, z))
+        return rotated[0] + self.lidar_x, rotated[1] + self.lidar_y, rotated[2] + self.lidar_z
+
+    def _is_stamp_fresh(self, stamp, timeout, now):
+        if stamp.is_zero():
             return False
-        if mx < 0 or mx >= self.map_info.width or my < 0 or my >= self.map_info.height:
-            return False
-        return self.map_data[my, mx] == 0  # 0=FREE
+        age = (now - stamp).to_sec()
+        return -self.max_future_stamp_skew <= age <= timeout
 
-    def _simple_path(self, start_x, start_y, goal_x, goal_y):
-        """简单的贪心路径规划：向目标移动，遇到障碍简单绕行"""
-        if self.map_data is None:
-            return None
-
-        path = []
-        sx, sy = self._world_to_map(start_x, start_y)
-        gx, gy = self._world_to_map(goal_x, goal_y)
-
-        if not self._is_free(gx, gy):
-            return None
-
-        # 简单的直线插值 + 障碍检查
-        steps = int(math.hypot(gx - sx, gy - sy))
-        if steps == 0:
-            return []
-
-        for i in range(steps + 1):
-            t = i / steps
-            x = start_x + (goal_x - start_x) * t
-            y = start_y + (goal_y - start_y) * t
-            mx, my = self._world_to_map(x, y)
-            if not self._is_free(mx, my):
-                return None  # 路径上有障碍
-            path.append((x, y))
-
-        return path
+    @staticmethod
+    def _finite(*values):
+        return all(math.isfinite(value) for value in values)
 
     def make_plan_cb(self, req):
-        """路径规划服务"""
-        resp = GetPlanResponse()
-        if self.map_data is None or self.current_pose is None:
-            return resp
+        """使用共享 A* 返回可执行的全局路径。"""
+        response = GetPlanResponse()
+        start, start_valid = self._pose_stamped_to_xy_yaw(req.start, allow_zero_stamp=True)
+        goal, goal_valid = self._pose_stamped_to_xy_yaw(req.goal, allow_zero_stamp=True)
+        if not start_valid or not goal_valid:
+            return response
+        ready, _, _ = self._navigation_readiness(rospy.Time.now(), require_obstacles=False)
+        if not ready:
+            return response
+        # GetPlan 的常见零时间戳 start 请求使用最新已验证的定位位姿。
+        if req.start.header.stamp.is_zero():
+            start = self._current_pose_snapshot()
+            if start is None:
+                return response
+        dynamic_cells, _, obstacle_fresh = self._dynamic_obstacle_snapshot(rospy.Time.now())
+        path_points = self._plan_path(
+            start[:2], goal[:2], dynamic_cells if obstacle_fresh else ()
+        )
+        if not path_points:
+            return response
 
-        start = req.start.pose.position
-        goal = req.goal.pose.position
+        response.plan.header.frame_id = self.map_frame
+        response.plan.header.stamp = rospy.Time.now()
+        for index, (x, y) in enumerate(path_points):
+            point = PoseStamped()
+            point.header = response.plan.header
+            point.pose.position.x = x
+            point.pose.position.y = y
+            yaw = goal[2]
+            if index + 1 < len(path_points):
+                next_x, next_y = path_points[index + 1]
+                yaw = math.atan2(next_y - y, next_x - x)
+            quaternion = tf.transformations.quaternion_from_euler(0.0, 0.0, yaw)
+            point.pose.orientation.x = quaternion[0]
+            point.pose.orientation.y = quaternion[1]
+            point.pose.orientation.z = quaternion[2]
+            point.pose.orientation.w = quaternion[3]
+            response.plan.poses.append(point)
+        return response
 
-        path_points = self._simple_path(start.x, start.y, goal.x, goal.y)
-        if path_points is None:
-            return resp
-
-        resp.plan.header.frame_id = self.map_frame
-        resp.plan.header.stamp = rospy.Time.now()
-        for x, y in path_points:
-            p = PoseStamped()
-            p.header = resp.plan.header
-            p.pose.position.x = x
-            p.pose.position.y = y
-            p.pose.orientation.w = 1.0
-            resp.plan.poses.append(p)
-
-        return resp
-
-    def clear_costmaps_cb(self, req):
-        """清除代价地图服务（P0占位）"""
-        rospy.loginfo("[navigation] clear_costmaps called")
+    def clear_costmaps_cb(self, _req):
+        """无独立 costmap；请求当前地图/障碍数据立即重规划。"""
+        with self.lock:
+            self.clear_costmaps_requested = self.goal_state.active
+        rospy.loginfo("[navigation] clear_costmaps：%s", "已请求当前路径重规划" if self.clear_costmaps_requested else "当前没有活动路径")
         return EmptyResponse()
 
     def execute_cb(self, goal):
-        """Action执行回调"""
-        if self.current_pose is None or self.map_data is None:
-            self.action_server.set_aborted(text="LOCALIZATION_NOT_READY")
-            self.failure_code = "LOCALIZATION_LOST"
-            self.has_active_goal = False
-            self._stop_robot()
+        """使用共享 A* 建立路线并跟踪前视点，而非直冲最终目标。"""
+        target, target_valid = self._pose_stamped_to_xy_yaw(
+            goal.target_pose, allow_zero_stamp=False
+        )
+        if not target_valid:
+            self._finish_goal("UNREACHABLE", "目标必须是时间有效、四元数合法的 map 位姿")
             return
 
-        self.has_active_goal = True
-        self.active_goal = goal
-        self.goal_start_time = rospy.Time.now()
-        self.last_progress_time = rospy.Time.now()
-        self.last_position = self.current_pose
-        self.is_stuck = False
-        self.failure_code = "NONE"
-        self.controller_active = True
+        now = rospy.Time.now()
+        ready, code, detail = self._navigation_readiness(now, require_obstacles=True)
+        if not ready:
+            self._finish_goal(code, detail)
+            return
+        current = self._current_pose_snapshot()
+        if current is None:
+            self._finish_goal("LOCALIZATION_LOST", "读取规划起点时定位位姿已失效")
+            return
+        dynamic_cells, _, obstacle_fresh = self._dynamic_obstacle_snapshot(now)
+        route = self._plan_path(current[:2], target[:2], dynamic_cells if obstacle_fresh else ())
+        if not route:
+            self._finish_goal("UNREACHABLE", "起点或目标位于不可通行栅格，或当前地图中无路径")
+            return
 
-        goal_x = goal.target_pose.pose.position.x
-        goal_y = goal.target_pose.pose.position.y
-        q = goal.target_pose.pose.orientation
-        _, _, goal_yaw = tf.transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
+        with self.lock:
+            self.goal_state.begin(self._current_goal_id())
+            self.has_active_goal = True
+            self.controller_active = True
+            self.active_goal_id = self.goal_state.active_goal_id
+            self.goal_start_time = now
+            self.last_position = current[:2]
+            self.last_progress_time = now
+            self._apply_route_locked(route, now)
 
-        rospy.loginfo(f"[navigation] New goal: ({goal_x:.2f}, {goal_y:.2f})")
-
+        terminal_code = None
+        terminal_detail = ""
+        terminal_stuck = False
         rate = rospy.Rate(self.control_rate)
         while not rospy.is_shutdown():
+            now = rospy.Time.now()
             if self.action_server.is_preempt_requested():
-                self.action_server.set_preempted()
-                self.failure_code = "CANCELED"
+                terminal_code, terminal_detail = "CANCELED", "目标被客户端取消"
+                break
+            ready, code, detail = self._navigation_readiness(now, require_obstacles=True)
+            if not ready:
+                terminal_code, terminal_detail = code, detail
+                break
+            if (now - self._goal_start_time()).to_sec() > self.goal_timeout:
+                terminal_code, terminal_detail = "TIMEOUT", "目标超过配置的执行时限"
                 break
 
-            if self.current_pose is None:
-                self.action_server.set_aborted(text="LOCALIZATION_LOST")
-                self.failure_code = "LOCALIZATION_LOST"
+            current = self._current_pose_snapshot()
+            if current is None:
+                terminal_code, terminal_detail = "LOCALIZATION_LOST", "控制循环中定位位姿已失效"
                 break
-
-            cx, cy, cyaw = self.current_pose
-
-            # 检查超时
-            elapsed = (rospy.Time.now() - self.goal_start_time).to_sec()
-            if elapsed > self.goal_timeout:
-                self.action_server.set_aborted(text="TIMEOUT")
-                self.failure_code = "TIMEOUT"
-                break
-
-            # 检查是否卡住
-            if self.last_position is not None:
-                dist_moved = math.hypot(cx - self.last_position[0], cy - self.last_position[1])
-                if dist_moved > 0.1:
-                    self.last_progress_time = rospy.Time.now()
-                    self.last_position = self.current_pose
-                elif (rospy.Time.now() - self.last_progress_time).to_sec() > self.stuck_threshold:
-                    self.is_stuck = True
-                    self.action_server.set_aborted(text="STUCK")
-                    self.failure_code = "CONTROL_FAILED"
+            dynamic_cells, front_clearance, obstacle_fresh = self._dynamic_obstacle_snapshot(now)
+            route, route_generation, last_replan = self._route_snapshot()
+            route_blocked = self._path_is_blocked(route, dynamic_cells if obstacle_fresh else ())
+            deviation = self._path_deviation(current[:2], route)
+            with self.lock:
+                requested = self.clear_costmaps_requested
+                self.clear_costmaps_requested = False
+            replan_due = (
+                route_generation != self._map_generation_snapshot()
+                or route_blocked
+                or requested
+                or deviation > self.replan_deviation_distance
+                or (now - last_replan).to_sec() >= self.replan_period
+            )
+            if replan_due and (now - last_replan).to_sec() >= self.replan_min_interval:
+                route = self._plan_path(
+                    current[:2], target[:2], dynamic_cells if obstacle_fresh else ()
+                )
+                if not route:
+                    terminal_code, terminal_detail = "UNREACHABLE", "最新地图或临时障碍已阻断路径"
                     break
+                with self.lock:
+                    self._apply_route_locked(route, now)
 
-            # 检查是否到达目标
-            dist_to_goal = math.hypot(cx - goal_x, cy - goal_y)
-            if dist_to_goal < self.goal_tolerance_xy:
-                self.action_server.set_succeeded(MoveBaseResult())
-                self.failure_code = "SUCCEEDED"
+            if goal_reached(current, target, self.goal_tolerance_xy, self.goal_tolerance_yaw):
+                terminal_code, terminal_detail = "SUCCEEDED", "已达到目标位置和最终朝向"
                 break
-
-            # 计算控制指令
-            dx = goal_x - cx
-            dy = goal_y - cy
-            target_yaw = math.atan2(dy, dx)
-            error_yaw = self._normalize_angle(target_yaw - cyaw)
-
-            cmd = Twist()
-            # 先转向
-            if abs(error_yaw) > 0.3:
-                cmd.angular.z = self.angular_kp * error_yaw
-                cmd.angular.z = max(-self.max_angular_speed, min(self.max_angular_speed, cmd.angular.z))
+            distance_to_goal = math.hypot(current[0] - target[0], current[1] - target[1])
+            yaw_error = normalize_angle(target[2] - current[2])
+            if distance_to_goal <= self.goal_tolerance_xy:
+                self._publish_velocity(0.0, self.final_yaw_gain * yaw_error)
             else:
-                cmd.linear.x = self.linear_kp * dist_to_goal
-                cmd.linear.x = min(self.max_linear_speed, cmd.linear.x)
-                cmd.angular.z = self.angular_kp * error_yaw
-                cmd.angular.z = max(-self.max_angular_speed, min(self.max_angular_speed, cmd.angular.z))
-
-            self.cmd_pub.publish(cmd)
-
-            # 反馈
-            feedback = MoveBaseFeedback()
-            feedback.base_position.header.stamp = rospy.Time.now()
-            feedback.base_position.header.frame_id = self.map_frame
-            feedback.base_position.pose.position.x = cx
-            feedback.base_position.pose.position.y = cy
-            q = tf.transformations.quaternion_from_euler(0, 0, cyaw)
-            feedback.base_position.pose.orientation.x = q[0]
-            feedback.base_position.pose.orientation.y = q[1]
-            feedback.base_position.pose.orientation.z = q[2]
-            feedback.base_position.pose.orientation.w = q[3]
-            self.action_server.publish_feedback(feedback)
-
+                linear_x, angular_z = self._path_tracking_command(current, self._route_snapshot()[0])
+                if (route_blocked or front_clearance <= self.dynamic_stop_distance) and linear_x > 0.0:
+                    linear_x = 0.0
+                self._publish_velocity(linear_x, angular_z)
+                if self._is_stuck(current[:2], linear_x, now):
+                    terminal_code = "CONTROL_FAILED"
+                    terminal_detail = "机器人在发布有效前进指令时持续无路径进展"
+                    terminal_stuck = True
+                    break
+            self._publish_feedback(current)
             rate.sleep()
 
-        # 结束：停止机器人
-        self.has_active_goal = False
-        self.controller_active = False
+        if terminal_code is None:
+            terminal_code, terminal_detail = "CANCELED", "节点关闭中断活动目标"
+        self._finish_goal(terminal_code, terminal_detail, terminal_stuck)
+
+    def _finish_goal(self, code, detail, stuck=False):
+        """唯一设置 Action 终态的出口，所有终态先显式停车。"""
+        # 取消与失败同时到达时，Action 语义优先保持为 PREEMPTED/CANCELED。
+        if code != "CANCELED" and self.action_server.is_preempt_requested():
+            code, detail, stuck = "CANCELED", "目标被客户端取消", False
+        with self.lock:
+            self.goal_state.finish(code, detail, stuck=stuck)
+            self.has_active_goal = False
+            self.controller_active = False
+            self.active_goal_id = ""
+            self.active_path = []
+            self.active_path_lengths = []
+            self.waypoint_index = 0
+            self.failure_code = code
+            self.failure_detail = detail
+            self.is_stuck = bool(stuck)
         self._stop_robot()
-        rospy.loginfo(f"[navigation] Goal finished: {self.failure_code}")
+        result = MoveBaseResult()
+        if code == "SUCCEEDED":
+            self.action_server.set_succeeded(result, text=detail)
+        elif code == "CANCELED":
+            self.action_server.set_preempted(result, text=detail)
+        else:
+            self.action_server.set_aborted(result, text=detail)
 
     def preempt_cb(self):
-        """目标被抢占"""
-        rospy.loginfo("[navigation] Goal preempted")
-        self.failure_code = "CANCELED"
-        self.has_active_goal = False
-        self.controller_active = False
+        """取消到达时立即零速；execute_cb 统一发布 PREEMPTED。"""
+        rospy.loginfo("[navigation] 收到目标取消请求，立即停车")
         self._stop_robot()
 
-    def control_loop(self, event):
-        """控制循环：没有目标时发0速度"""
-        if not self.has_active_goal:
+    def control_loop(self, _event):
+        """没有活动目标时持续发送零速度，消除旧命令残留。"""
+        with self.lock:
+            active = self.goal_state.active
+        if not active:
             self._stop_robot()
 
+    def _is_stuck(self, current_xy, linear_x, now):
+        """只在实际发布有效前进命令且无路径进展时标记卡住。"""
+        if linear_x < self.stuck_command_speed:
+            return False
+        with self.lock:
+            if self.last_position is None:
+                self.last_position = current_xy
+                self.last_progress_time = now
+                return False
+            moved = math.hypot(
+                current_xy[0] - self.last_position[0], current_xy[1] - self.last_position[1]
+            )
+            if moved >= self.progress_distance:
+                self.last_position = current_xy
+                self.last_progress_time = now
+                return False
+            if (now - self.last_progress_time).to_sec() > self.stuck_timeout:
+                self.goal_state.stuck = True
+                self.is_stuck = True
+                return True
+        return False
+
+    def _path_tracking_command(self, current, route):
+        """跟踪路径前视点；大偏航时先原地旋转。"""
+        if not route:
+            return 0.0, 0.0
+        current_x, current_y, current_yaw = current
+        index = self._closest_path_index(current_x, current_y, route)
+        target_x, target_y = route[-1]
+        for point_x, point_y in route[index:]:
+            if math.hypot(point_x - current_x, point_y - current_y) >= self.lookahead_distance:
+                target_x, target_y = point_x, point_y
+                break
+        heading_error = normalize_angle(
+            math.atan2(target_y - current_y, target_x - current_x) - current_yaw
+        )
+        if abs(heading_error) >= self.rotate_in_place_angle:
+            return 0.0, self.rotate_in_place_gain * heading_error
+        distance_to_goal = math.hypot(route[-1][0] - current_x, route[-1][1] - current_y)
+        linear_x = min(self.cruise_speed, self.max_linear_speed, distance_to_goal)
+        linear_x *= max(0.0, math.cos(heading_error))
+        angular_z = linear_x * 2.0 * math.sin(heading_error) / self.lookahead_distance
+        return linear_x, angular_z
+
+    def _closest_path_index(self, current_x, current_y, route):
+        with self.lock:
+            start_index = min(self.waypoint_index, max(0, len(route) - 1))
+        best_index = start_index
+        best_distance = float("inf")
+        for index in range(start_index, len(route)):
+            distance = math.hypot(route[index][0] - current_x, route[index][1] - current_y)
+            if distance < best_distance:
+                best_index, best_distance = index, distance
+        with self.lock:
+            self.waypoint_index = max(self.waypoint_index, best_index)
+        return best_index
+
+    def _path_deviation(self, current_xy, route):
+        if not route:
+            return float("inf")
+        return min(math.hypot(current_xy[0] - point[0], current_xy[1] - point[1]) for point in route)
+
+    def _publish_velocity(self, linear_x, angular_z):
+        """发布受速度上限约束的导航命令，并在发布前重新确认安全门。"""
+        command = Twist()
+        ready, _, _ = self._navigation_readiness(
+            rospy.Time.now(), require_obstacles=True
+        )
+        if ready:
+            command.linear.x = self._clamp(linear_x, -self.max_linear_speed, self.max_linear_speed)
+            command.angular.z = self._clamp(angular_z, -self.max_angular_speed, self.max_angular_speed)
+        with self.lock:
+            stamp = rospy.Time.now()
+            self.last_cmd_time = stamp
+            self.goal_state.record_command(stamp)
+        self.cmd_pub.publish(command)
+
     def _stop_robot(self):
-        """立即停止机器人"""
-        cmd = Twist()
-        self.cmd_pub.publish(cmd)
+        """立即发送导航零速度；navigation 从不直接发布 /cmd_vel。"""
+        command = Twist()
+        with self.lock:
+            stamp = rospy.Time.now()
+            self.last_cmd_time = stamp
+            self.goal_state.record_command(stamp)
+        self.cmd_pub.publish(command)
 
-    def _normalize_angle(self, angle):
-        """角度归一化到[-pi, pi]"""
-        while angle > math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
-        return angle
+    def _publish_feedback(self, current):
+        """根据真正已走过的累计路径长度发布反馈和 health 进度。"""
+        route, _, _ = self._route_snapshot()
+        if not route:
+            return
+        index = self._closest_path_index(current[0], current[1], route)
+        with self.lock:
+            self.goal_state.progress = path_progress(self.active_path_lengths, index)
+        feedback = MoveBaseFeedback()
+        feedback.base_position.header.stamp = rospy.Time.now()
+        feedback.base_position.header.frame_id = self.map_frame
+        feedback.base_position.pose.position.x = current[0]
+        feedback.base_position.pose.position.y = current[1]
+        quaternion = tf.transformations.quaternion_from_euler(0.0, 0.0, current[2])
+        feedback.base_position.pose.orientation.x = quaternion[0]
+        feedback.base_position.pose.orientation.y = quaternion[1]
+        feedback.base_position.pose.orientation.z = quaternion[2]
+        feedback.base_position.pose.orientation.w = quaternion[3]
+        self.action_server.publish_feedback(feedback)
 
-    def publish_health(self, event=None):
-        """发布导航健康状态"""
-        msg = NavigationHealth()
-        msg.header.stamp = rospy.Time.now()
-        msg.ready = self.current_pose is not None and self.map_data is not None
-        msg.controller_active = self.controller_active
-        msg.stuck = self.is_stuck
-        msg.fallen = False
-        msg.has_active_goal = self.has_active_goal
-        msg.active_goal_id = self.active_goal_id
-        msg.progress = 0.0
-        msg.last_cmd_time = rospy.Time.now()
-        msg.failure_code = self.failure_code
-        msg.failure_detail = ""
+    @staticmethod
+    def _clamp(value, lower, upper):
+        return max(lower, min(upper, value))
+
+    def publish_health(self, _event=None):
+        """发布真实 readiness、Action 生命周期、命令时刻和失败详情。"""
+        now = rospy.Time.now()
+        ready, readiness_code, readiness_detail = self._navigation_readiness(
+            now, require_obstacles=self.require_obstacle_cloud
+        )
+        with self.lock:
+            state = self.goal_state
+            msg = NavigationHealth()
+            msg.header.stamp = now
+            msg.ready = ready
+            msg.controller_active = state.controller_active
+            msg.stuck = state.stuck
+            msg.fallen = False  # P0 没有摔倒传感器，不能伪造检测结果。
+            msg.has_active_goal = state.active
+            msg.active_goal_id = state.active_goal_id
+            msg.progress = state.progress
+            msg.last_cmd_time = self.last_cmd_time
+            if not ready and state.failure_code == "NONE":
+                msg.failure_code = readiness_code
+                msg.failure_detail = readiness_detail
+            else:
+                msg.failure_code = state.failure_code
+                msg.failure_detail = state.failure_detail
         self.health_pub.publish(msg)
 
     def run(self):
@@ -361,7 +795,6 @@ class NavController:
 
 if __name__ == "__main__":
     try:
-        node = NavController()
-        node.run()
+        NavController().run()
     except rospy.ROSInterruptException:
         pass

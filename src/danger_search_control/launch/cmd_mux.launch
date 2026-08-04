@@ -1,8 +1,7 @@
 <launch>
   <arg name="config_file" default="$(find danger_search_control)/config/default.yaml" />
 
-  <rosparam command="load" file="$(arg config_file)" />
-
   <node name="cmd_mux" pkg="danger_search_control" type="cmd_mux.py" output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
   </node>
 </launch>

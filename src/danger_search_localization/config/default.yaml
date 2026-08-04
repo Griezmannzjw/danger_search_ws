@@ -1,26 +1,116 @@
-# 定位与建图模块参数
-# 对齐接口规范 v1.1-p0
+# 单楼层 2D 激光 SLAM 基线参数（不使用 Gazebo 真值）
 
-# 坐标系
+# 坐标系与公共接口
 map_frame: map
 odom_frame: odom
 base_frame: base
-world_frame: world
-
-# 话题
-map_topic: /map
+current_floor: 0
 pose_topic: /localization/pose
+map_topic: /map
 mapping_status_topic: /mapping/status
-lidar_topic: /livox/Pointcloud2
-imu_topic: /trunk_imu
+localization_status_topic: /localization/status
 
-# 地图参数
-map_resolution: 0.05      # 5cm分辨率
-map_width: 400            # 20m
-map_height: 720           # 36m
-map_origin_x: -10.0       # 地图原点X
-map_origin_y: -18.0       # 地图原点Y
+# 内部话题
+raw_scan_topic: /scan
+projected_scan_topic: /localization/scan
+raw_pose_topic: /localization/raw_pose
+raw_map_topic: /localization/raw_map
 
-# 激光参数
-lidar_max_range: 5.0
-lidar_min_range: 0.1
+# 三维 scan-to-scan GICP 里程计，为 navigation 提供局部连续位姿。
+lidar_odom_voxel_size_m: 0.15
+lidar_odom_min_range_m: 0.40
+lidar_odom_max_range_m: 12.0
+lidar_odom_max_correspondence_m: 0.80
+lidar_odom_max_iterations: 35
+lidar_odom_max_fitness: 0.20
+lidar_odom_max_step_translation_m: 0.35
+lidar_odom_max_step_rotation_rad: 0.45
+lidar_odom_min_points: 300
+
+# 原始三维点云投影为平面 LaserScan
+angle_min: -3.141592653589793
+angle_max: 3.141592653589793
+angle_increment: 0.008726646259972  # 0.5 deg
+range_min: 0.20
+range_max: 12.0
+min_height: 0.05                 # base 坐标系，排除地面
+max_height: 1.20
+self_exclusion_min_x: -0.55      # 删除机身和腿部附近回波
+self_exclusion_max_x: 0.55
+self_exclusion_half_width_y: 0.40
+min_returns_per_bin: 2           # 同一距离表面至少需要两个回波支持
+max_intra_bin_range_gap: 0.20    # 同角度回波按距离聚类，抑制近距离孤立噪点
+enable_isolated_hit_filter: true
+neighbor_window_bins: 8          # 0.5 deg/bin，对应左右各 4 deg
+min_neighbor_support: 1
+max_neighbor_range_jump: 0.75
+tf_timeout_s: 0.10
+imu_topic: /livox/imu
+enable_imu_leveling: true          # 运动时按重力方向校正俯仰/侧倾
+imu_fresh_timeout_s: 0.05
+max_abs_roll_rad: 0.55             # 约 31.5 deg，倾倒时停止污染地图
+max_abs_pitch_rad: 0.55
+max_angular_speed_rps: 1.50
+enable_ground_clearance_gate: true # 离地过低视为已摔倒，不把该帧写入地图
+ground_candidate_max_z: 0.05
+ground_candidate_min_range: 0.40
+ground_candidate_max_range: 3.00
+min_ground_candidate_points: 30
+min_ground_clearance_m: 0.18
+
+# Hector 2D 扫描匹配与地图
+map_resolution: 0.05
+map_size: 1024                    # 51.2 m x 51.2 m
+map_start_x: 0.5
+map_start_y: 0.5
+map_multi_res_levels: 2
+map_update_distance_thresh: 0.10
+map_update_angle_thresh: 0.04
+map_pub_period: 1.0
+laser_min_dist: 0.20
+laser_max_dist: 12.0
+update_factor_free: 0.40
+update_factor_occupied: 0.65     # 降低单帧误命中的占用权重
+
+# 接口健康判定
+pose_fresh_timeout_s: 1.0
+map_fresh_timeout_s: 3.0
+min_map_updates_for_stable: 2
+pose_publish_rate_hz: 20.0
+status_publish_rate_hz: 2.0
+fallback_xy_variance: 0.10
+fallback_yaw_variance: 0.15
+fallback_unobserved_variance: 0.25
+use_backend_covariance: false       # Hector 原始协方差量级不适合作为 ROS 协方差
+covariance_warning_trace: 2.0
+
+# 对 navigation 发布前的二维位姿守卫。首帧自动定义为比赛起点 (0,0,0)。
+pose_position_deadband_m: 0.015
+pose_yaw_deadband_rad: 0.010
+pose_filter_time_constant_s: 0.15
+pose_max_linear_speed_mps: 1.0
+pose_max_angular_speed_rps: 2.0
+pose_jump_translation_margin_m: 0.08
+pose_jump_yaw_margin_rad: 0.10
+pose_gate_max_dt_s: 0.50
+pose_rejections_before_lost: 3
+
+# P0 垂直状态：不使用 Gazebo 真值。IMU 积分配合静止零速修正与楼层吸附；
+# 后续接入 FAST-LIO 时可保持公共接口不变并替换此估计器。
+vertical_estimation_enabled: false  # 未经验证的 IMU 双积分不得覆盖 navigation 位姿
+vertical_imu_fresh_timeout_s: 0.20
+vertical_integration_rate_hz: 200.0
+gravity_mps2: 9.80665
+stationary_accel_tolerance_mps2: 0.30
+stationary_gyro_threshold_rps: 0.08
+stationary_hold_s: 0.40
+vertical_bias_learning_rate: 0.01
+max_vertical_acceleration_mps2: 5.0
+max_vertical_speed_mps: 1.5
+vertical_max_abs_roll_rad: 0.26
+vertical_max_abs_pitch_rad: 0.26
+vertical_velocity_damping_per_s: 2.0
+vertical_acceleration_deadband_mps2: 0.15
+floor_heights: [0.0, 2.6, 5.2]
+floor_switch_hysteresis_m: 0.20
+floor_snap_tolerance_m: 0.35
