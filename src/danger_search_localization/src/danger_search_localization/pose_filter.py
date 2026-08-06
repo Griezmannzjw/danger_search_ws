@@ -119,6 +119,21 @@ class PoseStabilizer:
             normalize_angle(yaw - self.anchor.yaw),
         )
 
+    def needs_recovery(self, stamp_s, timeout_s):
+        return (
+            self.initialized
+            and self.consecutive_rejections > 0
+            and stamp_s - self.last_accepted_stamp_s > timeout_s
+        )
+
+    def recover(self, stamp_s, x, y, yaw):
+        target = self._relative_to_anchor(x, y, yaw)
+        self.previous_raw = target
+        self.output = target
+        self.last_accepted_stamp_s = stamp_s
+        self.consecutive_rejections = 0
+        self.last_reason = "RECOVERED_FROM_PROLOONGED_REJECTION"
+
     def _reject(self, reason):
         self.consecutive_rejections += 1
         self.total_rejections += 1
