@@ -105,71 +105,90 @@ class ScanProjectorNode:
             imu_sample = self._closest_imu(message.header.stamp.to_sec())
             if imu_sample is None:
                 rospy.logwarn_throttle(
-                    1.0, "[localization] rejecting scan: synchronized IMU unavailable"
+                    2.0, "[localization] IMU unavailable, skipping leveling"
                 )
-                return
-            _, imu_frame, world_from_imu, angular_velocity = imu_sample
-            try:
-                base_from_imu = self.tf_buffer.lookup_transform(
-                    self.base_frame,
-                    imu_frame,
-                    message.header.stamp,
-                    rospy.Duration(self.config.tf_timeout_s),
-                ).transform.rotation
-            except (
-                tf2_ros.LookupException,
-                tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException,
-            ) as exc:
-                rospy.logwarn_throttle(
-                    1.0, "[localization] IMU extrinsic TF unavailable: %s", str(exc)
-                )
-                return
-            world_from_base = quaternion_multiply(
-                world_from_imu,
-                quaternion_inverse(
-                    (
-                        base_from_imu.x,
-                        base_from_imu.y,
-                        base_from_imu.z,
-                        base_from_imu.w,
-                    )
-                ),
-            )
-            points_base, roll, pitch = gravity_level_points(
-                points_base, world_from_base
-            )
-            angular_speed = math.sqrt(
-                sum(float(value) ** 2 for value in angular_velocity)
-            )
-            if (
-                abs(roll) > self.config.max_abs_roll_rad
-                or abs(pitch) > self.config.max_abs_pitch_rad
-                or angular_speed > self.config.max_angular_speed_rps
-            ):
-                rospy.logwarn_throttle(
-                    1.0,
-                    "[localization] rejecting unstable scan: roll=%.1fdeg "
-                    "pitch=%.1fdeg gyro=%.2frad/s",
-                    math.degrees(roll),
-                    math.degrees(pitch),
-                    angular_speed,
-                )
-                return
-            if self.config.enable_ground_clearance_gate:
-                clearance = estimate_ground_clearance(points_base, self.config)
-                if (
-                    clearance is not None
-                    and clearance < self.config.min_ground_clearance_m
-                ):
+            else:
+                _, imu_frame, world_from_imu, angular_velocity = imu_sample
+                try:
+                    base_from_imu = self.tf_buffer.lookup_transform(
+                        self.base_frame,
+                        imu_frame,
+                        message.header.stamp,
+                        rospy.Duration(self.config.tf_timeout_s),
+                    ).transform.rotation
+                except (
+                    tf2_ros.LookupException,
+                    tf2_ros.ConnectivityException,
+                    tf2_ros.ExtrapolationException,
+                ) as exc:
                     rospy.logwarn_throttle(
-                        1.0,
-                        "[localization] rejecting collapsed scan: estimated "
-                        "ground clearance=%.3fm",
-                        clearance,
+                        1.0, "[localization] IMU extrinsic TF unavailable: %s", str(exc)
                     )
-                    return
+                    base_from_imu = None
+                if base_from_imu is not None:
+                    world_from_base = quaternion_multiply(
+                        world_from_imu,
+                        quaternion_inverse(
+                            (
+                                base_from_imu.x,
+                                base_from_imu.y,
+                                base_from_imu.z,
+                                base_from_imu.w,
+                            )
+                        ),
+                    )
+                    points_base, roll, pitch = gravity_level_points(
+                        points_base, world_from_base
+                    )
+                    angular_speed = math.sqrt(
+                        sum(float(value) ** 2 for value in angular_velocity)
+                    )
+                    if (
+                        abs(roll) > self.config.max_abs_roll_rad
+                        or abs(pitch) > self.config.max_abs_pitch_rad
+                        or angular_speed > self.config.max_angular_speed_rps
+                    ):
+                        rospy.logwarn_throttle(
+                            1.0,
+                            "[localization] unstable scan: roll=%.1fdeg "
+                            "pitch=%.1fdeg gyro=%.2frad/s -- publishing anyway",
+                            math.degrees(roll),
+                            math.degrees(pitch),
+                            angular_speed,
+                        )
+                    if self.config.enable_ground_clearance_gate:
+                        clearance = estimate_ground_clearance(points_base, self.config)
+                        if (
+                            clearance is not None
+                            and clearance < self.config.min_ground_clearance_m
+                        ):
+                            rospy.logwarn_throttle(
+                                1.0,
+                                "[localization] low ground clearance=%.3fm "
+                                "-- publishing anyway",
+                                clearance,
+                            )
         ranges = project_planar_scan(points_base, self.config)
+
+        finite_mask = np.isfinite(ranges)
+        valid_bins = int(np.sum(finite_mask))
+        if valid_bins < self.config.min_valid_scan_bins:
+            rospy.logwarn_throttle(
+                2.0,
+                "[localization] dropping sparse scan: %d valid bins < %d",
+                valid_bins,
+                self.config.min_valid_scan_bins,
+            )
+            return
+        angular_coverage = self._angular_coverage_of_finite(ranges, finite_mask)
+        if angular_coverage < self.config.min_angular_coverage_rad:
+            rospy.logwarn_throttle(
+                2.0,
+                "[localization] dropping narrow scan: %.2f rad coverage < %.2f",
+                angular_coverage,
+                self.config.min_angular_coverage_rad,
+            )
+            return
 
         output = LaserScan()
         output.header.stamp = message.header.stamp
@@ -204,6 +223,24 @@ class ScanProjectorNode:
                 for name, value in vars(defaults).items()
             }
         )
+
+    def _angular_coverage_of_finite(self, ranges, finite_mask):
+        """Return the maximum angular span (radians) of consecutive finite bins."""
+        finite = np.asarray(finite_mask, dtype=bool)
+        if not np.any(finite):
+            return 0.0
+        doubled = np.concatenate([finite, finite])
+        max_run = 0
+        current = 0
+        for is_finite in doubled:
+            if is_finite:
+                current += 1
+                max_run = max(max_run, current)
+            else:
+                current = 0
+            if current >= finite.size:
+                return 2.0 * math.pi
+        return float(max_run) * self.config.angle_increment
 
     @staticmethod
     def run():

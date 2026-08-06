@@ -157,14 +157,34 @@ class LocalizationAdapterNode:
                 yaw,
             )
         if not result.accepted:
-            rospy.logerr_throttle(
-                1.0,
-                "[localization] rejecting unsafe backend pose: %s "
-                "(consecutive=%d)",
-                result.reason,
-                result.consecutive_rejections,
-            )
-            return
+            now = rospy.Time.now()
+            if self.pose_filter.needs_recovery(
+                now.to_sec(), self.config.pose_recovery_timeout_s
+            ):
+                rospy.logwarn(
+                    "[localization] recovering from prolonged rejection, "
+                    "re-anchoring at raw pose (%.2f, %.2f, %.1fdeg)",
+                    message.pose.pose.position.x,
+                    message.pose.pose.position.y,
+                    math.degrees(yaw),
+                )
+                self.pose_filter.recover(
+                    message.header.stamp.to_sec(),
+                    message.pose.pose.position.x,
+                    message.pose.pose.position.y,
+                    yaw,
+                )
+                with self.lock:
+                    result = self.pose_filter.snapshot(True)
+            else:
+                rospy.logerr_throttle(
+                    1.0,
+                    "[localization] rejecting unsafe backend pose: %s "
+                    "(consecutive=%d)",
+                    result.reason,
+                    result.consecutive_rejections,
+                )
+                return
 
         pose = copy.deepcopy(message)
         pose.pose.pose.position.x = result.pose.x

@@ -39,6 +39,8 @@ class ScanProjectionConfig:
     ground_candidate_max_range: float = 3.00
     min_ground_candidate_points: int = 30
     min_ground_clearance_m: float = 0.18
+    min_valid_scan_bins: int = 60
+    min_angular_coverage_rad: float = 0.50
 
     def __post_init__(self):
         _require(self.angle_min < self.angle_max, "scan angle range is invalid")
@@ -89,6 +91,14 @@ class ScanProjectionConfig:
             "minimum ground candidate count must be positive",
         )
         _require(self.min_ground_clearance_m > 0.0, "minimum clearance must be positive")
+        _require(
+            self.min_valid_scan_bins >= 1,
+            "min_valid_scan_bins must be at least one",
+        )
+        _require(
+            self.min_angular_coverage_rad > 0.0,
+            "min_angular_coverage_rad must be positive",
+        )
 
     @property
     def bin_count(self):
@@ -117,6 +127,7 @@ class AdapterConfig:
     pose_jump_yaw_margin_rad: float = 0.10
     pose_gate_max_dt_s: float = 0.50
     pose_rejections_before_lost: int = 3
+    pose_recovery_timeout_s: float = 3.0
     vertical_estimation_enabled: bool = False
     imu_topic: str = "/livox/imu"
     vertical_imu_fresh_timeout_s: float = 0.20
@@ -159,6 +170,7 @@ class AdapterConfig:
         _require(self.pose_jump_yaw_margin_rad >= 0.0, "pose yaw margin cannot be negative")
         _require(self.pose_gate_max_dt_s > 0.0, "pose gate dt must be positive")
         _require(self.pose_rejections_before_lost >= 1, "pose rejection limit must be positive")
+        _require(self.pose_recovery_timeout_s > 0.0, "pose recovery timeout must be positive")
         _require(bool(self.imu_topic), "imu_topic cannot be empty")
         _require(
             self.vertical_imu_fresh_timeout_s > 0.0,
