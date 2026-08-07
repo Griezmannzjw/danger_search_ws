@@ -37,8 +37,8 @@ class LocalizationAdapterNode:
         self.map_frame = rospy.get_param("~map_frame", "map")
         self.odom_frame = rospy.get_param("~odom_frame", "odom")
         self.base_frame = rospy.get_param("~base_frame", "base")
-        self.raw_pose_topic = rospy.get_param(
-            "~raw_pose_topic", "/localization/raw_pose"
+        self.backend_pose_topic = rospy.get_param(
+            "~backend_pose_topic", "/localization/hector_pose"
         )
         self.raw_map_topic = rospy.get_param(
             "~raw_map_topic", "/localization/raw_map"
@@ -90,7 +90,7 @@ class LocalizationAdapterNode:
             latch=True,
         )
         self.pose_sub = rospy.Subscriber(
-            self.raw_pose_topic,
+            self.backend_pose_topic,
             PoseWithCovarianceStamped,
             self._pose_callback,
             queue_size=10,
@@ -117,7 +117,8 @@ class LocalizationAdapterNode:
             self._publish_status,
         )
         rospy.loginfo(
-            "[localization] adapter started: pose=%s map=%s",
+            "[localization] adapter started: backend_pose=%s pose=%s map=%s",
+            self.backend_pose_topic,
             self.pose_topic,
             self.map_topic,
         )

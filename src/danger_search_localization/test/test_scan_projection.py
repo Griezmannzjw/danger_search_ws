@@ -2,6 +2,7 @@
 
 import math
 import unittest
+from collections import deque
 
 import numpy as np
 
@@ -9,6 +10,7 @@ from danger_search_localization.config import ScanProjectionConfig
 from danger_search_localization.scan_projection import (
     estimate_ground_clearance,
     gravity_level_points,
+    merge_scan_history,
     project_planar_scan,
     quaternion_multiply,
     transform_points,
@@ -149,6 +151,41 @@ class TestScanProjection(unittest.TestCase):
         ranges = project_planar_scan(points, config)
 
         self.assertEqual(int(np.isfinite(ranges).sum()), 2)
+
+    def test_scan_history_uses_median_after_minimum_observations(self):
+        history = [
+            np.array([1.0, np.inf, 4.0], dtype=np.float32),
+            np.array([3.0, 6.0, np.inf], dtype=np.float32),
+            np.array([5.0, 8.0, 2.0], dtype=np.float32),
+        ]
+
+        merged = merge_scan_history(history, min_samples_per_bin=2)
+
+        np.testing.assert_allclose(merged, [3.0, 7.0, 3.0])
+
+    def test_scan_history_rejects_single_frame_returns(self):
+        history = [
+            np.array([1.0, np.inf], dtype=np.float32),
+            np.array([np.inf, 2.0], dtype=np.float32),
+        ]
+
+        merged = merge_scan_history(history, min_samples_per_bin=2)
+
+        self.assertTrue(np.isinf(merged).all())
+
+    def test_scan_history_uses_only_the_configured_window(self):
+        history = deque(maxlen=2)
+        history.append(np.array([1.0], dtype=np.float32))
+        history.append(np.array([3.0], dtype=np.float32))
+        history.append(np.array([5.0], dtype=np.float32))
+
+        merged = merge_scan_history(history, min_samples_per_bin=2)
+
+        np.testing.assert_allclose(merged, [4.0])
+
+    def test_scan_history_requires_valid_minimum_sample_count(self):
+        with self.assertRaises(ValueError):
+            merge_scan_history([np.array([1.0])], min_samples_per_bin=0)
 
     @staticmethod
     def _quaternion_from_rpy(roll, pitch, yaw):

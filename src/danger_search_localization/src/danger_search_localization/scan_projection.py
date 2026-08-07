@@ -143,6 +143,34 @@ def project_planar_scan(points_base, config):
     return ranges
 
 
+def merge_scan_history(range_history, min_samples_per_bin):
+    """Merge sparse projected scans with a per-bin median.
+
+    A Livox frame does not cover every direction. A range is retained only
+    when enough frames observed that direction, so an isolated one-frame hit
+    cannot become a map obstacle.
+    """
+    if min_samples_per_bin < 1:
+        raise ValueError("min_samples_per_bin must be at least one")
+    if len(range_history) == 0:
+        return np.empty(0, dtype=np.float32)
+
+    history = np.asarray(range_history, dtype=np.float32)
+    if history.ndim != 2:
+        raise ValueError("range history must contain one-dimensional scans")
+    if min_samples_per_bin > history.shape[0]:
+        return np.full(history.shape[1], np.inf, dtype=np.float32)
+
+    output = np.full(history.shape[1], np.inf, dtype=np.float32)
+    finite = np.isfinite(history)
+    supported_indices = np.flatnonzero(
+        np.sum(finite, axis=0) >= min_samples_per_bin
+    )
+    for index in supported_indices:
+        output[index] = np.median(history[finite[:, index], index])
+    return output
+
+
 def _nearest_supported_surface(
     indices, point_ranges, bin_count, min_returns, max_range_gap
 ):
