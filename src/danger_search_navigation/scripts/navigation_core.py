@@ -8,6 +8,7 @@
 from dataclasses import dataclass
 import heapq
 import math
+import zlib
 
 
 VALID_FAILURE_CODES = frozenset((
@@ -31,6 +32,55 @@ def normalize_angle(angle):
 def zero_velocity():
     """返回非完整底盘的显式停车语义。"""
     return 0.0, 0.0
+
+
+def map_snapshot_fingerprint(
+    width, height, resolution, origin_x, origin_y, origin_yaw, data
+):
+    """Return a stable fingerprint for map geometry and occupancy values."""
+    metadata = "{}:{}:{:.9f}:{:.9f}:{:.9f}:{:.9f}".format(
+        int(width), int(height), float(resolution), float(origin_x),
+        float(origin_y), float(origin_yaw),
+    ).encode("ascii")
+    encoded_cells = bytes((int(value) + 1) & 0xFF for value in data)
+    return zlib.crc32(encoded_cells, zlib.crc32(metadata))
+
+
+@dataclass
+class DynamicObstacleWait:
+    """Bounded zero-velocity wait while transient obstacles block a route."""
+
+    timeout_s: float
+    retry_interval_s: float
+    blocked_since_s: float = None
+    next_retry_s: float = 0.0
+
+    def __post_init__(self):
+        if not math.isfinite(self.timeout_s) or self.timeout_s <= 0.0:
+            raise ValueError("dynamic obstacle timeout must be positive")
+        if not math.isfinite(self.retry_interval_s) or self.retry_interval_s <= 0.0:
+            raise ValueError("dynamic obstacle retry interval must be positive")
+
+    def begin(self, now_s):
+        if self.blocked_since_s is None:
+            self.blocked_since_s = float(now_s)
+        self.next_retry_s = float(now_s) + self.retry_interval_s
+
+    def retry_due(self, now_s):
+        return self.blocked_since_s is not None and float(now_s) >= self.next_retry_s
+
+    def record_retry(self, now_s):
+        self.next_retry_s = float(now_s) + self.retry_interval_s
+
+    def expired(self, now_s):
+        return (
+            self.blocked_since_s is not None
+            and float(now_s) - self.blocked_since_s >= self.timeout_s
+        )
+
+    def clear(self):
+        self.blocked_since_s = None
+        self.next_retry_s = 0.0
 
 
 def path_lengths(path):

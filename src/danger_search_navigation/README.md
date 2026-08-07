@@ -31,6 +31,7 @@ nav_controller.py 是本包唯一的 ROS 节点入口和唯一的 /move_base Act
 - Action 跟踪 A* 路径的前视点，不会直接追最终目标。大偏航先原地旋转；进入 XY 容差后继续独立调整最终 yaw，只有 XY 和 yaw 都达标才 SUCCEEDED。
 - /scan 依据 YAML 内的 LiDAR-to-base 外参筛选和投影成临时障碍，并以和静态障碍相同的策略膨胀。require_obstacle_cloud 为 true 时，缺失、过期或帧错误的点云会停止并以 CONTROL_FAILED 结束活动目标。
 - 位姿、地图和 MappingStatus 必须有正确 map 帧、合法数值/四元数及新鲜时间戳。MappingStatus 还必须 ready=true、stable=true、lost=false；不满足时 readiness 为 false，活动目标以 LOCALIZATION_LOST 安全结束。
+- 地图更新后静态地图确实无路时，目标立即以 UNREACHABLE 结束。若静态地图仍有路、但最新 /scan 的临时障碍封住路线，节点持续发布零速度并在 `blocked_replan_timeout` 内重规划；障碍清除后恢复原目标，超时才以 UNREACHABLE 结束。
 - safety_stop=true 会立即向 /danger_search/nav_cmd_vel 发布零速度，并以 SAFETY_STOP 结束活动目标。取消、不可达、超时、卡住、地图失效和节点关闭也都会显式发布零速度。
 - NavigationHealth 的 active_goal_id、progress 和 last_cmd_time 分别来自实际 Action GoalID、累计路径长度和实际导航命令发布时间，绝不用 health 发布时刻伪造。P0 没有摔倒传感器，fallen 始终为 false，不能解读为已实现摔倒检测。
 

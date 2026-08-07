@@ -12,9 +12,11 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 from navigation_core import (
+    DynamicObstacleWait,
     GoalState,
     InflatedOccupancyGrid,
     goal_reached,
+    map_snapshot_fingerprint,
     path_lengths,
     path_progress,
 )
@@ -75,6 +77,14 @@ class InflatedOccupancyGridTest(unittest.TestCase):
         self.assertIsNotNone(route)
         self.assertTrue(grid.path_is_traversable(route, dynamic_cells=[(3, 2)]))
 
+    def test_dynamic_obstacle_can_temporarily_block_an_otherwise_valid_route(self):
+        grid = make_grid(5, 1)
+
+        self.assertIsNotNone(grid.plan((0.5, 0.5), (4.5, 0.5)))
+        self.assertIsNone(
+            grid.plan((0.5, 0.5), (4.5, 0.5), dynamic_cells=[(2, 0)])
+        )
+
     def test_unknown_is_blocked_without_expanding_over_free_cells(self):
         # unknown 本身不可通行，但机器人膨胀只围绕真实占据栅格。
         grid = make_grid(5, 3, unknown=[(2, 1)], robot_radius=1.0)
@@ -96,6 +106,39 @@ class InflatedOccupancyGridTest(unittest.TestCase):
 
 
 class NavigationStateTest(unittest.TestCase):
+    def test_identical_map_snapshots_keep_the_same_fingerprint(self):
+        first = map_snapshot_fingerprint(
+            2, 2, 0.05, -1.0, -1.0, 0.0, [0, 0, -1, 100]
+        )
+        same = map_snapshot_fingerprint(
+            2, 2, 0.05, -1.0, -1.0, 0.0, [0, 0, -1, 100]
+        )
+        changed = map_snapshot_fingerprint(
+            2, 2, 0.05, -1.0, -1.0, 0.0, [0, 100, -1, 100]
+        )
+
+        self.assertEqual(first, same)
+        self.assertNotEqual(first, changed)
+
+    def test_dynamic_blockage_waits_then_recovers_when_route_clears(self):
+        wait = DynamicObstacleWait(timeout_s=2.0, retry_interval_s=0.2)
+        wait.begin(10.0)
+
+        self.assertFalse(wait.retry_due(10.1))
+        self.assertTrue(wait.retry_due(10.2))
+        self.assertFalse(wait.expired(11.9))
+        wait.clear()
+
+        self.assertIsNone(wait.blocked_since_s)
+        self.assertFalse(wait.expired(12.0))
+
+    def test_dynamic_blockage_expires_after_configured_timeout(self):
+        wait = DynamicObstacleWait(timeout_s=2.0, retry_interval_s=0.2)
+        wait.begin(10.0)
+
+        self.assertFalse(wait.expired(11.99))
+        self.assertTrue(wait.expired(12.0))
+
     def test_cancel_clears_goal_and_has_zero_velocity_semantics(self):
         state = GoalState()
         state.begin("goal-42")

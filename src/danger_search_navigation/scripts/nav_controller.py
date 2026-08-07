@@ -32,9 +32,11 @@ except ValueError:
 sys.path.insert(0, _SCRIPT_DIR)
 
 from navigation_core import (
+    DynamicObstacleWait,
     GoalState,
     InflatedOccupancyGrid,
     goal_reached,
+    map_snapshot_fingerprint,
     normalize_angle,
     path_lengths,
     path_progress,
@@ -102,6 +104,12 @@ class NavController:
         self.replan_period = float(rospy.get_param("~replan_period", 1.00))
         self.replan_min_interval = float(rospy.get_param("~replan_min_interval", 0.25))
         self.replan_deviation_distance = float(rospy.get_param("~replan_deviation_distance", 0.50))
+        self.blocked_replan_timeout = float(
+            rospy.get_param("~blocked_replan_timeout", 2.00)
+        )
+        self.blocked_replan_interval = float(
+            rospy.get_param("~blocked_replan_interval", 0.20)
+        )
         self.goal_tolerance_xy = float(rospy.get_param("~goal_tolerance_xy", 0.30))
         self.goal_tolerance_yaw = float(rospy.get_param("~goal_tolerance_yaw", 0.20))
         self.goal_timeout = float(rospy.get_param("~goal_timeout", 60.0))
@@ -121,6 +129,7 @@ class NavController:
         self.map_stamp = rospy.Time(0)
         self.map_valid = False
         self.map_generation = 0
+        self.map_fingerprint = None
         self.mapping_status = None
         self.mapping_status_stamp = rospy.Time(0)
         self.latest_obstacles_base = []
@@ -202,6 +211,7 @@ class NavController:
             self.max_angular_speed, self.rotate_in_place_angle,
             self.rotate_in_place_gain, self.final_yaw_gain, self.replan_period,
             self.replan_min_interval, self.replan_deviation_distance,
+            self.blocked_replan_timeout, self.blocked_replan_interval,
             self.stuck_timeout, self.progress_distance,
         )
         if any(not math.isfinite(value) or value <= 0.0 for value in positive_values):
@@ -232,6 +242,7 @@ class NavController:
     def map_callback(self, msg):
         """原子替换经合法性检查的规划器快照。"""
         planner = None
+        fingerprint = None
         valid = False
         if msg.header.frame_id == self.map_frame and not msg.header.stamp.is_zero():
             origin = msg.info.origin
@@ -247,17 +258,23 @@ class NavController:
                         allow_diagonal=self.allow_diagonal,
                         max_expansions=self.max_expansions,
                     )
+                    fingerprint = map_snapshot_fingerprint(
+                        msg.info.width, msg.info.height, msg.info.resolution,
+                        origin.position.x, origin.position.y, yaw, msg.data,
+                    )
                     valid = True
                 except (TypeError, ValueError) as exc:
                     rospy.logwarn_throttle(5.0, "[navigation] 地图无效，拒绝规划: %s", exc)
         if not valid:
             rospy.logwarn_throttle(5.0, "[navigation] 地图帧、时间戳、原点或几何无效")
         with self.lock:
+            map_changed = valid and fingerprint != self.map_fingerprint
             self.map_data = tuple(msg.data) if valid else None
             self.planner = planner
             self.map_stamp = msg.header.stamp
             self.map_valid = valid
-            if valid:
+            self.map_fingerprint = fingerprint if valid else None
+            if map_changed:
                 self.map_generation += 1
             active = self.goal_state.active
         if not valid and active:
@@ -316,6 +333,15 @@ class NavController:
         with self.lock:
             planner = self.planner
         return None if planner is None else planner.plan(start_xy, goal_xy, dynamic_cells)
+
+    def _plan_route_variants(self, start_xy, goal_xy, dynamic_cells, obstacle_fresh):
+        """Distinguish a static-map failure from a transient dynamic block."""
+        static_route = self._plan_path(start_xy, goal_xy)
+        if static_route is None:
+            return None, None
+        if not obstacle_fresh:
+            return static_route, static_route
+        return static_route, self._plan_path(start_xy, goal_xy, dynamic_cells)
 
     def _pose_from_message(self, msg):
         if msg.header.frame_id != self.map_frame or msg.header.stamp.is_zero():
@@ -532,10 +558,23 @@ class NavController:
             self._finish_goal("LOCALIZATION_LOST", "读取规划起点时定位位姿已失效")
             return
         dynamic_cells, _, obstacle_fresh = self._dynamic_obstacle_snapshot(now)
-        route = self._plan_path(current[:2], target[:2], dynamic_cells if obstacle_fresh else ())
-        if not route:
-            self._finish_goal("UNREACHABLE", "起点或目标位于不可通行栅格，或当前地图中无路径")
+        static_route, route = self._plan_route_variants(
+            current[:2], target[:2], dynamic_cells, obstacle_fresh
+        )
+        if static_route is None:
+            self._finish_goal("UNREACHABLE", "当前静态地图中起点或目标无可达路径")
             return
+
+        dynamic_wait = DynamicObstacleWait(
+            self.blocked_replan_timeout, self.blocked_replan_interval
+        )
+        if route is None:
+            route = static_route
+            dynamic_wait.begin(now.to_sec())
+            rospy.logwarn(
+                "[navigation] 动态障碍暂时阻断初始路径，零速等待最多 %.1fs",
+                self.blocked_replan_timeout,
+            )
 
         with self.lock:
             self.goal_state.begin(self._current_goal_id())
@@ -569,6 +608,36 @@ class NavController:
                 terminal_code, terminal_detail = "LOCALIZATION_LOST", "控制循环中定位位姿已失效"
                 break
             dynamic_cells, front_clearance, obstacle_fresh = self._dynamic_obstacle_snapshot(now)
+
+            if dynamic_wait.blocked_since_s is not None:
+                if dynamic_wait.expired(now.to_sec()):
+                    terminal_code = "UNREACHABLE"
+                    terminal_detail = (
+                        "动态障碍持续 %.1fs 阻断路径"
+                        % self.blocked_replan_timeout
+                    )
+                    break
+                if dynamic_wait.retry_due(now.to_sec()):
+                    static_route, dynamic_route = self._plan_route_variants(
+                        current[:2], target[:2], dynamic_cells, obstacle_fresh
+                    )
+                    if static_route is None:
+                        terminal_code = "UNREACHABLE"
+                        terminal_detail = "地图更新后静态地图中无可达路径"
+                        break
+                    if dynamic_route is not None:
+                        with self.lock:
+                            self._apply_route_locked(dynamic_route, now)
+                        dynamic_wait.clear()
+                        rospy.loginfo("[navigation] 动态障碍已清除，恢复路径跟踪")
+                    else:
+                        dynamic_wait.record_retry(now.to_sec())
+                if dynamic_wait.blocked_since_s is not None:
+                    self._publish_velocity(0.0, 0.0)
+                    self._publish_feedback(current)
+                    rate.sleep()
+                    continue
+
             route, route_generation, last_replan = self._route_snapshot()
             route_blocked = self._path_is_blocked(route, dynamic_cells if obstacle_fresh else ())
             deviation = self._path_deviation(current[:2], route)
@@ -583,14 +652,25 @@ class NavController:
                 or (now - last_replan).to_sec() >= self.replan_period
             )
             if replan_due and (now - last_replan).to_sec() >= self.replan_min_interval:
-                route = self._plan_path(
-                    current[:2], target[:2], dynamic_cells if obstacle_fresh else ()
+                static_route, dynamic_route = self._plan_route_variants(
+                    current[:2], target[:2], dynamic_cells, obstacle_fresh
                 )
-                if not route:
-                    terminal_code, terminal_detail = "UNREACHABLE", "最新地图或临时障碍已阻断路径"
+                if static_route is None:
+                    terminal_code = "UNREACHABLE"
+                    terminal_detail = "地图更新后静态地图中无可达路径"
                     break
+                if dynamic_route is None:
+                    dynamic_wait.begin(now.to_sec())
+                    rospy.logwarn(
+                        "[navigation] 动态障碍暂时阻断路径，零速等待最多 %.1fs",
+                        self.blocked_replan_timeout,
+                    )
+                    self._publish_velocity(0.0, 0.0)
+                    self._publish_feedback(current)
+                    rate.sleep()
+                    continue
                 with self.lock:
-                    self._apply_route_locked(route, now)
+                    self._apply_route_locked(dynamic_route, now)
 
             if goal_reached(current, target, self.goal_tolerance_xy, self.goal_tolerance_yaw):
                 terminal_code, terminal_detail = "SUCCEEDED", "已达到目标位置和最终朝向"
