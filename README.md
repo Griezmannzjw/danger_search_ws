@@ -8,9 +8,9 @@
 
 | 规范要求 | 实现状态 |
 |---------|---------|
-| localization是`/tf`唯一发布者，提供`world→map→odom→base` | ✅ 20Hz发布，链完整 |
+| localization是`/tf`唯一发布者，提供`map→odom→base` | ✅ 20Hz发布，链完整 |
 | 地图有已知自由区域（非全未知） | ✅ 初始化2m半径自由区域 |
-| 定位用IMU/激光，不用`cmd_vel_sent`做里程计 | ✅ IMU积分航位推算 |
+| 定位用允许的IMU/激光，不用`cmd_vel_sent`做里程计 | ✅ Hector 激光匹配位姿，IMU仅用于重力校正 |
 | `make_plan`基于实际地图判断可达性，不返回无条件直线 | ✅ 直线插值+障碍检查 |
 | 所有话题/服务/frame从ROS参数读取，无硬编码 | ✅ 全部参数化 |
 | 结果文件绝对路径，支持环境变量展开 | ✅ `~`和`$USER`自动展开 |
@@ -186,7 +186,7 @@ rosnode list
 
 # 2. 检查TF链是否完整
 rosrun tf view_frames && evince frames.pdf
-# 应该看到完整链路：world -> map -> odom -> base
+# 应该看到完整链路：map -> odom -> base
 
 # 3. 检查定位是否正常
 rostopic echo /localization/pose -n 1
@@ -194,7 +194,7 @@ rostopic echo /localization/pose -n 1
 
 # 4. 检查地图是否正常
 rostopic echo /map -n 1 | grep -A 5 info
-# 应该有resolution=0.05, width=400, height=720
+# 应该有resolution=0.05, width=1024, height=1024
 # data数组里应该有0（自由区域），不是全-1
 
 # 5. 检查建图状态
@@ -309,7 +309,7 @@ rospack find danger_search_bringup
 
 | 模块 | P0实现 | 升级方向 | 负责人 |
 |------|--------|---------|--------|
-| localization | IMU积分+2D栅格 | Cartographer激光SLAM，回环检测，多楼层地图 | 导航组 |
+| localization | Hector 位姿+2D栅格，GICP诊断 | Cartographer激光SLAM，回环检测，多楼层地图 | 导航组 |
 | navigation | P控制器+直线避障 | 完整move_base：global planner(Dijkstra/A*) + local planner(DWA/TEB) + costmap_2d | 导航组 |
 | exploration | 自由区域随机选点 | 前沿点算法(frontier exploration)，房间拓扑遍历，多楼层电梯/楼梯 | 探索组 |
 | perception | P0空骨架 | HSV颜色分割+轮廓检测，YOLOv8实例分割，深度图3D定位，多帧确认去重 | 识别组 |

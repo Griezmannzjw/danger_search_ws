@@ -39,8 +39,10 @@ class ScanProjectionConfig:
     ground_candidate_max_range: float = 3.00
     min_ground_candidate_points: int = 30
     min_ground_clearance_m: float = 0.18
-    min_valid_scan_bins: int = 60
-    min_angular_coverage_rad: float = 0.50
+    scan_accumulation_frames: int = 5
+    scan_accumulation_min_samples_per_bin: int = 2
+    min_valid_scan_bins: int = 8
+    min_angular_coverage_rad: float = 0.05
 
     def __post_init__(self):
         _require(self.angle_min < self.angle_max, "scan angle range is invalid")
@@ -91,6 +93,15 @@ class ScanProjectionConfig:
             "minimum ground candidate count must be positive",
         )
         _require(self.min_ground_clearance_m > 0.0, "minimum clearance must be positive")
+        _require(
+            self.scan_accumulation_frames >= 1,
+            "scan accumulation frame count must be positive",
+        )
+        _require(
+            1 <= self.scan_accumulation_min_samples_per_bin
+            <= self.scan_accumulation_frames,
+            "scan accumulation minimum samples must be within the window",
+        )
         _require(
             self.min_valid_scan_bins >= 1,
             "min_valid_scan_bins must be at least one",

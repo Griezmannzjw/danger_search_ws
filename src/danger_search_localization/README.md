@@ -1,19 +1,22 @@
 # danger_search_localization
 
-定位与建图包。当前 navigation 位姿由三维 GICP 雷达里程计产生，二维地图暂由
-Hector 维护；后端仍可在不改变公共接口的前提下替换为 FAST-LIO 或其他 LIO。
+定位与建图包。P0 的 navigation 位姿和二维地图都由 Hector 激光匹配提供；GICP
+保留为不阻断 P0 的三维点云诊断里程计。后端仍可在不改变公共接口的前提下替换为
+FAST-LIO 或其他 LIO。
 
 ## 当前数据链
 
 ```text
 /scan (官方原始 PointCloud, laser_livox)
-  +-> lidar_odometry_node（三维 GICP）
-  |    -> /localization/raw_pose
-  |    -> pose_estimator.py（起点归零、抖动抑制、跳变拒绝）
-  |    -> /localization/pose + /localization/status + TF
-  |
   +-> scan_projector.py -> /localization/scan -> hector_mapping
-       -> /localization/raw_map -> /map + /mapping/status
+  |    -> /localization/hector_pose -> pose_estimator.py
+  |    -> /localization/raw_map -> /map + /mapping/status
+  |
+  +-> lidar_odometry_node（三维 GICP，诊断）
+       -> /localization/raw_pose
+
+pose_estimator.py 对 Hector 位姿执行起点归零、抖动抑制和跳变拒绝后，发布
+`/localization/pose`、`/localization/status` 和 `map -> odom -> base` TF。
 ```
 
 本包不订阅 `/Odometry_gazebo`，也不订阅 SimEnv 默认可能使用真值里程计转换过的
@@ -23,10 +26,13 @@ Hector 维护；后端仍可在不改变公共接口的前提下替换为 FAST-L
 ```bash
 GUI=false \
 ENABLE_REFEREE_ODOM=0 \
-ENABLE_GROUND_TRUTH=0 \
+ENABLE_GROUND_TRUTH=1 \
 POINTCLOUD_USE_GROUND_TRUTH_ODOM=0 \
 ./auto.sh
 ```
+
+`ENABLE_GROUND_TRUTH=1` 仅供 SimEnv 的 `junior_ctrl` 获取步态策略观测；本包不订阅
+这些真值话题，referee 里程计和真值变换点云仍由另外两个选项禁用。
 
 点云投影会排除机器人自身范围；同一角度的回波先按距离聚类，只接受具有足够
 多点支持的最近表面并使用簇中位数，随后删除没有相邻连续表面支持的孤立命中。
@@ -34,6 +40,23 @@ POINTCLOUD_USE_GROUND_TRUTH_ODOM=0 \
 `config/default.yaml`；若窄障碍被过度过滤，可以减小 `min_returns_per_bin`、增大
 `max_intra_bin_range_gap` 或 `max_neighbor_range_jump`，也可以临时关闭
 `enable_isolated_hit_filter`。
+
+Livox 单帧的角度覆盖并不完整。投影器会在 `base` 坐标系中累计最近
+`scan_accumulation_frames` 帧（默认 5 帧，约 0.5 秒），仅保留同一角度 bin 至少被
+`scan_accumulation_min_samples_per_bin` 帧观测到的距离中位数。有效 bin 数和连续覆盖
+门限作用于这个稳定扫描，而不是任意单帧。运行时可用以下命令确认数据链：
+
+默认的累计扫描门限为至少 8 个有效 0.5 度 bin、连续覆盖至少 0.05 rad。它们仅排除
+空扫描和退化的单点回波；实际地图质量仍由 Hector 的连续更新和 `/mapping/status` 判断。
+
+```bash
+rostopic hz /scan
+rostopic hz /localization/scan
+rostopic echo -n 1 /mapping/status
+```
+
+正常情况下 `/scan` 约为 10 Hz，`/localization/scan` 会在缓存填充后持续发布；Hector
+收到地图更新后，`/mapping/status` 应变为 `ready: True`、`stable: True`。
 
 ## 公共输出
 
@@ -48,7 +71,8 @@ POINTCLOUD_USE_GROUND_TRUTH_ODOM=0 \
 `/localization/pose` 第一帧始终定义为比赛出发点 `(0,0,0)`。正常连续运动经过低通
 处理；静止时小于阈值的扫描匹配抖动不会传给 navigation。若后端出现超过速度上限
 的位置或航向跳变，适配器保留最后可信位姿，并在连续异常后将定位状态标为 LOST。
-GICP 连续配准失败时停止发布，状态会因位姿超时进入 LOST，而不会持续伪造新位姿。
+GICP 连续配准失败不会影响 P0 位姿；它会以当前扫描重新建立参考帧，避免陈旧点云
+造成连锁跳变。GICP 输出仅用于诊断和后续 LIO 升级，不是 navigation 输入。
 
 ### 探索模块实际收到的地图
 
@@ -90,7 +114,7 @@ rosrun tf tf_echo map base
   默认关闭；
 - 当前只维护 `current_floor=0`，尚未实现换层检测和分楼层地图；
 - 2D 投影不能保留楼梯、门槛和坡面的完整高度信息；
-- GICP 是局部 scan-to-scan 里程计，没有回环，长距离仍会累计漂移；
-- `/map` 仍来自 Hector，地图与 GICP 位姿的一致性需在建图模块下一阶段解决；
+- GICP 是局部 scan-to-scan 诊断里程计，没有回环，长距离仍会累计漂移；
+- P0 使用 Hector 同时提供地图和位姿；后续 LIO 替换时必须保持这两项输出的一致性；
 - 下一阶段应接入 Livox + IMU 的 LIO，并增加表面点云、可通行性和楼层管理；
 - 后端升级时保持本 README 中的公共输出不变，探索、导航和感知无需跟着改。

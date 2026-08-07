@@ -9,7 +9,7 @@
     <rosparam command="load" file="$(arg config_file)" />
   </node>
 
-  <!-- navigation 位姿使用三维点云 GICP，不使用 Gazebo 真值。 -->
+  <!-- GICP 保留为三维点云诊断里程计，不驱动 P0 readiness。 -->
   <node name="lidar_odometry"
         pkg="danger_search_localization"
         type="lidar_odometry_node"
@@ -17,7 +17,7 @@
     <rosparam command="load" file="$(arg config_file)" />
   </node>
 
-  <!-- Hector 只作为可替换的 SLAM 后端，公共话题和 TF 由 adapter 统一发布。 -->
+  <!-- Hector 是 P0 位姿与地图后端，公共话题和 TF 由 adapter 统一发布。 -->
   <node name="hector_mapping"
         pkg="hector_mapping"
         type="hector_mapping"

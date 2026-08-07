@@ -13,6 +13,7 @@ from .config import ScanProjectionConfig
 from .scan_projection import (
     estimate_ground_clearance,
     gravity_level_points,
+    merge_scan_history,
     project_planar_scan,
     quaternion_inverse,
     quaternion_multiply,
@@ -31,6 +32,7 @@ class ScanProjectorNode:
         self.config = self._load_config()
         self.imu_lock = threading.RLock()
         self.imu_samples = deque(maxlen=500)
+        self.range_history = deque(maxlen=self.config.scan_accumulation_frames)
 
         self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
@@ -168,7 +170,12 @@ class ScanProjectorNode:
                                 "-- publishing anyway",
                                 clearance,
                             )
-        ranges = project_planar_scan(points_base, self.config)
+        frame_ranges = project_planar_scan(points_base, self.config)
+        self.range_history.append(frame_ranges)
+        ranges = merge_scan_history(
+            self.range_history,
+            self.config.scan_accumulation_min_samples_per_bin,
+        )
 
         finite_mask = np.isfinite(ranges)
         valid_bins = int(np.sum(finite_mask))
@@ -196,7 +203,7 @@ class ScanProjectorNode:
         output.angle_min = self.config.angle_min
         output.angle_max = self.config.angle_max
         output.angle_increment = self.config.angle_increment
-        output.scan_time = 0.1
+        output.scan_time = 0.1 * len(self.range_history)
         output.time_increment = 0.0
         output.range_min = self.config.range_min
         output.range_max = self.config.range_max

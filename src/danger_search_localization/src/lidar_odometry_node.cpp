@@ -22,7 +22,7 @@ class LidarOdometryNode {
  public:
   LidarOdometryNode() : private_nh_("~"), tf_listener_(tf_buffer_) {
     private_nh_.param<std::string>("raw_scan_topic", input_topic_, "/scan");
-    private_nh_.param<std::string>("raw_pose_topic", output_topic_,
+    private_nh_.param<std::string>("gicp_pose_topic", output_topic_,
                                    "/localization/raw_pose");
     private_nh_.param<std::string>("map_frame", map_frame_, "map");
     private_nh_.param<std::string>("base_frame", base_frame_, "base");
@@ -153,9 +153,13 @@ class LidarOdometryNode {
       ++consecutive_failures_;
       ROS_ERROR_THROTTLE(1.0,
                          "[localization] GICP rejected: converged=%d fitness=%.3f "
-                         "translation=%.3f rotation=%.3f failures=%d",
+                         "translation=%.3f rotation=%.3f failures=%d; rebaselining",
                          registration.hasConverged(), fitness, translation, angle,
                          consecutive_failures_);
+      // Do not compare later scans with a stale reference after a rejection.
+      previous_ = current;
+      last_stamp_ = message->header.stamp;
+      last_delta_.setIdentity();
     }
   }
 
