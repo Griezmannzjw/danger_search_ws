@@ -23,7 +23,7 @@ allow_diagonal: true
 max_planner_expansions: 75000
 
 # 消息合法性和新鲜度门
-pose_timeout: 0.50
+pose_timeout: 1.00
 map_timeout: 2.00
 mapping_status_timeout: 1.50
 obstacle_cloud_timeout: 0.50
