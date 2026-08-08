@@ -36,8 +36,10 @@ from navigation_core import (
     GoalState,
     InflatedOccupancyGrid,
     goal_reached,
+    is_non_decreasing_stamp,
     map_snapshot_fingerprint,
     normalize_angle,
+    plan_route_variants,
     path_lengths,
     path_progress,
 )
@@ -124,7 +126,6 @@ class NavController:
         self.current_pose = None  # (x, y, yaw)，全部处于 map 坐标系。
         self.pose_stamp = rospy.Time(0)
         self.pose_valid = False
-        self.map_data = None
         self.planner = None
         self.map_stamp = rospy.Time(0)
         self.map_valid = False
@@ -135,6 +136,8 @@ class NavController:
         self.latest_obstacles_base = []
         self.obstacle_stamp = rospy.Time(0)
         self.obstacle_frame_valid = False
+        self.dynamic_obstacle_cache_key = None
+        self.dynamic_obstacle_cache = (set(), float("inf"))
         self.safety_stop = False
         self.clear_costmaps_requested = False
         self.lidar_rotation = tf.transformations.euler_matrix(
@@ -159,18 +162,27 @@ class NavController:
         self.cmd_pub = rospy.Publisher(self.nav_cmd_topic, Twist, queue_size=10)
         self.health_pub = rospy.Publisher(self.health_topic, NavigationHealth, queue_size=10)
 
+        # 规划和地图更新是 CPU 密集型 Python 工作。只保留最新传感器快照，避免
+        # 节点忙时继续消费已经过期的队列消息并触发错误的 freshness 失败。
         self.pose_sub = rospy.Subscriber(
-            self.pose_topic, PoseWithCovarianceStamped, self.pose_callback
+            self.pose_topic, PoseWithCovarianceStamped, self.pose_callback,
+            queue_size=1,
         )
-        self.map_sub = rospy.Subscriber(self.map_topic, OccupancyGrid, self.map_callback)
+        self.map_sub = rospy.Subscriber(
+            self.map_topic, OccupancyGrid, self.map_callback,
+            queue_size=1, buff_size=2 ** 22,
+        )
         self.mapping_status_sub = rospy.Subscriber(
-            self.mapping_status_topic, MappingStatus, self.mapping_status_callback
+            self.mapping_status_topic, MappingStatus, self.mapping_status_callback,
+            queue_size=1,
         )
         self.obstacle_sub = rospy.Subscriber(
-            self.obstacle_cloud_topic, PointCloud, self.obstacle_callback
+            self.obstacle_cloud_topic, PointCloud, self.obstacle_callback,
+            queue_size=1, buff_size=2 ** 20,
         )
         self.safety_stop_sub = rospy.Subscriber(
-            self.safety_stop_topic, Bool, self.safety_stop_callback
+            self.safety_stop_topic, Bool, self.safety_stop_callback,
+            queue_size=1,
         )
 
         self.action_server = actionlib.SimpleActionServer(
@@ -235,6 +247,7 @@ class NavController:
             self.current_pose = pose
             self.pose_stamp = msg.header.stamp
             self.pose_valid = valid
+            self.dynamic_obstacle_cache_key = None
             active = self.goal_state.active
         if not valid and active:
             self._stop_robot()
@@ -249,6 +262,20 @@ class NavController:
             yaw = self._quaternion_yaw(origin.orientation)
             if yaw is not None and self._finite(origin.position.x, origin.position.y):
                 try:
+                    fingerprint = map_snapshot_fingerprint(
+                        msg.info.width, msg.info.height, msg.info.resolution,
+                        origin.position.x, origin.position.y, yaw, msg.data,
+                    )
+                    with self.lock:
+                        unchanged = (
+                            self.planner is not None
+                            and fingerprint == self.map_fingerprint
+                        )
+                    if unchanged:
+                        with self.lock:
+                            self.map_stamp = msg.header.stamp
+                            self.map_valid = True
+                        return
                     planner = InflatedOccupancyGrid(
                         msg.info.width, msg.info.height, msg.info.resolution,
                         origin.position.x, origin.position.y, yaw, msg.data,
@@ -258,10 +285,6 @@ class NavController:
                         allow_diagonal=self.allow_diagonal,
                         max_expansions=self.max_expansions,
                     )
-                    fingerprint = map_snapshot_fingerprint(
-                        msg.info.width, msg.info.height, msg.info.resolution,
-                        origin.position.x, origin.position.y, yaw, msg.data,
-                    )
                     valid = True
                 except (TypeError, ValueError) as exc:
                     rospy.logwarn_throttle(5.0, "[navigation] 地图无效，拒绝规划: %s", exc)
@@ -269,13 +292,13 @@ class NavController:
             rospy.logwarn_throttle(5.0, "[navigation] 地图帧、时间戳、原点或几何无效")
         with self.lock:
             map_changed = valid and fingerprint != self.map_fingerprint
-            self.map_data = tuple(msg.data) if valid else None
             self.planner = planner
             self.map_stamp = msg.header.stamp
             self.map_valid = valid
             self.map_fingerprint = fingerprint if valid else None
             if map_changed:
                 self.map_generation += 1
+                self.dynamic_obstacle_cache_key = None
             active = self.goal_state.active
         if not valid and active:
             self._stop_robot()
@@ -291,6 +314,17 @@ class NavController:
 
     def obstacle_callback(self, cloud):
         """把有效原始 /scan 转为 base 坐标下的临时障碍，不用作定位。"""
+        with self.lock:
+            previous_stamp = self.obstacle_stamp
+        if not is_non_decreasing_stamp(
+            previous_stamp.to_nsec(), cloud.header.stamp.to_nsec()
+        ):
+            rospy.logwarn_throttle(
+                5.0,
+                "[navigation] 丢弃倒退的 /scan 时间戳: current=%.3f previous=%.3f",
+                cloud.header.stamp.to_sec(), previous_stamp.to_sec(),
+            )
+            return
         points = []
         frame_valid = cloud.header.frame_id == self.lidar_frame and not cloud.header.stamp.is_zero()
         if frame_valid:
@@ -316,6 +350,7 @@ class NavController:
             self.latest_obstacles_base = points
             self.obstacle_stamp = cloud.header.stamp
             self.obstacle_frame_valid = frame_valid
+            self.dynamic_obstacle_cache_key = None
             active = self.goal_state.active
         if self.require_obstacle_cloud and not frame_valid and active:
             self._stop_robot()
@@ -328,20 +363,10 @@ class NavController:
         if bool(msg.data) and active:
             self._stop_robot()
 
-    def _plan_path(self, start_xy, goal_xy, dynamic_cells=()):
-        """make_plan 与 Action 唯一允许调用的共享规划入口。"""
+    def _planner_snapshot(self):
+        """返回必须在一次规划中共同使用的不可变地图快照和版本。"""
         with self.lock:
-            planner = self.planner
-        return None if planner is None else planner.plan(start_xy, goal_xy, dynamic_cells)
-
-    def _plan_route_variants(self, start_xy, goal_xy, dynamic_cells, obstacle_fresh):
-        """Distinguish a static-map failure from a transient dynamic block."""
-        static_route = self._plan_path(start_xy, goal_xy)
-        if static_route is None:
-            return None, None
-        if not obstacle_fresh:
-            return static_route, static_route
-        return static_route, self._plan_path(start_xy, goal_xy, dynamic_cells)
+            return self.planner, self.map_generation
 
     def _pose_from_message(self, msg):
         if msg.header.frame_id != self.map_frame or msg.header.stamp.is_zero():
@@ -399,6 +424,8 @@ class NavController:
             obstacle_ready = self.obstacle_frame_valid and self._is_stamp_fresh(
                 self.obstacle_stamp, self.obstacle_cloud_timeout, now
             )
+            obstacle_frame_valid = self.obstacle_frame_valid
+            obstacle_stamp = self.obstacle_stamp
             safety_stop = self.safety_stop
         if safety_stop:
             return False, "SAFETY_STOP", "外部 safety_stop 信号为真"
@@ -413,18 +440,33 @@ class NavController:
         if not mapping.ready or not mapping.stable:
             return False, "LOCALIZATION_LOST", mapping.status_reason or "定位/建图尚未 ready 且 stable"
         if require_obstacles and self.require_obstacle_cloud and not obstacle_ready:
-            return False, "CONTROL_FAILED", "要求的 /scan 缺失、过期或坐标帧无效"
+            if not obstacle_frame_valid:
+                detail = "要求的 /scan 缺失或坐标帧无效（期望 %s）" % self.lidar_frame
+            elif obstacle_stamp.is_zero():
+                detail = "要求的 /scan 尚未收到有效时间戳"
+            else:
+                age = (now - obstacle_stamp).to_sec()
+                if age < -self.max_future_stamp_skew:
+                    detail = "/scan 时间戳超前 %.3fs" % (-age)
+                else:
+                    detail = "/scan 已过期：age=%.3fs timeout=%.3fs" % (
+                        age, self.obstacle_cloud_timeout,
+                    )
+            return False, "CONTROL_FAILED", detail
         return True, "NONE", ""
 
-    def _dynamic_obstacle_snapshot(self, now):
-        """将当前点云临时障碍投到 map 栅格，并计算前方净空。"""
+    def _dynamic_obstacle_snapshot(self, now, planner, planner_generation):
+        """返回同一传感器/位姿/地图版本对应的已膨胀动态障碍快照。"""
         with self.lock:
-            planner = self.planner
             pose = self.current_pose
             obstacles = list(self.latest_obstacles_base)
+            obstacle_stamp = self.obstacle_stamp
             fresh = self.obstacle_frame_valid and self._is_stamp_fresh(
-                self.obstacle_stamp, self.obstacle_cloud_timeout, now
+                obstacle_stamp, self.obstacle_cloud_timeout, now
             )
+            cache_key = (obstacle_stamp.to_nsec(), pose, planner_generation)
+            if fresh and cache_key == self.dynamic_obstacle_cache_key:
+                return self.dynamic_obstacle_cache[0], self.dynamic_obstacle_cache[1], True
         if planner is None or pose is None or not fresh:
             return set(), float("inf"), fresh
         cos_yaw, sin_yaw = math.cos(pose[2]), math.sin(pose[2])
@@ -438,22 +480,25 @@ class NavController:
             cell = planner.world_to_cell(world_x, world_y)
             if cell is not None:
                 dynamic_cells.add(cell)
-        return dynamic_cells, front_clearance, True
+        dynamic_blocked = planner.expanded_cells(dynamic_cells)
+        with self.lock:
+            if (self.obstacle_stamp == obstacle_stamp
+                    and self.current_pose == pose
+                    and self.map_generation == planner_generation):
+                self.dynamic_obstacle_cache_key = cache_key
+                self.dynamic_obstacle_cache = (dynamic_blocked, front_clearance)
+        return dynamic_blocked, front_clearance, True
 
-    def _apply_route_locked(self, route, now):
+    def _apply_route_locked(self, route, now, map_generation):
         self.active_path = list(route)
         self.active_path_lengths = path_lengths(self.active_path)
         self.waypoint_index = 0
-        self.active_map_generation = self.map_generation
+        self.active_map_generation = map_generation
         self.last_replan_time = now
 
     def _route_snapshot(self):
         with self.lock:
             return list(self.active_path), self.active_map_generation, self.last_replan_time
-
-    def _map_generation_snapshot(self):
-        with self.lock:
-            return self.map_generation
 
     def _current_pose_snapshot(self):
         with self.lock:
@@ -463,10 +508,11 @@ class NavController:
         with self.lock:
             return self.goal_start_time
 
-    def _path_is_blocked(self, route, dynamic_cells):
-        with self.lock:
-            planner = self.planner
-        return planner is None or not planner.path_is_traversable(route, dynamic_cells)
+    @staticmethod
+    def _path_is_blocked(planner, route, dynamic_blocked):
+        return planner is None or not planner.path_is_traversable_expanded(
+            route, dynamic_blocked
+        )
 
     def _current_goal_id(self):
         try:
@@ -498,7 +544,9 @@ class NavController:
         goal, goal_valid = self._pose_stamped_to_xy_yaw(req.goal, allow_zero_stamp=True)
         if not start_valid or not goal_valid:
             return response
-        ready, _, _ = self._navigation_readiness(rospy.Time.now(), require_obstacles=False)
+        ready, _, _ = self._navigation_readiness(
+            rospy.Time.now(), require_obstacles=self.require_obstacle_cloud
+        )
         if not ready:
             return response
         # GetPlan 的常见零时间戳 start 请求使用最新已验证的定位位姿。
@@ -506,9 +554,12 @@ class NavController:
             start = self._current_pose_snapshot()
             if start is None:
                 return response
-        dynamic_cells, _, obstacle_fresh = self._dynamic_obstacle_snapshot(rospy.Time.now())
-        path_points = self._plan_path(
-            start[:2], goal[:2], dynamic_cells if obstacle_fresh else ()
+        planner, planner_generation = self._planner_snapshot()
+        dynamic_blocked, _, obstacle_fresh = self._dynamic_obstacle_snapshot(
+            rospy.Time.now(), planner, planner_generation
+        )
+        path_points = None if planner is None else planner.plan_expanded(
+            start[:2], goal[:2], dynamic_blocked if obstacle_fresh else ()
         )
         if not path_points:
             return response
@@ -557,9 +608,12 @@ class NavController:
         if current is None:
             self._finish_goal("LOCALIZATION_LOST", "读取规划起点时定位位姿已失效")
             return
-        dynamic_cells, _, obstacle_fresh = self._dynamic_obstacle_snapshot(now)
-        static_route, route = self._plan_route_variants(
-            current[:2], target[:2], dynamic_cells, obstacle_fresh
+        planner, planner_generation = self._planner_snapshot()
+        dynamic_blocked, _, obstacle_fresh = self._dynamic_obstacle_snapshot(
+            now, planner, planner_generation
+        )
+        static_route, route = plan_route_variants(
+            planner, current[:2], target[:2], dynamic_blocked, obstacle_fresh
         )
         if static_route is None:
             self._finish_goal("UNREACHABLE", "当前静态地图中起点或目标无可达路径")
@@ -584,7 +638,7 @@ class NavController:
             self.goal_start_time = now
             self.last_position = current[:2]
             self.last_progress_time = now
-            self._apply_route_locked(route, now)
+            self._apply_route_locked(route, now, planner_generation)
 
         terminal_code = None
         terminal_detail = ""
@@ -607,7 +661,10 @@ class NavController:
             if current is None:
                 terminal_code, terminal_detail = "LOCALIZATION_LOST", "控制循环中定位位姿已失效"
                 break
-            dynamic_cells, front_clearance, obstacle_fresh = self._dynamic_obstacle_snapshot(now)
+            planner, planner_generation = self._planner_snapshot()
+            dynamic_blocked, front_clearance, obstacle_fresh = self._dynamic_obstacle_snapshot(
+                now, planner, planner_generation
+            )
 
             if dynamic_wait.blocked_since_s is not None:
                 if dynamic_wait.expired(now.to_sec()):
@@ -618,8 +675,9 @@ class NavController:
                     )
                     break
                 if dynamic_wait.retry_due(now.to_sec()):
-                    static_route, dynamic_route = self._plan_route_variants(
-                        current[:2], target[:2], dynamic_cells, obstacle_fresh
+                    static_route, dynamic_route = plan_route_variants(
+                        planner, current[:2], target[:2], dynamic_blocked,
+                        obstacle_fresh
                     )
                     if static_route is None:
                         terminal_code = "UNREACHABLE"
@@ -627,7 +685,9 @@ class NavController:
                         break
                     if dynamic_route is not None:
                         with self.lock:
-                            self._apply_route_locked(dynamic_route, now)
+                            self._apply_route_locked(
+                                dynamic_route, now, planner_generation
+                            )
                         dynamic_wait.clear()
                         rospy.loginfo("[navigation] 动态障碍已清除，恢复路径跟踪")
                     else:
@@ -639,21 +699,24 @@ class NavController:
                     continue
 
             route, route_generation, last_replan = self._route_snapshot()
-            route_blocked = self._path_is_blocked(route, dynamic_cells if obstacle_fresh else ())
+            route_blocked = self._path_is_blocked(
+                planner, route, dynamic_blocked if obstacle_fresh else ()
+            )
             deviation = self._path_deviation(current[:2], route)
             with self.lock:
                 requested = self.clear_costmaps_requested
                 self.clear_costmaps_requested = False
             replan_due = (
-                route_generation != self._map_generation_snapshot()
+                route_generation != planner_generation
                 or route_blocked
                 or requested
                 or deviation > self.replan_deviation_distance
                 or (now - last_replan).to_sec() >= self.replan_period
             )
             if replan_due and (now - last_replan).to_sec() >= self.replan_min_interval:
-                static_route, dynamic_route = self._plan_route_variants(
-                    current[:2], target[:2], dynamic_cells, obstacle_fresh
+                static_route, dynamic_route = plan_route_variants(
+                    planner, current[:2], target[:2], dynamic_blocked,
+                    obstacle_fresh
                 )
                 if static_route is None:
                     terminal_code = "UNREACHABLE"
@@ -670,7 +733,9 @@ class NavController:
                     rate.sleep()
                     continue
                 with self.lock:
-                    self._apply_route_locked(dynamic_route, now)
+                    self._apply_route_locked(
+                        dynamic_route, now, planner_generation
+                    )
 
             if goal_reached(current, target, self.goal_tolerance_xy, self.goal_tolerance_yaw):
                 terminal_code, terminal_detail = "SUCCEEDED", "已达到目标位置和最终朝向"

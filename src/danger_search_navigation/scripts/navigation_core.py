@@ -24,6 +24,27 @@ VALID_FAILURE_CODES = frozenset((
 ))
 
 
+def is_non_decreasing_stamp(previous_ns, candidate_ns):
+    """只接受首帧或不早于当前快照的消息时间戳。"""
+    return int(previous_ns) == 0 or int(candidate_ns) >= int(previous_ns)
+
+
+def plan_route_variants(
+    planner, start_xy, goal_xy, dynamic_blocked, obstacle_fresh
+):
+    """在一个不可变 planner 上区分静态无路和动态阻断。"""
+    if planner is None:
+        return None, None
+    static_route = planner.plan_expanded(start_xy, goal_xy)
+    if static_route is None:
+        return None, None
+    if not obstacle_fresh:
+        return static_route, static_route
+    return static_route, planner.plan_expanded(
+        start_xy, goal_xy, dynamic_blocked
+    )
+
+
 def normalize_angle(angle):
     """将角度归一化到 [-pi, pi]。"""
     return math.atan2(math.sin(angle), math.cos(angle))
@@ -275,7 +296,12 @@ class InflatedOccupancyGrid:
         return dynamic_blocked is None or cell not in dynamic_blocked
 
     def path_is_traversable(self, path, dynamic_cells=()):
-        dynamic_blocked = self.expanded_cells(dynamic_cells)
+        return self.path_is_traversable_expanded(
+            path, self.expanded_cells(dynamic_cells)
+        )
+
+    def path_is_traversable_expanded(self, path, dynamic_blocked=()):
+        """检查已膨胀动态障碍下的路径，供同一控制周期复用快照。"""
         return all(
             self.traversable(self.world_to_cell(point[0], point[1]), dynamic_blocked)
             for point in path
@@ -283,9 +309,14 @@ class InflatedOccupancyGrid:
 
     def plan(self, start_world, goal_world, dynamic_cells=()):
         """以 A* 搜索膨胀后栅格；起终点或搜索不可达时返回 None。"""
+        return self.plan_expanded(
+            start_world, goal_world, self.expanded_cells(dynamic_cells)
+        )
+
+    def plan_expanded(self, start_world, goal_world, dynamic_blocked=()):
+        """使用已膨胀动态障碍运行 A*，避免一个周期内重复膨胀。"""
         start = self.world_to_cell(start_world[0], start_world[1])
         goal = self.world_to_cell(goal_world[0], goal_world[1])
-        dynamic_blocked = self.expanded_cells(dynamic_cells)
         if not self.traversable(start, dynamic_blocked) or not self.traversable(goal, dynamic_blocked):
             return None
         if start == goal:

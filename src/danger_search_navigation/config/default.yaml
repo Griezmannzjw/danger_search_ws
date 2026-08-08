@@ -26,7 +26,9 @@ max_planner_expansions: 75000
 pose_timeout: 1.00
 map_timeout: 2.00
 mapping_status_timeout: 1.50
-obstacle_cloud_timeout: 0.50
+# SimEnv 实测 /scan 在规划负载下偶发达到约 0.54s；0.75s 仍小于
+# dynamic_stop_distance / max_linear_speed = 2.0s 的停车安全预算。
+obstacle_cloud_timeout: 0.75
 goal_stamp_timeout: 2.00
 max_future_stamp_skew: 0.05
 quaternion_norm_tolerance: 0.05

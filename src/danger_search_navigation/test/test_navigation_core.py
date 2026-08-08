@@ -16,7 +16,9 @@ from navigation_core import (
     GoalState,
     InflatedOccupancyGrid,
     goal_reached,
+    is_non_decreasing_stamp,
     map_snapshot_fingerprint,
+    plan_route_variants,
     path_lengths,
     path_progress,
 )
@@ -106,6 +108,49 @@ class InflatedOccupancyGridTest(unittest.TestCase):
 
 
 class NavigationStateTest(unittest.TestCase):
+    def test_latest_sensor_snapshot_rejects_regressing_stamp(self):
+        self.assertTrue(is_non_decreasing_stamp(0, 100))
+        self.assertTrue(is_non_decreasing_stamp(100, 100))
+        self.assertTrue(is_non_decreasing_stamp(100, 101))
+        self.assertFalse(is_non_decreasing_stamp(101, 100))
+
+    def test_route_variants_use_one_planner_snapshot(self):
+        class RecordingPlanner:
+            def __init__(self):
+                self.calls = []
+
+            def plan_expanded(self, start, goal, dynamic_blocked=()):
+                self.calls.append((start, goal, dynamic_blocked))
+                return None if dynamic_blocked == {"blocked"} else [start, goal]
+
+        planner = RecordingPlanner()
+        static_route, dynamic_route = plan_route_variants(
+            planner, (0.0, 0.0), (1.0, 0.0), {"blocked"}, True
+        )
+
+        self.assertEqual(static_route, [(0.0, 0.0), (1.0, 0.0)])
+        self.assertIsNone(dynamic_route)
+        self.assertEqual(len(planner.calls), 2)
+
+    def test_preexpanded_dynamic_cells_are_not_expanded_again(self):
+        class CountingGrid(InflatedOccupancyGrid):
+            def __init__(self):
+                super().__init__(5, 3, 1.0, 0.0, 0.0, 0.0, [0] * 15)
+                self.expansion_calls = 0
+
+            def expanded_cells(self, cells):
+                self.expansion_calls += 1
+                return super().expanded_cells(cells)
+
+        grid = CountingGrid()
+        dynamic_blocked = grid.expanded_cells([(2, 1)])
+        grid.plan_expanded((0.5, 1.5), (4.5, 1.5), dynamic_blocked)
+        grid.path_is_traversable_expanded(
+            [(0.5, 0.5), (4.5, 0.5)], dynamic_blocked
+        )
+
+        self.assertEqual(grid.expansion_calls, 1)
+
     def test_identical_map_snapshots_keep_the_same_fingerprint(self):
         first = map_snapshot_fingerprint(
             2, 2, 0.05, -1.0, -1.0, 0.0, [0, 0, -1, 100]

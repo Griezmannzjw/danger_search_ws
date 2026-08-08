@@ -26,10 +26,12 @@ nav_controller.py 是本包唯一的 ROS 节点入口和唯一的 /move_base Act
 
 ## 规划、跟踪与安全行为
 
-- navigation_core.py 不依赖 ROS。make_plan、Action 启动、地图更新和动态障碍阻断后的重规划都调用同一个带膨胀的 A* 入口。
+- navigation_core.py 不依赖 ROS。make_plan、Action 启动、地图更新和动态障碍阻断后的重规划都调用同一个带膨胀的 A* 入口。make_plan 与 Action 使用相同的位姿、地图、建图状态和必需 `/scan` readiness，不能出现“路径预检通过、Action 因同一输入门立即拒绝”的接线分叉。
 - /map 中 -1、100、任何非 0 栅格和地图外部均不可通行；所有非自由栅格按机器人半径加安全余量膨胀。地图 origin.position 和二维 yaw 都参与 world/cell 转换，负坐标使用 floor 语义。
 - Action 跟踪 A* 路径的前视点，不会直接追最终目标。大偏航先原地旋转；进入 XY 容差后继续独立调整最终 yaw，只有 XY 和 yaw 都达标才 SUCCEEDED。
 - /scan 依据 YAML 内的 LiDAR-to-base 外参筛选和投影成临时障碍，并以和静态障碍相同的策略膨胀。require_obstacle_cloud 为 true 时，缺失、过期或帧错误的点云会停止并以 CONTROL_FAILED 结束活动目标。
+- 默认 `/scan` freshness 为 0.75 秒；该值覆盖 SimEnv 规划负载下约 0.54 秒的实测抖动，同时小于 `dynamic_stop_distance / max_linear_speed` 的停车预算。不得通过关闭 `require_obstacle_cloud` 绕过安全门。
+- 高频位姿、状态和点云订阅只保留最新消息；倒退的点云时间戳不会覆盖新快照。一次静态/动态规划固定使用同一个不可变地图版本，膨胀后的动态障碍在相同点云、位姿和地图版本内复用，避免规划负载反过来制造输入过期。
 - 位姿、地图和 MappingStatus 必须有正确 map 帧、合法数值/四元数及新鲜时间戳。MappingStatus 还必须 ready=true、stable=true、lost=false；不满足时 readiness 为 false，活动目标以 LOCALIZATION_LOST 安全结束。
 - 地图更新后静态地图确实无路时，目标立即以 UNREACHABLE 结束。若静态地图仍有路、但最新 /scan 的临时障碍封住路线，节点持续发布零速度并在 `blocked_replan_timeout` 内重规划；障碍清除后恢复原目标，超时才以 UNREACHABLE 结束。
 - safety_stop=true 会立即向 /danger_search/nav_cmd_vel 发布零速度，并以 SAFETY_STOP 结束活动目标。取消、不可达、超时、卡住、地图失效和节点关闭也都会显式发布零速度。
