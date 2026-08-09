@@ -17,8 +17,9 @@ class TestLocalizationConfig(unittest.TestCase):
 
     def test_defaults_are_valid(self):
         scan_config = ScanProjectionConfig()
-        self.assertEqual(scan_config.min_valid_scan_bins, 8)
-        self.assertEqual(scan_config.min_angular_coverage_rad, 0.05)
+        self.assertEqual(scan_config.scan_accumulation_frames, 1)
+        self.assertEqual(scan_config.min_valid_scan_bins, 40)
+        self.assertEqual(scan_config.min_angular_coverage_rad, 0.35)
         AdapterConfig()
 
     def test_invalid_height_range_is_rejected(self):

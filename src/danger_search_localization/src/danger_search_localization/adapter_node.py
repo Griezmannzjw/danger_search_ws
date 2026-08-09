@@ -18,7 +18,7 @@ from danger_search_common.msg import (
 )
 
 from .config import AdapterConfig
-from .pose_filter import PoseStabilizer
+from .pose_fusion import HectorGicpFusion, Pose2D
 from .vertical_estimation import (
     VerticalEstimator,
     quaternion_from_rpy,
@@ -40,6 +40,9 @@ class LocalizationAdapterNode:
         self.backend_pose_topic = rospy.get_param(
             "~backend_pose_topic", "/localization/hector_pose"
         )
+        self.gicp_pose_topic = rospy.get_param(
+            "~gicp_pose_topic", "/localization/raw_pose"
+        )
         self.raw_map_topic = rospy.get_param(
             "~raw_map_topic", "/localization/raw_map"
         )
@@ -54,12 +57,14 @@ class LocalizationAdapterNode:
             "~localization_status_topic", "/localization/status"
         )
         self.config = self._load_config()
-        self.pose_filter = PoseStabilizer(self.config)
+        self.pose_fusion = HectorGicpFusion(self.config)
         self.vertical_estimator = VerticalEstimator(self.config)
 
         self.lock = threading.RLock()
         self.latest_pose = None
         self.last_pose_received = rospy.Time(0)
+        self.last_hector_pose_received = rospy.Time(0)
+        self.last_hector_pose_accepted = rospy.Time(0)
         self.last_map_received = rospy.Time(0)
         self.last_map_update = rospy.Time(0)
         self.map_version = 0
@@ -67,12 +72,17 @@ class LocalizationAdapterNode:
         self.map_checksum = None
         self.ever_ready = False
         self.base_from_imu_quaternion = None
+        self.latest_local_pose = None
+        self.latest_map_to_odom = Pose2D(0.0, 0.0, 0.0)
+        self.gicp_consecutive_failures = 0
+        self.hector_consecutive_rejections = 0
+        self.last_hector_update_accepted = False
+        self.pending_hector_pose = None
+        self.last_fusion_reason = "WAITING_FOR_LOCAL_ODOMETRY"
 
         self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster()
-        self.static_tf_broadcaster = tf2_ros.StaticTransformBroadcaster()
-        self._publish_identity_map_to_odom()
 
         self.pose_pub = rospy.Publisher(
             self.pose_topic, PoseWithCovarianceStamped, queue_size=10
@@ -89,10 +99,16 @@ class LocalizationAdapterNode:
             queue_size=5,
             latch=True,
         )
-        self.pose_sub = rospy.Subscriber(
+        self.backend_pose_sub = rospy.Subscriber(
             self.backend_pose_topic,
             PoseWithCovarianceStamped,
-            self._pose_callback,
+            self._backend_pose_callback,
+            queue_size=10,
+        )
+        self.gicp_pose_sub = rospy.Subscriber(
+            self.gicp_pose_topic,
+            PoseWithCovarianceStamped,
+            self._gicp_pose_callback,
             queue_size=10,
         )
         self.map_sub = rospy.Subscriber(
@@ -117,25 +133,18 @@ class LocalizationAdapterNode:
             self._publish_status,
         )
         rospy.loginfo(
-            "[localization] adapter started: backend_pose=%s pose=%s map=%s",
+            "[localization] fusion started: hector=%s gicp=%s pose=%s map=%s",
             self.backend_pose_topic,
+            self.gicp_pose_topic,
             self.pose_topic,
             self.map_topic,
         )
 
-    def _publish_identity_map_to_odom(self):
-        transform = TransformStamped()
-        transform.header.stamp = rospy.Time.now()
-        transform.header.frame_id = self.map_frame
-        transform.child_frame_id = self.odom_frame
-        transform.transform.rotation.w = 1.0
-        self.static_tf_broadcaster.sendTransform(transform)
-
-    def _pose_callback(self, message):
+    def _backend_pose_callback(self, message):
         if message.header.frame_id != self.map_frame:
             rospy.logwarn_throttle(
                 2.0,
-                "[localization] rejecting pose in frame '%s', expected '%s'",
+                "[localization] rejecting Hector pose in frame '%s', expected '%s'",
                 message.header.frame_id,
                 self.map_frame,
             )
@@ -150,44 +159,65 @@ class LocalizationAdapterNode:
                 1.0, "[localization] rejecting raw pose with invalid quaternion"
             )
             return
-        with self.lock:
-            result = self.pose_filter.update(
-                message.header.stamp.to_sec(),
-                message.pose.pose.position.x,
-                message.pose.pose.position.y,
-                yaw,
-            )
-        if not result.accepted:
-            now = rospy.Time.now()
-            if self.pose_filter.needs_recovery(
-                now.to_sec(), self.config.pose_recovery_timeout_s
-            ):
-                rospy.logwarn(
-                    "[localization] recovering from prolonged rejection, "
-                    "re-anchoring at raw pose (%.2f, %.2f, %.1fdeg)",
-                    message.pose.pose.position.x,
-                    message.pose.pose.position.y,
-                    math.degrees(yaw),
-                )
-                self.pose_filter.recover(
+        now = rospy.Time.now()
+        try:
+            with self.lock:
+                result = self.pose_fusion.update_global(
                     message.header.stamp.to_sec(),
                     message.pose.pose.position.x,
                     message.pose.pose.position.y,
                     yaw,
                 )
-                with self.lock:
-                    result = self.pose_filter.snapshot(True)
-            else:
-                rospy.logerr_throttle(
-                    1.0,
-                    "[localization] rejecting unsafe backend pose: %s "
-                    "(consecutive=%d)",
-                    result.reason,
-                    result.consecutive_rejections,
+                self.last_hector_pose_received = now
+                self.last_fusion_reason = result.reason
+                if result.reason == "HECTOR_POSE_HAS_NO_SYNCHRONIZED_LOCAL_POSE":
+                    self.pending_hector_pose = copy.deepcopy(message)
+                    return
+                self.latest_map_to_odom = result.correction
+                self.last_hector_update_accepted = result.accepted
+                if result.accepted:
+                    self.last_hector_pose_accepted = now
+                    self.hector_consecutive_rejections = 0
+                else:
+                    self.hector_consecutive_rejections += 1
+        except ValueError as exc:
+            rospy.logerr_throttle(1.0, "[localization] invalid Hector pose: %s", str(exc))
+            return
+        if not result.accepted:
+            rospy.logwarn_throttle(
+                1.0,
+                "[localization] rejected Hector map correction: %s (consecutive=%d)",
+                result.reason,
+                result.consecutive_global_rejections,
+            )
+
+    def _gicp_pose_callback(self, message):
+        if message.header.frame_id != self.odom_frame:
+            rospy.logwarn_throttle(
+                2.0,
+                "[localization] rejecting GICP pose in frame '%s', expected '%s'",
+                message.header.frame_id,
+                self.odom_frame,
+            )
+            return
+        orientation = message.pose.pose.orientation
+        try:
+            _, _, yaw = quaternion_to_rpy(
+                (orientation.x, orientation.y, orientation.z, orientation.w)
+            )
+            with self.lock:
+                result = self.pose_fusion.update_local(
+                    message.header.stamp.to_sec(),
+                    message.pose.pose.position.x,
+                    message.pose.pose.position.y,
+                    yaw,
                 )
-                return
+        except ValueError as exc:
+            rospy.logerr_throttle(1.0, "[localization] invalid GICP pose: %s", str(exc))
+            return
 
         pose = copy.deepcopy(message)
+        pose.header.frame_id = self.map_frame
         pose.pose.pose.position.x = result.pose.x
         pose.pose.pose.position.y = result.pose.y
         pose.pose.pose.position.z = 0.0
@@ -196,10 +226,36 @@ class LocalizationAdapterNode:
         pose.pose.pose.orientation.y = qy
         pose.pose.pose.orientation.z = qz
         pose.pose.pose.orientation.w = qw
-        self._ensure_covariance(pose)
+        gicp_healthy = self._gicp_covariance_healthy(message)
+        self._set_output_covariance(pose, gicp_healthy)
         with self.lock:
+            if gicp_healthy:
+                self.gicp_consecutive_failures = 0
+            else:
+                self.gicp_consecutive_failures += 1
             self.latest_pose = pose
+            self.latest_local_pose = Pose2D(
+                message.pose.pose.position.x,
+                message.pose.pose.position.y,
+                yaw,
+            )
+            self.latest_map_to_odom = result.correction
+            self.last_fusion_reason = result.reason
             self.last_pose_received = rospy.Time.now()
+            pending_hector_pose = self.pending_hector_pose
+            if (
+                pending_hector_pose is not None
+                and abs(
+                    pending_hector_pose.header.stamp.to_sec()
+                    - message.header.stamp.to_sec()
+                )
+                <= self.config.fusion_max_pose_pair_age_s
+            ):
+                self.pending_hector_pose = None
+            else:
+                pending_hector_pose = None
+        if pending_hector_pose is not None:
+            self._backend_pose_callback(pending_hector_pose)
 
     def _map_callback(self, message):
         if message.header.frame_id != self.map_frame:
@@ -208,6 +264,18 @@ class LocalizationAdapterNode:
                 "[localization] rejecting map in frame '%s', expected '%s'",
                 message.header.frame_id,
                 self.map_frame,
+            )
+            return
+        with self.lock:
+            map_correction_healthy = (
+                self.pose_fusion.initialized
+                and self.last_hector_update_accepted
+            )
+        if not map_correction_healthy:
+            rospy.logwarn_throttle(
+                1.0,
+                "[localization] freezing public map until a safe Hector "
+                "correction is accepted",
             )
             return
         checksum = self._map_checksum(message)
@@ -300,20 +368,44 @@ class LocalizationAdapterNode:
         with self.lock:
             pose = copy.deepcopy(self.latest_pose)
             vertical = self.vertical_estimator.snapshot()
+            local_pose = self.latest_local_pose
+            correction = self.latest_map_to_odom
         if pose is None:
             return
         self._apply_vertical_state(pose, vertical)
         self.pose_pub.publish(pose)
 
-        transform = TransformStamped()
-        transform.header.stamp = rospy.Time.now()
-        transform.header.frame_id = self.odom_frame
-        transform.child_frame_id = self.base_frame
-        transform.transform.translation.x = pose.pose.pose.position.x
-        transform.transform.translation.y = pose.pose.pose.position.y
-        transform.transform.translation.z = pose.pose.pose.position.z
-        transform.transform.rotation = pose.pose.pose.orientation
-        self.tf_broadcaster.sendTransform(transform)
+        if local_pose is None:
+            return
+        stamp = rospy.Time.now()
+        map_to_odom = TransformStamped()
+        map_to_odom.header.stamp = stamp
+        map_to_odom.header.frame_id = self.map_frame
+        map_to_odom.child_frame_id = self.odom_frame
+        map_to_odom.transform.translation.x = correction.x
+        map_to_odom.transform.translation.y = correction.y
+        _, _, qz, qw = quaternion_from_rpy(0.0, 0.0, correction.yaw)
+        map_to_odom.transform.rotation.z = qz
+        map_to_odom.transform.rotation.w = qw
+
+        odom_to_base = TransformStamped()
+        odom_to_base.header.stamp = stamp
+        odom_to_base.header.frame_id = self.odom_frame
+        odom_to_base.child_frame_id = self.base_frame
+        odom_to_base.transform.translation.x = local_pose.x
+        odom_to_base.transform.translation.y = local_pose.y
+        if self.config.vertical_estimation_enabled and vertical.initialized:
+            odom_to_base.transform.translation.z = vertical.z
+            qx, qy, qz, qw = quaternion_from_rpy(
+                vertical.roll, vertical.pitch, local_pose.yaw
+            )
+        else:
+            qx, qy, qz, qw = quaternion_from_rpy(0.0, 0.0, local_pose.yaw)
+        odom_to_base.transform.rotation.x = qx
+        odom_to_base.transform.rotation.y = qy
+        odom_to_base.transform.rotation.z = qz
+        odom_to_base.transform.rotation.w = qw
+        self.tf_broadcaster.sendTransform([map_to_odom, odom_to_base])
 
     def _publish_status(self, _event=None):
         now = rospy.Time.now()
@@ -325,18 +417,28 @@ class LocalizationAdapterNode:
             map_update_count = self.map_update_count
             last_map_update = self.last_map_update
             vertical = self.vertical_estimator.snapshot()
-            pose_filter = self.pose_filter.snapshot()
+            fusion_initialized = self.pose_fusion.initialized
+            gicp_failures = self.gicp_consecutive_failures
+            hector_rejections = self.hector_consecutive_rejections
+            hector_age = self._age(now, self.last_hector_pose_accepted)
+            fusion_reason = self.last_fusion_reason
 
         pose_fresh = pose_age <= self.config.pose_fresh_timeout_s
         map_fresh = map_age <= self.config.map_fresh_timeout_s
-        ready = pose is not None and pose_fresh and map_fresh
-        pose_filter_healthy = (
-            pose_filter.consecutive_rejections
-            < self.config.pose_rejections_before_lost
+        hector_fresh = hector_age <= self.config.hector_pose_fresh_timeout_s
+        gicp_degraded = (
+            gicp_failures >= self.config.gicp_failures_before_degraded
         )
+        gicp_lost = gicp_failures >= self.config.gicp_failures_before_lost
+        hector_degraded = (
+            hector_rejections >= self.config.hector_rejections_before_degraded
+            or not hector_fresh
+        )
+        ready = pose is not None and pose_fresh and map_fresh and fusion_initialized
         stable = (
             ready
-            and pose_filter_healthy
+            and not gicp_degraded
+            and not hector_degraded
             and map_update_count >= self.config.min_map_updates_for_stable
         )
         vertical_fresh = (
@@ -347,7 +449,7 @@ class LocalizationAdapterNode:
                 <= self.config.vertical_imu_fresh_timeout_s
             )
         )
-        lost = self.ever_ready and (not pose_fresh or not pose_filter_healthy)
+        lost = self.ever_ready and (not pose_fresh or gicp_lost)
         self.ever_ready = self.ever_ready or ready
         reason = self._status_reason(
             pose,
@@ -355,8 +457,10 @@ class LocalizationAdapterNode:
             map_fresh,
             stable,
             vertical_fresh,
-            pose_filter_healthy,
-            pose_filter.reason,
+            gicp_degraded,
+            gicp_lost,
+            hector_degraded,
+            fusion_reason,
         )
         current_floor = (
             vertical.current_floor
@@ -383,7 +487,11 @@ class LocalizationAdapterNode:
         localization = LocalizationStatus()
         localization.header = mapping.header
         localization.tracking_state = self._tracking_state(
-            pose, pose_fresh, map_fresh
+            pose,
+            pose_fresh,
+            map_fresh and fusion_initialized,
+            degraded=gicp_degraded or hector_degraded,
+            lost=gicp_lost,
         )
         covariance_trace = self._covariance_trace(pose)
         localization.pose_covariance_trace = covariance_trace
@@ -416,6 +524,23 @@ class LocalizationAdapterNode:
         covariance[21] = self.config.fallback_unobserved_variance
         covariance[28] = self.config.fallback_unobserved_variance
         covariance[35] = self.config.fallback_yaw_variance
+        pose.pose.covariance = covariance
+
+    def _gicp_covariance_healthy(self, pose):
+        covariance = pose.pose.covariance
+        return all(
+            math.isfinite(covariance[index])
+            and covariance[index] < self.config.gicp_unhealthy_variance_threshold
+            for index in (0, 7, 35)
+        )
+
+    def _set_output_covariance(self, pose, healthy):
+        if healthy:
+            self._ensure_covariance(pose)
+            return
+        covariance = [0.0] * 36
+        for index in (0, 7, 14, 21, 28, 35):
+            covariance[index] = self.config.gicp_unhealthy_variance_threshold
         pose.pose.covariance = covariance
 
     def _apply_vertical_state(self, pose, vertical):
@@ -474,30 +599,36 @@ class LocalizationAdapterNode:
         map_fresh,
         stable,
         vertical_fresh=True,
-        pose_filter_healthy=True,
-        pose_filter_reason="",
+        gicp_degraded=False,
+        gicp_lost=False,
+        hector_degraded=False,
+        fusion_reason="",
     ):
         if pose is None:
             return "WAITING_FOR_SCAN_MATCHING_POSE"
         if not pose_fresh:
             return "SCAN_MATCHING_POSE_STALE"
-        if not pose_filter_healthy:
-            return "SCAN_MATCHING_REJECTED:" + pose_filter_reason
+        if gicp_lost:
+            return "GICP_ODOMETRY_LOST:" + fusion_reason
+        if gicp_degraded:
+            return "GICP_ODOMETRY_DEGRADED_HOLDING_LAST_POSE"
+        if hector_degraded:
+            return "HECTOR_CORRECTION_DEGRADED:" + fusion_reason
         if not map_fresh:
             return "MAP_STALE"
         if not stable:
             return "WAITING_FOR_STABLE_MAP"
         if not vertical_fresh:
             return "VERTICAL_IMU_STALE"
-        return "TRACKING_FILTERED_2D_POSE_FIXED_COVARIANCE_NO_LOOP_CLOSURE"
+        return "TRACKING_FUSED_GICP_ODOMETRY_WITH_BOUNDED_HECTOR_CORRECTION"
 
     @staticmethod
-    def _tracking_state(pose, pose_fresh, map_fresh):
+    def _tracking_state(pose, pose_fresh, map_fresh, degraded=False, lost=False):
         if pose is None:
             return LocalizationStatus.STATE_INITIALIZING
-        if not pose_fresh:
+        if not pose_fresh or lost:
             return LocalizationStatus.STATE_LOST
-        if not map_fresh:
+        if not map_fresh or degraded:
             return LocalizationStatus.STATE_DEGRADED
         return LocalizationStatus.STATE_TRACKING
 

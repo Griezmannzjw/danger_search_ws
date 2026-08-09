@@ -81,6 +81,35 @@ class TestLocalizationAdapter(unittest.TestCase):
             LocalizationStatus.STATE_DEGRADED,
         )
         self.assertEqual(
+            self.adapter._tracking_state(
+                pose, True, True, degraded=True
+            ),
+            LocalizationStatus.STATE_DEGRADED,
+        )
+        self.assertEqual(
+            self.adapter._tracking_state(pose, True, True, lost=True),
+            LocalizationStatus.STATE_LOST,
+        )
+
+    def test_high_gicp_covariance_is_unhealthy(self):
+        pose = PoseWithCovarianceStamped()
+        pose.pose.covariance[0] = 0.01
+        pose.pose.covariance[7] = 0.01
+        pose.pose.covariance[35] = 0.02
+        self.assertTrue(self.adapter._gicp_covariance_healthy(pose))
+
+        pose.pose.covariance[0] = 10.0
+        self.assertFalse(self.adapter._gicp_covariance_healthy(pose))
+
+    def test_unhealthy_gicp_pose_gets_large_public_covariance(self):
+        pose = PoseWithCovarianceStamped()
+        self.adapter._set_output_covariance(pose, healthy=False)
+        for index in (0, 7, 14, 21, 28, 35):
+            self.assertEqual(
+                pose.pose.covariance[index],
+                self.adapter.config.gicp_unhealthy_variance_threshold,
+            )
+        self.assertEqual(
             self.adapter._tracking_state(pose, True, True),
             LocalizationStatus.STATE_TRACKING,
         )

@@ -39,10 +39,11 @@ class ScanProjectionConfig:
     ground_candidate_max_range: float = 3.00
     min_ground_candidate_points: int = 30
     min_ground_clearance_m: float = 0.18
-    scan_accumulation_frames: int = 5
-    scan_accumulation_min_samples_per_bin: int = 2
-    min_valid_scan_bins: int = 8
-    min_angular_coverage_rad: float = 0.05
+    scan_accumulation_frames: int = 1
+    scan_accumulation_min_samples_per_bin: int = 1
+    min_valid_scan_bins: int = 40
+    min_angular_coverage_rad: float = 0.35
+    drop_unstable_scans: bool = True
 
     def __post_init__(self):
         _require(self.angle_min < self.angle_max, "scan angle range is invalid")
@@ -139,6 +140,22 @@ class AdapterConfig:
     pose_gate_max_dt_s: float = 0.50
     pose_rejections_before_lost: int = 3
     pose_recovery_timeout_s: float = 3.0
+    fusion_local_history_size: int = 30
+    fusion_max_pose_pair_age_s: float = 0.20
+    fusion_initial_correction_translation_m: float = 0.30
+    fusion_initial_correction_yaw_rad: float = 0.35
+    fusion_max_correction_translation_m: float = 0.30
+    fusion_max_correction_yaw_rad: float = 0.25
+    fusion_correction_time_constant_s: float = 0.75
+    fusion_stationary_translation_m: float = 0.025
+    fusion_stationary_yaw_rad: float = 0.020
+    fusion_stationary_correction_deadband_m: float = 0.025
+    fusion_stationary_correction_deadband_yaw_rad: float = 0.020
+    gicp_unhealthy_variance_threshold: float = 1.0
+    gicp_failures_before_degraded: int = 3
+    gicp_failures_before_lost: int = 20
+    hector_rejections_before_degraded: int = 3
+    hector_pose_fresh_timeout_s: float = 2.0
     vertical_estimation_enabled: bool = False
     imu_topic: str = "/livox/imu"
     vertical_imu_fresh_timeout_s: float = 0.20
@@ -182,6 +199,49 @@ class AdapterConfig:
         _require(self.pose_gate_max_dt_s > 0.0, "pose gate dt must be positive")
         _require(self.pose_rejections_before_lost >= 1, "pose rejection limit must be positive")
         _require(self.pose_recovery_timeout_s > 0.0, "pose recovery timeout must be positive")
+        _require(self.fusion_local_history_size >= 2, "fusion history must contain at least two poses")
+        _require(self.fusion_max_pose_pair_age_s > 0.0, "fusion pose pair timeout must be positive")
+        _require(
+            self.fusion_initial_correction_translation_m > 0.0
+            and self.fusion_initial_correction_yaw_rad > 0.0,
+            "initial fusion correction limits must be positive",
+        )
+        _require(
+            self.fusion_max_correction_translation_m > 0.0
+            and self.fusion_max_correction_yaw_rad > 0.0,
+            "fusion correction limits must be positive",
+        )
+        _require(
+            self.fusion_correction_time_constant_s > 0.0,
+            "fusion correction time constant must be positive",
+        )
+        _require(
+            self.fusion_stationary_translation_m >= 0.0
+            and self.fusion_stationary_yaw_rad >= 0.0,
+            "fusion stationary thresholds cannot be negative",
+        )
+        _require(
+            self.fusion_stationary_correction_deadband_m >= 0.0
+            and self.fusion_stationary_correction_deadband_yaw_rad >= 0.0,
+            "fusion stationary correction deadbands cannot be negative",
+        )
+        _require(
+            self.gicp_unhealthy_variance_threshold > 0.0,
+            "GICP unhealthy variance threshold must be positive",
+        )
+        _require(
+            1 <= self.gicp_failures_before_degraded
+            < self.gicp_failures_before_lost,
+            "GICP failure thresholds are invalid",
+        )
+        _require(
+            self.hector_rejections_before_degraded >= 1,
+            "Hector rejection threshold must be positive",
+        )
+        _require(
+            self.hector_pose_fresh_timeout_s > 0.0,
+            "Hector pose timeout must be positive",
+        )
         _require(bool(self.imu_topic), "imu_topic cannot be empty")
         _require(
             self.vertical_imu_fresh_timeout_s > 0.0,

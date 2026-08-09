@@ -24,7 +24,7 @@ class LidarOdometryNode {
     private_nh_.param<std::string>("raw_scan_topic", input_topic_, "/scan");
     private_nh_.param<std::string>("gicp_pose_topic", output_topic_,
                                    "/localization/raw_pose");
-    private_nh_.param<std::string>("map_frame", map_frame_, "map");
+    private_nh_.param<std::string>("odom_frame", odom_frame_, "odom");
     private_nh_.param<std::string>("base_frame", base_frame_, "base");
     private_nh_.param("lidar_odom_voxel_size_m", voxel_size_, 0.15);
     private_nh_.param("lidar_odom_min_range_m", min_range_, 0.40);
@@ -34,10 +34,20 @@ class LidarOdometryNode {
     private_nh_.param("lidar_odom_max_fitness", max_fitness_, 0.20);
     private_nh_.param("lidar_odom_max_step_translation_m", max_step_translation_, 0.35);
     private_nh_.param("lidar_odom_max_step_rotation_rad", max_step_rotation_, 0.45);
+    private_nh_.param("lidar_odom_max_linear_speed_mps", max_linear_speed_, 1.0);
+    private_nh_.param("lidar_odom_max_angular_speed_rps", max_angular_speed_, 2.0);
+    private_nh_.param("lidar_odom_translation_margin_m", translation_margin_, 0.05);
+    private_nh_.param("lidar_odom_rotation_margin_rad", rotation_margin_, 0.08);
+    private_nh_.param("lidar_odom_translation_deadband_m", translation_deadband_, 0.015);
+    private_nh_.param("lidar_odom_rotation_deadband_rad", rotation_deadband_, 0.008);
     private_nh_.param("lidar_odom_min_points", min_points_, 300);
     if (voxel_size_ <= 0.0 || min_range_ < 0.0 || max_range_ <= min_range_ ||
         max_correspondence_ <= 0.0 || max_iterations_ < 1 || max_fitness_ <= 0.0 ||
-        max_step_translation_ <= 0.0 || max_step_rotation_ <= 0.0 || min_points_ < 50) {
+        max_step_translation_ <= 0.0 || max_step_rotation_ <= 0.0 ||
+        max_linear_speed_ <= 0.0 || max_angular_speed_ <= 0.0 ||
+        translation_margin_ < 0.0 || rotation_margin_ < 0.0 ||
+        translation_deadband_ < 0.0 || rotation_deadband_ < 0.0 ||
+        min_points_ < 50) {
       throw std::invalid_argument("invalid lidar odometry configuration");
     }
     publisher_ = private_nh_.advertise<geometry_msgs::PoseWithCovarianceStamped>(
@@ -138,11 +148,18 @@ class LidarOdometryNode {
     const double fitness = registration.hasConverged()
                                ? registration.getFitnessScore(max_correspondence_)
                                : std::numeric_limits<double>::infinity();
+    const double dynamic_translation_limit =
+        std::min(max_step_translation_, translation_margin_ + max_linear_speed_ * dt);
+    const double dynamic_rotation_limit =
+        std::min(max_step_rotation_, rotation_margin_ + max_angular_speed_ * dt);
     const bool accepted = registration.hasConverged() && std::isfinite(fitness) &&
                           fitness <= max_fitness_ &&
-                          translation <= max_step_translation_ &&
-                          angle <= max_step_rotation_;
+                          translation <= dynamic_translation_limit &&
+                          angle <= dynamic_rotation_limit;
     if (accepted) {
+      if (translation <= translation_deadband_ && angle <= rotation_deadband_) {
+        delta.setIdentity();
+      }
       world_from_base_ = world_from_base_ * delta;
       last_delta_ = delta;
       previous_ = current;
@@ -153,20 +170,26 @@ class LidarOdometryNode {
       ++consecutive_failures_;
       ROS_ERROR_THROTTLE(1.0,
                          "[localization] GICP rejected: converged=%d fitness=%.3f "
-                         "translation=%.3f rotation=%.3f failures=%d; rebaselining",
-                         registration.hasConverged(), fitness, translation, angle,
+                         "translation=%.3f/%.3f rotation=%.3f/%.3f failures=%d; "
+                         "holding pose and rebaselining",
+                         registration.hasConverged(), fitness, translation,
+                         dynamic_translation_limit, angle, dynamic_rotation_limit,
                          consecutive_failures_);
       // Do not compare later scans with a stale reference after a rejection.
       previous_ = current;
       last_stamp_ = message->header.stamp;
       last_delta_.setIdentity();
+      // A fresh held pose prevents one bad sparse Livox frame from causing a
+      // timeout.  Large covariance tells the fusion/status layer to degrade
+      // after repeated failures instead of treating the hold as real motion.
+      PublishPose(message->header.stamp, fitness, false);
     }
   }
 
   void PublishPose(const ros::Time& stamp, double fitness, bool healthy) {
     geometry_msgs::PoseWithCovarianceStamped message;
     message.header.stamp = stamp;
-    message.header.frame_id = map_frame_;
+    message.header.frame_id = odom_frame_;
     const Eigen::Vector3d translation = world_from_base_.translation();
     Eigen::Quaterniond rotation(world_from_base_.rotation());
     rotation.normalize();
@@ -193,9 +216,11 @@ class LidarOdometryNode {
   ros::Subscriber subscriber_;
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
-  std::string input_topic_, output_topic_, map_frame_, base_frame_;
+  std::string input_topic_, output_topic_, odom_frame_, base_frame_;
   double voxel_size_, min_range_, max_range_, max_correspondence_, max_fitness_;
   double max_step_translation_, max_step_rotation_;
+  double max_linear_speed_, max_angular_speed_, translation_margin_, rotation_margin_;
+  double translation_deadband_, rotation_deadband_;
   int max_iterations_, min_points_, consecutive_failures_ = 0;
   Cloud::Ptr previous_;
   ros::Time last_stamp_;

@@ -33,6 +33,7 @@ class ScanProjectorNode:
         self.imu_lock = threading.RLock()
         self.imu_samples = deque(maxlen=500)
         self.range_history = deque(maxlen=self.config.scan_accumulation_frames)
+        self.last_published_stamp_s = None
 
         self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
@@ -153,11 +154,13 @@ class ScanProjectorNode:
                         rospy.logwarn_throttle(
                             1.0,
                             "[localization] unstable scan: roll=%.1fdeg "
-                            "pitch=%.1fdeg gyro=%.2frad/s -- publishing anyway",
+                            "pitch=%.1fdeg gyro=%.2frad/s",
                             math.degrees(roll),
                             math.degrees(pitch),
                             angular_speed,
                         )
+                        if self.config.drop_unstable_scans:
+                            return
                     if self.config.enable_ground_clearance_gate:
                         clearance = estimate_ground_clearance(points_base, self.config)
                         if (
@@ -167,9 +170,11 @@ class ScanProjectorNode:
                             rospy.logwarn_throttle(
                                 1.0,
                                 "[localization] low ground clearance=%.3fm "
-                                "-- publishing anyway",
+                                "-- rejecting scan",
                                 clearance,
                             )
+                            if self.config.drop_unstable_scans:
+                                return
         frame_ranges = project_planar_scan(points_base, self.config)
         self.range_history.append(frame_ranges)
         ranges = merge_scan_history(
@@ -203,12 +208,19 @@ class ScanProjectorNode:
         output.angle_min = self.config.angle_min
         output.angle_max = self.config.angle_max
         output.angle_increment = self.config.angle_increment
-        output.scan_time = 0.1 * len(self.range_history)
+        stamp_s = message.header.stamp.to_sec()
+        if self.last_published_stamp_s is None:
+            output.scan_time = 0.1
+        else:
+            output.scan_time = max(
+                1e-3, min(1.0, stamp_s - self.last_published_stamp_s)
+            )
         output.time_increment = 0.0
         output.range_min = self.config.range_min
         output.range_max = self.config.range_max
         output.ranges = ranges.tolist()
         self.publisher.publish(output)
+        self.last_published_stamp_s = stamp_s
 
     def _closest_imu(self, stamp_s):
         with self.imu_lock:
