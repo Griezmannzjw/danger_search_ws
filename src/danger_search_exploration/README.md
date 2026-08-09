@@ -1,6 +1,6 @@
 # danger_search_exploration
 
-单楼层 S0/P0 探索规划模块。当前目标是跑通合法选点、路径校验、导航执行、失败处理和任务停止链路；这不是最终比赛探索算法。
+单楼层 S0/P0 探索规划模块。当前目标是跑通合法选点、路径校验、导航执行、有限恢复、稳定完成判定和任务停止链路；这不是最终比赛探索算法。
 
 ## S0 当前算法
 
@@ -12,7 +12,7 @@ S0 按 `SimEnv/AGENTS.md` 采用 **最近可达简单前沿（nearest reachable 
 4. 按机器人到候选的欧氏距离由近到远排序，并调用 `/move_base/make_plan` 逐个验证。
 5. 将首个返回非空路径的候选作为 `MoveBaseGoal` 发送给 navigation。
 
-该算法是确定性的 S0 基线，用于完成至少一次地图驱动移动并跑通任务与评分链路。它不是最终比赛算法：S0 不要求信息增益、地图版本、自动收敛或完整恢复；S1 再加入可靠前沿收敛、目标冷却/黑名单、定位修正重验证和单楼层自动结束。当前代码中的有限失败冷却仅作为防止同一目标立即死循环的保护，不代表 S1 已完成。
+该算法是确定性的 P0 基线。按团队追加验收要求，本包在简单前沿上实现了保守自动完成：输入新鲜且健康、无活动导航目标、地图超过稳定窗口且连续多轮无可达前沿时，才发布一次完成事件。它仍不包含 WFD、信息增益和定位修正版本等完整 P1 能力。
 
 ## 职责与边界
 
@@ -47,6 +47,13 @@ exploration --MoveBaseGoal--> navigation
 | `/localization/pose` | `geometry_msgs/PoseWithCovarianceStamped` |
 | `/mapping/status` | `danger_search_common/MappingStatus` |
 | `/navigation/health` | `danger_search_common/NavigationHealth` |
+
+发布：
+
+| 默认名称 | 类型 | 语义 |
+|---|---|---|
+| `/exploration/status` | `std_msgs/String`（JSON） | `state/reason/remaining_frontier_count/known_grid_ratio/map_revision/has_active_goal` |
+| `/exploration/complete` | `std_msgs/Bool`（latched） | 每个会话开始发布 `false`，满足收敛条件后只发布一次 `true` |
 
 调用：
 
@@ -85,5 +92,7 @@ roslaunch danger_search_exploration exploration.launch
 3. 候选来自有效前沿簇，必须在地图范围内且栅格值为 `0`，并通过非空 `make_plan` 校验。
 4. 成功后继续选择新目标；失败、取消和超时不会无限重试同一位置。
 5. stop 取消全部目标，旧 Action 回调不能重新激活已停止的会话，重复 stop 返回可预测成功。
+6. 输入过期、地图未初始化、导航服务不可用和定位丢失分别进入明确的 WAITING/FAILED 原因，不计入无可达前沿轮次。
+7. `known_grid_ratio` 仅在已观测栅格的最小包围盒内统计，不把固定地图消息的全部未知边界当成真实可通行总面积。
 
 后续 S1 才实现可靠前沿聚类、目标持久化、自动收敛和更完整恢复；S2 以后再实现房间可见性、多楼层与门梯能力。

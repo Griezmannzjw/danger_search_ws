@@ -21,6 +21,7 @@ P0要求：
 import rospy
 import actionlib
 import math
+import json
 import threading
 from collections import deque
 import numpy as np
@@ -28,6 +29,7 @@ from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from std_srvs.srv import Trigger, TriggerResponse
+from std_msgs.msg import Bool, String
 from nav_msgs.srv import GetPlan
 from danger_search_common.msg import MappingStatus, NavigationHealth
 
@@ -47,6 +49,8 @@ class ExplorationPlanner:
         self.make_plan_service = rospy.get_param("~make_plan_service", "/move_base/make_plan")
         self.start_service = rospy.get_param("~start_service", "/danger_search/start_exploration")
         self.stop_service = rospy.get_param("~stop_service", "/danger_search/stop_exploration")
+        self.status_topic = rospy.get_param("~status_topic", "/exploration/status")
+        self.complete_topic = rospy.get_param("~complete_topic", "/exploration/complete")
 
         # 探索参数
         self.goal_interval = rospy.get_param("~goal_interval", 2.0)
@@ -58,6 +62,10 @@ class ExplorationPlanner:
         self.failed_goal_cooldown = rospy.get_param("~failed_goal_cooldown", 30.0)
         self.failed_goal_radius = rospy.get_param("~failed_goal_radius", 0.75)
         self.dependency_check_timeout = rospy.get_param("~dependency_check_timeout", 0.1)
+        self.input_timeout = rospy.get_param("~input_timeout", 3.0)
+        self.no_frontier_cycles_required = rospy.get_param("~no_frontier_cycles_required", 5)
+        self.map_stable_time = rospy.get_param("~map_stable_time", 8.0)
+        self.map_change_cell_threshold = rospy.get_param("~map_change_cell_threshold", 5)
 
         # ========== 状态 ==========
         self.exploring = False
@@ -69,6 +77,18 @@ class ExplorationPlanner:
         self.mapping_stable = False
         self.mapping_lost = True
         self.nav_ready = False
+        self.nav_has_active_goal = False
+        self.last_pose_time = rospy.Time(0)
+        self.last_map_time = rospy.Time(0)
+        self.last_mapping_status_time = rospy.Time(0)
+        self.last_nav_health_time = rospy.Time(0)
+        self.last_significant_map_change = rospy.Time(0)
+        self.map_revision = 0
+        self.no_reachable_frontier_cycles = 0
+        self.remaining_frontier_count = 0
+        self.exploration_state = "STOPPED"
+        self.state_reason = "not_started"
+        self.complete_published = False
         self.waiting_for_result = False
         self.retry_count = 0
         self.last_goal_time = rospy.Time(0)
@@ -107,6 +127,8 @@ class ExplorationPlanner:
         self.stop_srv = rospy.Service(
             self.stop_service, Trigger, self.stop_exploration_cb
         )
+        self.status_pub = rospy.Publisher(self.status_topic, String, queue_size=10, latch=True)
+        self.complete_pub = rospy.Publisher(self.complete_topic, Bool, queue_size=1, latch=True)
 
         # ========== 主循环 ==========
         self.planner_timer = rospy.Timer(rospy.Duration(0.5), self.planner_loop)
@@ -126,6 +148,7 @@ class ExplorationPlanner:
             rospy.logwarn_throttle(5, "[exploration] Ignoring pose with invalid orientation")
             return
         self.current_pose = msg.pose.pose
+        self.last_pose_time = rospy.Time.now()
 
     def map_callback(self, msg):
         expected_size = msg.info.width * msg.info.height
@@ -133,19 +156,83 @@ class ExplorationPlanner:
                 or expected_size == 0 or len(msg.data) != expected_size):
             rospy.logwarn_throttle(5, "[exploration] Ignoring invalid occupancy grid")
             return
-        self.current_map = msg
-        self.map_info = msg.info
-        self.map_data = np.array(msg.data, dtype=np.int8).reshape(
+        new_data = np.array(msg.data, dtype=np.int8).reshape(
             (msg.info.height, msg.info.width)
         )
+        significant = (self.map_data is None or self.map_data.shape != new_data.shape
+                       or np.count_nonzero(self.map_data != new_data)
+                       >= self.map_change_cell_threshold)
+        self.current_map = msg
+        self.map_info = msg.info
+        self.map_data = new_data
+        now = rospy.Time.now()
+        self.last_map_time = now
+        if significant:
+            self.map_revision += 1
+            self.last_significant_map_change = now
+            self.no_reachable_frontier_cycles = 0
+            self.failed_goals = []
 
     def mapping_status_callback(self, msg):
         self.mapping_ready = msg.ready
         self.mapping_stable = msg.stable
         self.mapping_lost = msg.lost
+        self.last_mapping_status_time = rospy.Time.now()
 
     def nav_health_callback(self, msg):
         self.nav_ready = msg.ready
+        self.nav_has_active_goal = msg.has_active_goal
+        self.last_nav_health_time = rospy.Time.now()
+
+    def _set_state(self, state, reason):
+        self.exploration_state = state
+        self.state_reason = reason
+        self._publish_status()
+
+    def _known_grid_ratio(self):
+        """Known-cell ratio inside the observed bounding box, not fixed map bounds."""
+        if self.map_data is None:
+            return None
+        known = self.map_data != -1
+        cells = np.argwhere(known)
+        if not len(cells):
+            return 0.0
+        y0, x0 = cells.min(axis=0)
+        y1, x1 = cells.max(axis=0)
+        observed_box = known[y0:y1 + 1, x0:x1 + 1]
+        return float(np.count_nonzero(observed_box)) / float(observed_box.size)
+
+    def _publish_status(self):
+        coverage = self._known_grid_ratio()
+        payload = {
+            "state": self.exploration_state,
+            "reason": self.state_reason,
+            "complete": self.complete_published,
+            "remaining_frontier_count": self.remaining_frontier_count,
+            "known_grid_ratio": coverage,
+            "known_grid_ratio_scope": "observed_known_bounding_box",
+            "map_revision": self.map_revision,
+            "has_active_goal": bool(self.waiting_for_result or self.nav_has_active_goal),
+        }
+        self.status_pub.publish(String(data=json.dumps(payload, sort_keys=True)))
+
+    def _inputs_health(self, now):
+        if self.current_map is None:
+            return False, "map_uninitialized"
+        if self.current_pose is None:
+            return False, "pose_uninitialized"
+        stamps = (self.last_map_time, self.last_pose_time,
+                  self.last_mapping_status_time, self.last_nav_health_time)
+        if any(stamp == rospy.Time(0) or (now - stamp).to_sec() > self.input_timeout
+               for stamp in stamps):
+            return False, "input_stale"
+        if self.mapping_lost:
+            return False, "localization_lost"
+        if not self.mapping_ready or not self.mapping_stable:
+            return False, "mapping_not_ready"
+        if not self.nav_ready:
+            return False, "navigation_not_ready"
+        return True, "healthy"
 
     def _world_to_map(self, x, y):
         origin = self.map_info.origin
@@ -204,10 +291,10 @@ class ExplorationPlanner:
             goal.pose.orientation.w = 1.0
 
             resp = self.make_plan_client(start, goal, self.plan_tolerance)
-            return len(resp.plan.poses) > 0
+            return "reachable" if len(resp.plan.poses) > 0 else "unreachable"
         except (rospy.ROSException, rospy.ServiceException) as e:
             rospy.logwarn_throttle(5, f"[exploration] make_plan failed: {e}")
-            return False
+            return "unavailable"
 
     def _goal_is_cooled_down(self, goal_x, goal_y):
         now = rospy.Time.now()
@@ -282,23 +369,29 @@ class ExplorationPlanner:
         return representatives
 
     def _select_goal(self):
-        """按欧氏距离检查前沿，返回最近的可达目标。"""
+        """Return (goal, reason); dependency failure is not no-frontier."""
         if self.current_pose is None or self.map_data is None:
-            return None
+            return None, "input_missing"
 
         cx = self.current_pose.position.x
         cy = self.current_pose.position.y
-        candidates = [self._map_to_world(mx, my)
-                      for mx, my in self._frontier_representatives()]
+        representatives = self._frontier_representatives()
+        self.remaining_frontier_count = len(representatives)
+        candidates = [self._map_to_world(mx, my) for mx, my in representatives]
         candidates.sort(key=lambda goal: math.hypot(goal[0] - cx, goal[1] - cy))
 
         for gx, gy in candidates[:self.max_frontier_candidates]:
             if self._goal_is_cooled_down(gx, gy):
                 continue
-            if self._check_path(cx, cy, gx, gy):
-                return (gx, gy)
+            path_state = self._check_path(cx, cy, gx, gy)
+            if path_state == "reachable":
+                return (gx, gy), "reachable_frontier"
+            if path_state == "unavailable":
+                return None, "navigation_service_unavailable"
 
-        return None
+        if not candidates:
+            return None, "no_frontier"
+        return None, "all_frontiers_unreachable_or_blacklisted"
 
     def _send_goal(self, gx, gy):
         """发送导航目标"""
@@ -355,6 +448,10 @@ class ExplorationPlanner:
             self.waiting_for_result = False
             self.current_goal = None
             self.retry_count = 0
+            self.no_reachable_frontier_cycles = 0
+            self.complete_published = False
+            self.complete_pub.publish(Bool(data=False))
+            self._set_state("WAITING", "waiting_for_inputs")
             return TriggerResponse(success=True, message="Exploration started; waiting for inputs")
 
     def stop_exploration_cb(self, req):
@@ -368,26 +465,26 @@ class ExplorationPlanner:
             self.waiting_for_result = False
             self.current_goal = None
             self.move_base_client.cancel_all_goals()
+            self._set_state("STOPPED", "stop_requested")
             return TriggerResponse(success=True, message="Exploration stopped")
 
     def planner_loop(self, event):
         """主规划循环"""
         if not self.exploring:
             return
-
-        # 检查所有必要条件
-        if not self.mapping_ready or not self.mapping_stable or self.mapping_lost:
-            rospy.loginfo_throttle(5, "[exploration] Waiting for mapping to be ready...")
+        if self.complete_published:
             return
 
-        if not self.nav_ready:
-            rospy.loginfo_throttle(5, "[exploration] Waiting for navigation to be ready...")
-            return
-
-        if self.current_pose is None or self.map_data is None:
+        now = rospy.Time.now()
+        healthy, reason = self._inputs_health(now)
+        if not healthy:
+            self.no_reachable_frontier_cycles = 0
+            state = "FAILED" if reason == "localization_lost" else "WAITING"
+            self._set_state(state, reason)
             return
 
         if self.waiting_for_result:
+            self._set_state("NAVIGATING", "active_goal")
             # 检查目标是否超时
             elapsed = (rospy.Time.now() - self.last_goal_time).to_sec()
             if elapsed > self.goal_timeout:
@@ -398,6 +495,7 @@ class ExplorationPlanner:
                 self.waiting_for_result = False
                 self.current_goal = None
                 self.retry_count += 1
+                self._set_state("RECOVERING", "goal_timeout")
             return
 
         # 达到连续失败上限后退避，再尝试其他候选，避免永久停摆。
@@ -414,13 +512,31 @@ class ExplorationPlanner:
             return
 
         # 选择目标
-        goal = self._select_goal()
+        goal, selection_reason = self._select_goal()
         if goal is not None:
+            self.no_reachable_frontier_cycles = 0
             if not self._send_goal(*goal):
                 self.retry_count += 1
+                self._set_state("WAITING", "move_base_unavailable")
+            else:
+                self._set_state("NAVIGATING", "goal_sent")
         else:
-            rospy.loginfo_throttle(5, "[exploration] No valid goal found, retrying...")
-            self.retry_count += 1
+            if selection_reason == "navigation_service_unavailable":
+                self.no_reachable_frontier_cycles = 0
+                self._set_state("WAITING", selection_reason)
+                return
+            self.no_reachable_frontier_cycles += 1
+            map_stable = (now - self.last_significant_map_change).to_sec() >= self.map_stable_time
+            no_active_goal = not self.waiting_for_result and not self.nav_has_active_goal
+            if (self.no_reachable_frontier_cycles >= self.no_frontier_cycles_required
+                    and map_stable and no_active_goal):
+                if not self.complete_published:
+                    self.complete_published = True
+                    self.complete_pub.publish(Bool(data=True))
+                    rospy.loginfo("[exploration] Exploration converged")
+                self._set_state("COMPLETE", selection_reason)
+            else:
+                self._set_state("WAITING", selection_reason)
 
     def run(self):
         rospy.spin()

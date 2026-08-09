@@ -13,6 +13,8 @@ move_base_action_name: /move_base
 make_plan_service: /move_base/make_plan
 start_service: /danger_search/start_exploration
 stop_service: /danger_search/stop_exploration
+status_topic: /exploration/status
+complete_topic: /exploration/complete
 
 # 探索参数
 goal_interval: 2.0
@@ -24,3 +26,7 @@ plan_tolerance: 0.5
 failed_goal_cooldown: 30.0
 failed_goal_radius: 0.75
 dependency_check_timeout: 0.1
+input_timeout: 3.0
+no_frontier_cycles_required: 5
+map_stable_time: 8.0
+map_change_cell_threshold: 5

@@ -73,6 +73,34 @@ class SimpleFrontierTest(unittest.TestCase):
         self.assertAlmostEqual(world_y, 1.5)
         self.assertEqual(planner._world_to_map(world_x, world_y), (1, 0))
 
+    def test_known_ratio_uses_observed_bounding_box(self):
+        planner = make_planner([
+            [-1, -1, -1, -1, -1],
+            [-1, 0, 0, -1, -1],
+            [-1, 0, -1, -1, -1],
+            [-1, -1, -1, -1, -1],
+        ])
+        self.assertAlmostEqual(planner._known_grid_ratio(), 0.75)
+
+    def test_select_goal_distinguishes_service_unavailable(self):
+        planner = make_planner([
+            [100, 100, 100, 100, 100],
+            [100, 0, 0, -1, -1],
+            [100, 0, 0, -1, -1],
+            [100, 100, 100, 100, 100],
+        ])
+        planner.current_pose = SimpleNamespace(position=SimpleNamespace(x=1.5, y=1.5))
+        planner.max_frontier_candidates = 20
+        planner.failed_goals = []
+        planner.failed_goal_cooldown = 30.0
+        planner.failed_goal_radius = 0.75
+        planner._goal_is_cooled_down = lambda x, y: False
+        planner._check_path = lambda *args: "unavailable"
+        goal, reason = planner._select_goal()
+        self.assertIsNone(goal)
+        self.assertEqual(reason, "navigation_service_unavailable")
+        self.assertEqual(planner.remaining_frontier_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
