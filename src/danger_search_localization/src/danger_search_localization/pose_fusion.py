@@ -86,6 +86,11 @@ class HectorGicpFusion:
 
     def update_global(self, stamp_s, x, y, yaw):
         global_pose = self._sample(stamp_s, x, y, yaw)
+        if (
+            self.last_global_stamp_s is not None
+            and global_pose[0] <= self.last_global_stamp_s
+        ):
+            return self._reject("NON_INCREASING_HECTOR_POSE_STAMP")
         local_sample = self._nearest_local(global_pose[0])
         if local_sample is None:
             # ROS callback ordering is not deterministic.  This is a timing

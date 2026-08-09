@@ -124,11 +124,21 @@ class LidarOdometryNode {
       return;
     }
     const double dt = (message->header.stamp - last_stamp_).toSec();
-    if (dt <= 0.0 || dt > 0.5) {
+    if (dt <= 0.0) {
       ROS_WARN_THROTTLE(1.0, "[localization] invalid lidar scan interval %.3f", dt);
+      return;
+    }
+    if (dt > 0.5) {
+      ROS_WARN_THROTTLE(
+          1.0,
+          "[localization] trusted lidar reference is %.3fs old; "
+          "rebaselining without changing pose",
+          dt);
       previous_ = current;
       last_stamp_ = message->header.stamp;
       last_delta_.setIdentity();
+      PublishPose(message->header.stamp,
+                  std::numeric_limits<double>::infinity(), false);
       return;
     }
 
@@ -157,10 +167,18 @@ class LidarOdometryNode {
                           translation <= dynamic_translation_limit &&
                           angle <= dynamic_rotation_limit;
     if (accepted) {
-      if (translation <= translation_deadband_ && angle <= rotation_deadband_) {
-        delta.setIdentity();
+      // Accumulate sub-threshold motion instead of discarding it frame by
+      // frame.  Stationary jitter tends to cancel, while sustained low-speed
+      // motion eventually crosses the deadband and is committed.
+      pending_delta_ = pending_delta_ * delta;
+      const double pending_translation = pending_delta_.translation().norm();
+      const double pending_angle =
+          std::abs(Eigen::AngleAxisd(pending_delta_.rotation()).angle());
+      if (pending_translation > translation_deadband_ ||
+          pending_angle > rotation_deadband_) {
+        world_from_base_ = world_from_base_ * pending_delta_;
+        pending_delta_.setIdentity();
       }
-      world_from_base_ = world_from_base_ * delta;
       last_delta_ = delta;
       previous_ = current;
       last_stamp_ = message->header.stamp;
@@ -171,13 +189,13 @@ class LidarOdometryNode {
       ROS_ERROR_THROTTLE(1.0,
                          "[localization] GICP rejected: converged=%d fitness=%.3f "
                          "translation=%.3f/%.3f rotation=%.3f/%.3f failures=%d; "
-                         "holding pose and rebaselining",
+                         "holding pose and retaining trusted reference",
                          registration.hasConverged(), fitness, translation,
                          dynamic_translation_limit, angle, dynamic_rotation_limit,
                          consecutive_failures_);
-      // Do not compare later scans with a stale reference after a rejection.
-      previous_ = current;
-      last_stamp_ = message->header.stamp;
+      // Keep the last trusted keyframe so a single sparse Livox frame cannot
+      // permanently erase the displacement during the rejected interval.
+      // The elapsed-time gate above rebaselines if recovery takes too long.
       last_delta_.setIdentity();
       // A fresh held pose prevents one bad sparse Livox frame from causing a
       // timeout.  Large covariance tells the fusion/status layer to degrade
@@ -226,6 +244,7 @@ class LidarOdometryNode {
   ros::Time last_stamp_;
   Eigen::Isometry3d world_from_base_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d last_delta_ = Eigen::Isometry3d::Identity();
+  Eigen::Isometry3d pending_delta_ = Eigen::Isometry3d::Identity();
 };
 
 }  // namespace danger_search_localization

@@ -1,10 +1,61 @@
 """Convert the official local Livox PointCloud into a planar LaserScan."""
 
+from collections import deque
 import math
 
 import numpy as np
 
 from .vertical_estimation import quaternion_to_rpy
+
+
+class TimedScanAccumulator:
+    """Bound sparse scan history by frame count and monotonic sensor time."""
+
+    def __init__(self, max_frames, max_age_s):
+        if int(max_frames) < 1:
+            raise ValueError("maximum scan history length must be positive")
+        if not math.isfinite(float(max_age_s)) or float(max_age_s) <= 0.0:
+            raise ValueError("maximum scan history age must be positive")
+        self.max_age_s = float(max_age_s)
+        self._history = deque(maxlen=int(max_frames))
+        self._last_stamp_s = None
+
+    def add(self, stamp_s, ranges):
+        stamp_s = float(stamp_s)
+        scan = np.asarray(ranges, dtype=np.float32)
+        if not math.isfinite(stamp_s):
+            raise ValueError("scan timestamp must be finite")
+        if scan.ndim != 1:
+            raise ValueError("projected scan must be one-dimensional")
+
+        reset = (
+            self._last_stamp_s is not None
+            and (
+                stamp_s <= self._last_stamp_s
+                or stamp_s - self._last_stamp_s > self.max_age_s
+            )
+        )
+        if reset:
+            self._history.clear()
+        elif self._history and scan.shape != self._history[-1][1].shape:
+            self._history.clear()
+            reset = True
+
+        self._history.append((stamp_s, scan.copy()))
+        self._last_stamp_s = stamp_s
+        while (
+            self._history
+            and stamp_s - self._history[0][0] > self.max_age_s
+        ):
+            self._history.popleft()
+        return reset
+
+    @property
+    def scans(self):
+        return tuple(scan for _, scan in self._history)
+
+    def __len__(self):
+        return len(self._history)
 
 
 def transform_points(points, translation, quaternion):
@@ -166,8 +217,11 @@ def merge_scan_history(range_history, min_samples_per_bin):
     supported_indices = np.flatnonzero(
         np.sum(finite, axis=0) >= min_samples_per_bin
     )
-    for index in supported_indices:
-        output[index] = np.median(history[finite[:, index], index])
+    if supported_indices.size:
+        supported = history[:, supported_indices]
+        supported_finite = finite[:, supported_indices]
+        supported = np.where(supported_finite, supported, np.nan)
+        output[supported_indices] = np.nanmedian(supported, axis=0)
     return output
 
 
@@ -223,16 +277,34 @@ def _reject_isolated_hits(ranges, config):
     filtered = np.asarray(ranges, dtype=np.float32).copy()
     finite = np.isfinite(filtered)
     support = np.zeros(filtered.size, dtype=np.int16)
+    full_circle = (
+        config.angle_max - config.angle_min
+        >= 2.0 * math.pi - 1.5 * config.angle_increment
+    )
     for offset in range(1, config.neighbor_window_bins + 1):
-        left = filtered[:-offset]
-        right = filtered[offset:]
-        with np.errstate(invalid="ignore"):
-            compatible = (
-                np.isfinite(left)
-                & np.isfinite(right)
-                & (np.abs(left - right) <= config.max_neighbor_range_jump)
-            )
-        support[:-offset] += compatible
-        support[offset:] += compatible
+        if full_circle:
+            neighbor = np.roll(filtered, offset)
+            with np.errstate(invalid="ignore"):
+                compatible = (
+                    finite
+                    & np.isfinite(neighbor)
+                    & (
+                        np.abs(filtered - neighbor)
+                        <= config.max_neighbor_range_jump
+                    )
+                )
+            support += compatible
+            support += np.roll(compatible, -offset)
+        else:
+            left = filtered[:-offset]
+            right = filtered[offset:]
+            with np.errstate(invalid="ignore"):
+                compatible = (
+                    np.isfinite(left)
+                    & np.isfinite(right)
+                    & (np.abs(left - right) <= config.max_neighbor_range_jump)
+                )
+            support[:-offset] += compatible
+            support[offset:] += compatible
     filtered[finite & (support < config.min_neighbor_support)] = np.inf
     return filtered

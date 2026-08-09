@@ -76,6 +76,18 @@ class TestHectorGicpFusion(unittest.TestCase):
             result.reason, "HECTOR_POSE_HAS_NO_SYNCHRONIZED_LOCAL_POSE"
         )
 
+    def test_non_increasing_hector_stamp_is_rejected_without_rewinding_clock(self):
+        self._initialize()
+        self.fusion.update_local(1.1, 0.1, 0.0, 0.0)
+        accepted = self.fusion.update_global(1.1, 0.1, 0.0, 0.0)
+        self.assertTrue(accepted.accepted)
+
+        stale = self.fusion.update_global(1.05, 0.1, 0.0, 0.0)
+
+        self.assertFalse(stale.accepted)
+        self.assertEqual(stale.reason, "NON_INCREASING_HECTOR_POSE_STAMP")
+        self.assertAlmostEqual(self.fusion.last_global_stamp_s, 1.1)
+
     def test_initial_large_offset_is_rejected(self):
         self.fusion.update_local(1.0, 0.0, 0.0, 0.0)
         result = self.fusion.update_global(1.0, 3.0, 0.0, math.pi / 2.0)

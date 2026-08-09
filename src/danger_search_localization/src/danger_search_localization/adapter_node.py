@@ -18,7 +18,7 @@ from danger_search_common.msg import (
 )
 
 from .config import AdapterConfig
-from .pose_fusion import HectorGicpFusion, Pose2D
+from .pose_fusion import compose, HectorGicpFusion, Pose2D
 from .vertical_estimation import (
     VerticalEstimator,
     quaternion_from_rpy,
@@ -372,6 +372,20 @@ class LocalizationAdapterNode:
             correction = self.latest_map_to_odom
         if pose is None:
             return
+        # Recompose from the same correction and local pose used for TF.  A
+        # Hector callback may update map->odom between GICP frames; publishing
+        # cached XY/yaw here would briefly disagree with the TF tree.
+        if local_pose is not None:
+            fused_pose = compose(correction, local_pose)
+            pose.pose.pose.position.x = fused_pose.x
+            pose.pose.pose.position.y = fused_pose.y
+            qx, qy, qz, qw = quaternion_from_rpy(
+                0.0, 0.0, fused_pose.yaw
+            )
+            pose.pose.pose.orientation.x = qx
+            pose.pose.pose.orientation.y = qy
+            pose.pose.pose.orientation.z = qz
+            pose.pose.pose.orientation.w = qw
         self._apply_vertical_state(pose, vertical)
         self.pose_pub.publish(pose)
 

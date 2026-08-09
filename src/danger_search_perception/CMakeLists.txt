@@ -38,5 +38,8 @@ catkin_install_python(PROGRAMS
 )
 
 if(CATKIN_ENABLE_TESTING)
-  catkin_add_nosetests(test)
+  catkin_add_nosetests(test/test_color_detector.py)
+  catkin_add_nosetests(test/test_config.py)
+  catkin_add_nosetests(test/test_depth_geometry.py)
+  catkin_add_nosetests(test/test_message_adapter.py)
 endif()

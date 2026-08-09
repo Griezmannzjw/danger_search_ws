@@ -59,3 +59,8 @@ class TestLocalizationConfig(unittest.TestCase):
             for remap in hector_node.findall("remap")
         }
         self.assertEqual(remaps["poseupdate"], config["backend_pose_topic"])
+        parameters = {
+            parameter.attrib["name"]: parameter.attrib["value"]
+            for parameter in hector_node.findall("param")
+        }
+        self.assertEqual(parameters["use_tf_pose_start_estimate"], "true")

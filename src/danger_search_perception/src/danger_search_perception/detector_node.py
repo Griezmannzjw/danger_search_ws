@@ -1,6 +1,7 @@
 """ROS integration for the danger source perception pipeline."""
 
 import message_filters
+import math
 import rospy
 import tf2_ros
 import threading
@@ -78,6 +79,8 @@ class DangerDetectorNode:
         self.last_detection_count = 0
         self.has_synchronized_input = False
         self.last_tf_available = False
+        self.last_camera_valid = False
+        self.state_lock = threading.Lock()
 
         self.detections_pub = rospy.Publisher(
             self.detections_topic, DangerSourceArray, queue_size=10
@@ -118,9 +121,11 @@ class DangerDetectorNode:
         )
 
     def _sensor_callback(self, rgb_msg, depth_msg, camera_info_msg):
-        self.has_synchronized_input = True
-        self.last_input_stamp = rgb_msg.header.stamp
-        self.last_detection_count = 0
+        with self.state_lock:
+            self.has_synchronized_input = True
+            self.last_input_stamp = rgb_msg.header.stamp
+            self.last_detection_count = 0
+            self.last_camera_valid = False
 
         output = DangerSourceArray()
         output.header.stamp = rgb_msg.header.stamp
@@ -142,6 +147,12 @@ class DangerDetectorNode:
             return
 
         self.camera_model.fromCameraInfo(camera_info_msg)
+        if not self._camera_model_is_valid(self.camera_model):
+            rospy.logwarn_throttle(
+                2.0, "[perception] CameraInfo has invalid intrinsics"
+            )
+            self._publish(output)
+            return
         camera_frame = self._camera_frame(
             rgb_msg, depth_msg, camera_info_msg
         )
@@ -156,10 +167,13 @@ class DangerDetectorNode:
             camera_frame, rgb_msg.header.stamp
         )
         if transform is None:
-            self.last_tf_available = False
+            with self.state_lock:
+                self.last_tf_available = False
             self._publish(output)
             return
-        self.last_tf_available = True
+        with self.state_lock:
+            self.last_camera_valid = True
+            self.last_tf_available = True
 
         _, candidates = self.color_detector.detect(bgr)
         for candidate_index, candidate in enumerate(candidates):
@@ -189,7 +203,8 @@ class DangerDetectorNode:
             if danger is not None:
                 output.dangers.append(danger)
 
-        self.last_detection_count = len(output.dangers)
+        with self.state_lock:
+            self.last_detection_count = len(output.dangers)
         self._publish(output)
 
     def _convert_images(self, rgb_msg, depth_msg):
@@ -285,31 +300,42 @@ class DangerDetectorNode:
         status.header.stamp = now
         status.header.frame_id = self.target_frame
 
+        with self.state_lock:
+            last_input_stamp = self.last_input_stamp
+            has_synchronized_input = self.has_synchronized_input
+            last_tf_available = self.last_tf_available
+            last_camera_valid = self.last_camera_valid
+            last_detection_count = self.last_detection_count
+
         input_age_s = float("inf")
-        if self.last_input_stamp != rospy.Time(0):
-            input_age_s = max(0.0, (now - self.last_input_stamp).to_sec())
+        if last_input_stamp != rospy.Time(0):
+            input_age_s = max(0.0, (now - last_input_stamp).to_sec())
 
         status.input_fresh = (
-            self.has_synchronized_input
+            has_synchronized_input
             and input_age_s < self.input_fresh_timeout_s
         )
-        status.ready = status.input_fresh and self.last_tf_available
+        status.ready = (
+            status.input_fresh and last_camera_valid and last_tf_available
+        )
         status.input_latency_ms = (
             float(input_age_s * 1000.0)
             if input_age_s != float("inf")
             else -1.0
         )
-        status.total_detections = self.last_detection_count
+        status.total_detections = last_detection_count
         # P0 confirmation and de-duplication are owned by mission.
         status.confirmed_count = 0
         status.pending_verification = 0
         status.capability_version = self.capability_version
 
-        if not self.has_synchronized_input:
+        if not has_synchronized_input:
             status.status_reason = "WAITING_FOR_SYNCHRONIZED_INPUT"
         elif not status.input_fresh:
             status.status_reason = "INPUT_STALE"
-        elif not self.last_tf_available:
+        elif not last_camera_valid:
+            status.status_reason = "CAMERA_INPUT_INVALID"
+        elif not last_tf_available:
             status.status_reason = "TARGET_FRAME_TF_UNAVAILABLE"
         else:
             status.status_reason = "OK"
@@ -319,9 +345,26 @@ class DangerDetectorNode:
     @staticmethod
     def _camera_frame(rgb_msg, depth_msg, camera_info_msg):
         return (
-            depth_msg.header.frame_id
+            camera_info_msg.header.frame_id
             or rgb_msg.header.frame_id
-            or camera_info_msg.header.frame_id
+            or depth_msg.header.frame_id
+        )
+
+    @staticmethod
+    def _camera_model_is_valid(camera_model):
+        try:
+            parameters = (
+                float(camera_model.fx()),
+                float(camera_model.fy()),
+                float(camera_model.cx()),
+                float(camera_model.cy()),
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return (
+            all(math.isfinite(value) for value in parameters)
+            and parameters[0] > 1e-9
+            and parameters[1] > 1e-9
         )
 
     @staticmethod

@@ -1,6 +1,7 @@
 """Validated configuration for localization nodes."""
 
 from dataclasses import dataclass
+import math
 
 
 def _require(condition, message):
@@ -41,6 +42,7 @@ class ScanProjectionConfig:
     min_ground_clearance_m: float = 0.18
     scan_accumulation_frames: int = 1
     scan_accumulation_min_samples_per_bin: int = 1
+    scan_accumulation_max_age_s: float = 0.6
     min_valid_scan_bins: int = 40
     min_angular_coverage_rad: float = 0.35
     drop_unstable_scans: bool = True
@@ -102,6 +104,11 @@ class ScanProjectionConfig:
             1 <= self.scan_accumulation_min_samples_per_bin
             <= self.scan_accumulation_frames,
             "scan accumulation minimum samples must be within the window",
+        )
+        _require(
+            math.isfinite(self.scan_accumulation_max_age_s)
+            and self.scan_accumulation_max_age_s > 0.0,
+            "scan accumulation maximum age must be positive",
         )
         _require(
             self.min_valid_scan_bins >= 1,
