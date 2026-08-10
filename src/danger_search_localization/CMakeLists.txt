@@ -52,5 +52,10 @@ catkin_install_python(PROGRAMS
 )
 
 if(CATKIN_ENABLE_TESTING)
-  catkin_add_nosetests(test)
+  catkin_add_nosetests(test/test_adapter.py)
+  catkin_add_nosetests(test/test_config.py)
+  catkin_add_nosetests(test/test_pose_filter.py)
+  catkin_add_nosetests(test/test_pose_fusion.py)
+  catkin_add_nosetests(test/test_scan_projection.py)
+  catkin_add_nosetests(test/test_vertical_estimation.py)
 endif()

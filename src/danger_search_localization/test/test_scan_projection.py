@@ -13,6 +13,7 @@ from danger_search_localization.scan_projection import (
     merge_scan_history,
     project_planar_scan,
     quaternion_multiply,
+    TimedScanAccumulator,
     transform_points,
 )
 
@@ -152,6 +153,33 @@ class TestScanProjection(unittest.TestCase):
 
         self.assertEqual(int(np.isfinite(ranges).sum()), 2)
 
+    def test_isolated_filter_connects_across_full_scan_seam(self):
+        config = ScanProjectionConfig(
+            angle_min=-math.pi,
+            angle_max=math.pi,
+            angle_increment=math.pi / 8.0,
+            range_min=0.2,
+            range_max=5.0,
+            min_height=0.0,
+            max_height=1.0,
+            self_exclusion_min_x=-0.1,
+            self_exclusion_max_x=0.1,
+            self_exclusion_half_width_y=0.1,
+            min_returns_per_bin=1,
+            neighbor_window_bins=2,
+            max_neighbor_range_jump=0.5,
+        )
+        points = np.array(
+            [
+                [math.cos(-math.pi + 0.01), math.sin(-math.pi + 0.01), 0.5],
+                [math.cos(math.pi - 0.01), math.sin(math.pi - 0.01), 0.5],
+            ]
+        )
+
+        ranges = project_planar_scan(points, config)
+
+        self.assertEqual(int(np.isfinite(ranges).sum()), 2)
+
     def test_scan_history_uses_median_after_minimum_observations(self):
         history = [
             np.array([1.0, np.inf, 4.0], dtype=np.float32),
@@ -186,6 +214,24 @@ class TestScanProjection(unittest.TestCase):
     def test_scan_history_requires_valid_minimum_sample_count(self):
         with self.assertRaises(ValueError):
             merge_scan_history([np.array([1.0])], min_samples_per_bin=0)
+
+    def test_timed_scan_history_resets_after_long_gap(self):
+        accumulator = TimedScanAccumulator(max_frames=5, max_age_s=0.6)
+        self.assertFalse(accumulator.add(1.0, [1.0, np.inf]))
+        self.assertFalse(accumulator.add(1.1, [1.1, np.inf]))
+
+        reset = accumulator.add(2.0, [2.0, np.inf])
+
+        self.assertTrue(reset)
+        self.assertEqual(len(accumulator), 1)
+        np.testing.assert_allclose(accumulator.scans[0][0], 2.0)
+
+    def test_timed_scan_history_resets_when_clock_moves_backwards(self):
+        accumulator = TimedScanAccumulator(max_frames=5, max_age_s=0.6)
+        accumulator.add(2.0, [2.0])
+
+        self.assertTrue(accumulator.add(1.0, [1.0]))
+        self.assertEqual(len(accumulator), 1)
 
     @staticmethod
     def _quaternion_from_rpy(roll, pitch, yaw):

@@ -17,6 +17,7 @@ from .scan_projection import (
     project_planar_scan,
     quaternion_inverse,
     quaternion_multiply,
+    TimedScanAccumulator,
     transform_points,
 )
 
@@ -32,7 +33,12 @@ class ScanProjectorNode:
         self.config = self._load_config()
         self.imu_lock = threading.RLock()
         self.imu_samples = deque(maxlen=500)
-        self.range_history = deque(maxlen=self.config.scan_accumulation_frames)
+        self.scan_accumulator = TimedScanAccumulator(
+            self.config.scan_accumulation_frames,
+            self.config.scan_accumulation_max_age_s,
+        )
+        self.last_published_stamp_s = None
+        self.last_published_stamp_s = None
 
         self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
@@ -98,11 +104,17 @@ class ScanProjectorNode:
         )
         translation = transform.transform.translation
         rotation = transform.transform.rotation
-        points_base = transform_points(
-            points,
-            (translation.x, translation.y, translation.z),
-            (rotation.x, rotation.y, rotation.z, rotation.w),
-        )
+        try:
+            points_base = transform_points(
+                points,
+                (translation.x, translation.y, translation.z),
+                (rotation.x, rotation.y, rotation.z, rotation.w),
+            )
+        except ValueError as exc:
+            rospy.logwarn_throttle(
+                1.0, "[localization] invalid lidar transform: %s", str(exc)
+            )
+            return
         if self.config.enable_imu_leveling:
             imu_sample = self._closest_imu(message.header.stamp.to_sec())
             if imu_sample is None:
@@ -128,36 +140,53 @@ class ScanProjectorNode:
                     )
                     base_from_imu = None
                 if base_from_imu is not None:
-                    world_from_base = quaternion_multiply(
-                        world_from_imu,
-                        quaternion_inverse(
-                            (
-                                base_from_imu.x,
-                                base_from_imu.y,
-                                base_from_imu.z,
-                                base_from_imu.w,
-                            )
-                        ),
-                    )
-                    points_base, roll, pitch = gravity_level_points(
-                        points_base, world_from_base
-                    )
+                    try:
+                        world_from_base = quaternion_multiply(
+                            world_from_imu,
+                            quaternion_inverse(
+                                (
+                                    base_from_imu.x,
+                                    base_from_imu.y,
+                                    base_from_imu.z,
+                                    base_from_imu.w,
+                                )
+                            ),
+                        )
+                        points_base, roll, pitch = gravity_level_points(
+                            points_base, world_from_base
+                        )
+                    except ValueError as exc:
+                        rospy.logwarn_throttle(
+                            1.0,
+                            "[localization] invalid IMU orientation: %s",
+                            str(exc),
+                        )
+                        roll = pitch = None
+                    if roll is None:
+                        frame_ranges = project_planar_scan(
+                            points_base, self.config
+                        )
+                        self._accumulate_and_publish(message, frame_ranges)
+                        return
                     angular_speed = math.sqrt(
                         sum(float(value) ** 2 for value in angular_velocity)
                     )
                     if (
                         abs(roll) > self.config.max_abs_roll_rad
                         or abs(pitch) > self.config.max_abs_pitch_rad
+                        or not math.isfinite(angular_speed)
                         or angular_speed > self.config.max_angular_speed_rps
                     ):
                         rospy.logwarn_throttle(
                             1.0,
                             "[localization] unstable scan: roll=%.1fdeg "
-                            "pitch=%.1fdeg gyro=%.2frad/s -- publishing anyway",
+                            "pitch=%.1fdeg gyro=%.2frad/s",
                             math.degrees(roll),
                             math.degrees(pitch),
                             angular_speed,
                         )
+                        if self.config.drop_unstable_scans:
+                            return
                     if self.config.enable_ground_clearance_gate:
                         clearance = estimate_ground_clearance(points_base, self.config)
                         if (
@@ -167,13 +196,31 @@ class ScanProjectorNode:
                             rospy.logwarn_throttle(
                                 1.0,
                                 "[localization] low ground clearance=%.3fm "
-                                "-- publishing anyway",
+                                "-- rejecting scan",
                                 clearance,
                             )
+                            if self.config.drop_unstable_scans:
+                                return
         frame_ranges = project_planar_scan(points_base, self.config)
-        self.range_history.append(frame_ranges)
+        self._accumulate_and_publish(message, frame_ranges)
+
+    def _accumulate_and_publish(self, message, frame_ranges):
+        try:
+            reset = self.scan_accumulator.add(
+                message.header.stamp.to_sec(), frame_ranges
+            )
+        except ValueError as exc:
+            rospy.logwarn_throttle(
+                1.0, "[localization] invalid projected scan: %s", str(exc)
+            )
+            return
+        if reset:
+            rospy.logwarn_throttle(
+                2.0,
+                "[localization] scan history reset after time discontinuity",
+            )
         ranges = merge_scan_history(
-            self.range_history,
+            self.scan_accumulator.scans,
             self.config.scan_accumulation_min_samples_per_bin,
         )
 
@@ -203,12 +250,22 @@ class ScanProjectorNode:
         output.angle_min = self.config.angle_min
         output.angle_max = self.config.angle_max
         output.angle_increment = self.config.angle_increment
-        output.scan_time = 0.1 * len(self.range_history)
+        stamp_s = message.header.stamp.to_sec()
+        output.scan_time = self._published_scan_interval(stamp_s)
         output.time_increment = 0.0
         output.range_min = self.config.range_min
         output.range_max = self.config.range_max
         output.ranges = ranges.tolist()
         self.publisher.publish(output)
+
+    def _published_scan_interval(self, stamp_s):
+        interval = 0.0
+        if self.last_published_stamp_s is not None:
+            candidate = float(stamp_s) - self.last_published_stamp_s
+            if candidate > 0.0 and math.isfinite(candidate):
+                interval = candidate
+        self.last_published_stamp_s = float(stamp_s)
+        return interval
 
     def _closest_imu(self, stamp_s):
         with self.imu_lock:

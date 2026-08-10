@@ -468,7 +468,16 @@ class NavController:
     def make_plan_cb(self, req):
         """使用共享 A* 返回可执行的全局路径。"""
         response = GetPlanResponse()
-        start, start_valid = self._pose_stamped_to_xy_yaw(req.start, allow_zero_stamp=True)
+        # A zero-stamped start means "use the latest robot pose". Resolve it
+        # before quaternion validation because the unused request pose is
+        # commonly left as an all-zero message.
+        if req.start.header.stamp.is_zero():
+            start = self._current_pose_snapshot()
+            start_valid = start is not None
+        else:
+            start, start_valid = self._pose_stamped_to_xy_yaw(
+                req.start, allow_zero_stamp=False
+            )
         goal, goal_valid = self._pose_stamped_to_xy_yaw(req.goal, allow_zero_stamp=True)
         if not start_valid or not goal_valid:
             return response
@@ -476,10 +485,6 @@ class NavController:
         if not ready:
             return response
         # GetPlan 的常见零时间戳 start 请求使用最新已验证的定位位姿。
-        if req.start.header.stamp.is_zero():
-            start = self._current_pose_snapshot()
-            if start is None:
-                return response
         dynamic_cells, _, obstacle_fresh = self._dynamic_obstacle_snapshot(rospy.Time.now())
         path_points = self._plan_path(
             start[:2], goal[:2], dynamic_cells if obstacle_fresh else ()

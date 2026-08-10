@@ -17,8 +17,9 @@ class TestLocalizationConfig(unittest.TestCase):
 
     def test_defaults_are_valid(self):
         scan_config = ScanProjectionConfig()
-        self.assertEqual(scan_config.min_valid_scan_bins, 8)
-        self.assertEqual(scan_config.min_angular_coverage_rad, 0.05)
+        self.assertEqual(scan_config.scan_accumulation_frames, 1)
+        self.assertEqual(scan_config.min_valid_scan_bins, 40)
+        self.assertEqual(scan_config.min_angular_coverage_rad, 0.35)
         AdapterConfig()
 
     def test_invalid_height_range_is_rejected(self):
@@ -58,3 +59,8 @@ class TestLocalizationConfig(unittest.TestCase):
             for remap in hector_node.findall("remap")
         }
         self.assertEqual(remaps["poseupdate"], config["backend_pose_topic"])
+        parameters = {
+            parameter.attrib["name"]: parameter.attrib["value"]
+            for parameter in hector_node.findall("param")
+        }
+        self.assertEqual(parameters["use_tf_pose_start_estimate"], "true")

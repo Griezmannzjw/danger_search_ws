@@ -87,6 +87,12 @@ class TestDepthGeometryValidator(unittest.TestCase):
 
         self.assertIsNone(self._validate_first_candidate(image, depth))
 
+    def test_invalid_camera_intrinsics_are_rejected(self):
+        image, depth = self._synthetic_sphere(2.0, 0.15)
+        self.camera = FakeCameraModel(fx=0.0)
+
+        self.assertIsNone(self._validate_first_candidate(image, depth))
+
     def _validate_first_candidate(self, image, depth):
         _, candidates = self.color_detector.detect(image)
         self.assertEqual(len(candidates), 1)

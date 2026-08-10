@@ -56,8 +56,15 @@ class DepthGeometryValidator:
         if depths.size < 12:
             return None
 
+        camera_parameters = self._camera_parameters(camera_model)
+        if camera_parameters is None:
+            return None
         rows, cols, depths = self._subsample(rows, cols, depths)
-        points = self._pixels_to_points(cols, rows, depths, camera_model)
+        points = self._pixels_to_points(
+            cols, rows, depths, camera_parameters
+        )
+        if not np.isfinite(points).all():
+            return None
         sphere_fit = self._fit_known_radius_sphere(
             points, candidate.center_u, candidate.center_v, camera_model
         )
@@ -110,9 +117,27 @@ class DepthGeometryValidator:
         return rows[indices], cols[indices], depths[indices]
 
     @staticmethod
-    def _pixels_to_points(cols, rows, depths, camera_model):
-        fx, fy = float(camera_model.fx()), float(camera_model.fy())
-        cx, cy = float(camera_model.cx()), float(camera_model.cy())
+    def _camera_parameters(camera_model):
+        try:
+            parameters = tuple(
+                float(value)
+                for value in (
+                    camera_model.fx(),
+                    camera_model.fy(),
+                    camera_model.cx(),
+                    camera_model.cy(),
+                )
+            )
+        except (AttributeError, TypeError, ValueError):
+            return None
+        fx, fy, _, _ = parameters
+        if not np.isfinite(parameters).all() or fx <= 1e-9 or fy <= 1e-9:
+            return None
+        return parameters
+
+    @staticmethod
+    def _pixels_to_points(cols, rows, depths, camera_parameters):
+        fx, fy, cx, cy = camera_parameters
         x = (cols.astype(np.float64) - cx) * depths / fx
         y = (rows.astype(np.float64) - cy) * depths / fy
         return np.column_stack((x, y, depths)).astype(np.float64)
@@ -120,12 +145,15 @@ class DepthGeometryValidator:
     def _fit_known_radius_sphere(
         self, points, center_u, center_v, camera_model
     ):
-        ray = np.asarray(
-            camera_model.projectPixelTo3dRay((center_u, center_v)),
-            dtype=np.float64,
-        )
+        try:
+            ray = np.asarray(
+                camera_model.projectPixelTo3dRay((center_u, center_v)),
+                dtype=np.float64,
+            ).reshape(3)
+        except (AttributeError, TypeError, ValueError):
+            return None
         ray_norm = np.linalg.norm(ray)
-        if ray_norm <= 1e-9:
+        if not np.isfinite(ray).all() or ray_norm <= 1e-9:
             return None
         ray /= ray_norm
 
@@ -139,14 +167,20 @@ class DepthGeometryValidator:
 
         best_t, best_loss = None, float("inf")
         for sample_count in (81, 61):
-            for distance in np.linspace(low, high, sample_count):
-                center = float(distance) * ray
-                errors = np.abs(
-                    np.linalg.norm(points - center, axis=1) - radius
+            distances = np.linspace(low, high, sample_count)
+            centers = distances[:, np.newaxis] * ray[np.newaxis, :]
+            errors = np.abs(
+                np.linalg.norm(
+                    points[np.newaxis, :, :] - centers[:, np.newaxis, :],
+                    axis=2,
                 )
-                loss = float(np.median(errors))
-                if loss < best_loss:
-                    best_t, best_loss = float(distance), loss
+                - radius
+            )
+            losses = np.median(errors, axis=1)
+            best_index = int(np.argmin(losses))
+            if float(losses[best_index]) < best_loss:
+                best_t = float(distances[best_index])
+                best_loss = float(losses[best_index])
             step = (high - low) / max(sample_count - 1, 1)
             low = max(self.config.min_depth_m, best_t - 2.0 * step)
             high = min(

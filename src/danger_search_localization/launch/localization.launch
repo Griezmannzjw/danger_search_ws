@@ -28,7 +28,11 @@
     <remap from="map" to="/localization/raw_map" />
     <param name="pub_map_odom_transform" value="false" />
     <param name="use_tf_scan_transformation" value="true" />
-    <param name="use_tf_pose_start_estimate" value="false" />
+    <!-- Seed each scan match from the bounded GICP-backed map->odom->base TF.
+         Without this prior, sparse Mid-360 projections can make Hector feed a
+         bad previous match back into the next frame and drift metres while the
+         robot is stationary. -->
+    <param name="use_tf_pose_start_estimate" value="true" />
   </node>
 
   <node name="localization_adapter"
