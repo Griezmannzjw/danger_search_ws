@@ -15,4 +15,7 @@
   <exec_depend>danger_search_exploration</exec_depend>
   <exec_depend>danger_search_control</exec_depend>
   <exec_depend>danger_search_mission</exec_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>rosservice</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
 </package>

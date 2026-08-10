@@ -11,18 +11,18 @@
 | localization是`/tf`唯一发布者，提供`map→odom→base` | ✅ 20Hz发布，链完整 |
 | 地图有已知自由区域（非全未知） | ✅ 初始化2m半径自由区域 |
 | 定位用允许的IMU/激光，不用`cmd_vel_sent`做里程计 | ✅ GICP局部里程计 + Hector受限全局修正，IMU用于重力校正 |
-| `make_plan`基于实际地图判断可达性，不返回无条件直线 | ✅ 直线插值+障碍检查 |
+| `make_plan`基于实际地图判断可达性，不返回无条件直线 | ✅ 膨胀占据栅格 A* |
 | 所有话题/服务/frame从ROS参数读取，无硬编码 | ✅ 全部参数化 |
-| 结果文件绝对路径，支持环境变量展开 | ✅ `~`和`$USER`自动展开 |
-| start/finish严格流程，幂等性 | ✅ 重复调用可预测 |
+| 结果文件路径可移植 | ✅ launch自动查找同级SimEnv，可用一个参数覆盖 |
+| 完整任务状态机 | ✅ EXPLORING→RETURNING→FINISHED/ERROR |
 | control是`/cmd_vel`唯一发布者 | ✅ 安全仲裁层唯一输出 |
 | exploration发目标前检查所有前置条件 | ✅ 6项条件全部满足才发 |
 | 失败不无限重试，stop时取消活动目标 | ✅ 最多3次重试，stop立即cancel |
-| 只接收`class_id=1`红球，去重 | ✅ detection_id+0.8m空间去重 |
-| map→world坐标转换 | ✅ 首版静态重合，预留TF接口 |
-| 结果文件原子写入 | ✅ tmp+rename，避免半写文件 |
+| 只接收`class_id=1`红球，去重 | ✅ 置信度过滤+空间融合+至少三帧确认 |
+| 任务起点坐标转换 | ✅ 记录home pose并转换为起点相对坐标 |
+| 结果文件原子写入 | ✅ flush+fsync+os.replace |
 | 所有服务统一用`std_srvs/Trigger` | ✅ 无自定义srv |
-| 600s是评分阈值不是硬截止 | ✅ 不自动结束，用户调用finish |
+| 自动结束和超时 | ✅ 探索收敛后自动返航；600s仅作评分参考，默认不强制停止 |
 
 ## 系统架构
 
@@ -132,21 +132,16 @@ cd ~/danger_search_ws/src
 find . -name "*.py" -exec chmod +x {} \;
 ```
 
-### 4. 配置结果文件路径
+### 4. 目录布局
 
-编辑 `src/danger_search_bringup/config/global.yaml`，确认`result_file`指向你的SimEnv结果目录：
-```yaml
-# 默认配置（如果SimEnv在~/SimEnv）
-result_file: /home/$USER/SimEnv/results/detected_danger.json
-```
-如果你的SimEnv在其他位置，修改为对应绝对路径即可。
+默认只要求 `SimEnv` 和 `danger_search_ws` 位于同一父目录，不需要修改 YAML。不同布局可在
+启动时通过 `simenv_root:=/absolute/path/to/SimEnv` 覆盖一次。
 
 ### 5. 启动仿真
 
 ```bash
-cd ~/SimEnv
-source devel/setup.bash
-./auto.sh
+cd ~/myProject/SimEnv
+GUI=false FLOOR_COUNT=1 ENABLE_REFEREE_ODOM=0 ENABLE_GROUND_TRUTH=1 POINTCLOUD_USE_GROUND_TRUTH_ODOM=0 ./auto.sh
 ```
 
 Gazebo启动后，在终端按：
@@ -157,32 +152,27 @@ Gazebo启动后，在终端按：
 
 **新开终端**：
 ```bash
-cd ~/danger_search_ws
+cd ~/myProject/danger_search_ws
 source devel/setup.bash
-roslaunch danger_search_bringup competition.launch
+roslaunch danger_search_bringup competition.launch autostart:=true
 ```
 
 正常启动后会看到各节点的日志输出，没有红色error。
 
-### 7. 开始任务
+### 7. 自动闭环
 
-**新开终端**：
-```bash
-# 开始自主探索
-rosservice call /danger_search/start "{}"
-
-# 探索完成后结束任务（输出结果）
-rosservice call /danger_search/finish "{}"
-```
+`autostart:=true` 时，mission 在定位、地图、导航和感知全部就绪后自动开始。探索收敛后
+自动返航并输出结果，不需要人工调用 finish。使用 `autostart:=false` 时，只需调用一次
+`rosservice call /danger_search/start "{}"`。
 
 ## 启动后验证（必做！）
 
 启动后按顺序执行以下命令验证系统正常：
 
 ```bash
-# 1. 检查所有6个节点是否都启动了
+# 1. 检查全部运行节点
 rosnode list
-# 应该看到：/localization /perception /navigation /exploration /control /mission
+# 应看到scan projector、GICP、Hector、localization adapter及5个功能节点
 
 # 2. 检查TF链是否完整
 rosrun tf view_frames && evince frames.pdf
@@ -214,6 +204,7 @@ rosservice list | grep danger_search
 # 应该看到：
 # /danger_search/start
 # /danger_search/finish
+# /danger_search/return_home
 # /danger_search/start_exploration
 # /danger_search/stop_exploration
 ```
@@ -233,6 +224,7 @@ rosservice list | grep danger_search
 | `/danger_detector/status` | DetectionStatus | perception | 2Hz | 检测器状态 |
 | `/mission/status` | MissionStatus | mission | 2Hz | 任务状态（latch） |
 | `/mission/active` | Bool | mission | latch | 任务激活标志 |
+| `/exploration/complete` | Bool | exploration | latch | 探索收敛事件 |
 
 ## P0服务/Action
 
@@ -244,6 +236,7 @@ rosservice list | grep danger_search
 | `/danger_search/stop_exploration` | Trigger | exploration | mission | 停止探索 |
 | `/danger_search/start` | Trigger | mission | 用户 | 开始任务 |
 | `/danger_search/finish` | Trigger | mission | 用户 | 结束任务 |
+| `/danger_search/return_home` | Trigger | mission | 用户 | 调试时提前返航 |
 
 ## 结果文件格式
 
@@ -257,7 +250,7 @@ rosservice list | grep danger_search
 }
 ```
 - `exploration_time`：从start到finish的秒数，保留2位小数
-- `position`：危险源在world坐标系下的[x, y, z]坐标，保留2位小数
+- `position`：以本次任务起点为原点的[x, y, z]坐标，保留2位小数
 - 匹配阈值：1.0m欧氏距离，贪心一对一匹配
 
 ## 常见问题排查
@@ -282,8 +275,8 @@ rosservice list | grep danger_search
 
 ### ❌ 问题3：结果文件没生成
 **排查步骤**：
-1. 确认调用了`/danger_search/finish`服务（不是只按Ctrl+C）
-2. 检查`result_file`路径是否正确，目录是否存在（代码会自动创建目录）
+1. 确认 `/mission/status` 已进入 `FINISHED` 或带原因的 `ERROR`
+2. 检查 mission 启动日志中的 `result=` 是否指向同级 SimEnv 的 results 目录
 3. 检查mission节点日志是否有`Result written to ...`
 4. 检查是否有红色error日志
 
@@ -311,9 +304,9 @@ rospack find danger_search_bringup
 |------|--------|---------|--------|
 | localization | GICP连续里程计 + Hector受限修正和2D栅格 | LIO/回环检测、多楼层地图 | 导航组 |
 | navigation | P控制器+直线避障 | 完整move_base：global planner(Dijkstra/A*) + local planner(DWA/TEB) + costmap_2d | 导航组 |
-| exploration | 自由区域随机选点 | 前沿点算法(frontier exploration)，房间拓扑遍历，多楼层电梯/楼梯 | 探索组 |
-| perception | P0空骨架 | HSV颜色分割+轮廓检测，YOLOv8实例分割，深度图3D定位，多帧确认去重 | 识别组 |
-| mission | 手动start/finish | 自动结束判定，自动返航，多楼层切换，自动电梯调用 | 框架组 |
+| exploration | 最近可达前沿+自动收敛 | 信息增益、房间拓扑、多楼层电梯/楼梯 | 探索组 |
+| perception | RGB-D球体识别和map定位 | YOLO/实例分割、跨视角复核 | 识别组 |
+| mission | 自动结束、返航和结果输出 | 多楼层切换、自动电梯调用 | 框架组 |
 | control | 速度平滑+超时停车 | 跌倒检测，紧急避障，步态切换 | 控制组 |
 
 ## 团队分工

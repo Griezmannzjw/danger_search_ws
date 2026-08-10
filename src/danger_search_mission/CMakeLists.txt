@@ -12,6 +12,8 @@ find_package(catkin REQUIRED COMPONENTS
   danger_search_common
 )
 
+catkin_python_setup()
+
 catkin_package(
   CATKIN_DEPENDS
   rospy
@@ -32,3 +34,10 @@ catkin_install_python(PROGRAMS
   scripts/mission_manager.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+
+if(CATKIN_ENABLE_TESTING)
+  find_package(rostest REQUIRED)
+  catkin_add_nosetests(test/test_mission_core.py)
+  catkin_add_nosetests(test/test_mission_contract.py)
+  add_rostest(test/mission_smoke.test)
+endif()

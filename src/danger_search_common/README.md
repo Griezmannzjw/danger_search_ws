@@ -23,7 +23,7 @@
 
 ### MissionState.msg
 任务状态消息
-- `state` (string): IDLE / EXPLORING / RETURNING / FINISHED / ERROR
+- `state` (string): IDLE / ENTERING / EXPLORING / RETURNING / FINISHED / ERROR
 - `detail` (string): 状态详情
 - `progress` (float32): 任务进度 0~1
 

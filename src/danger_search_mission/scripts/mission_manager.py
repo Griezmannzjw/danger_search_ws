@@ -1,49 +1,70 @@
 #!/usr/bin/env python3
-"""
-任务总控节点 - P0最小可运行版本
-对齐接口规范 v1.1-p0
+"""P0 mission manager: explore, return home, and atomically save results."""
 
-状态机：IDLE → EXPLORING → FINISHED
-         ↓
-        ERROR
-
-P0要求：
-  - 所有名称从参数读取
-  - start/finish严格按流程
-  - 负责map->world坐标转换
-  - 结果文件绝对路径
-  - 只输出class_id=1的红球
-  - 幂等性：重复start/finish返回可预测结果
-"""
-
-import rospy
+import copy
 import json
-import os
 import math
+import os
+import threading
+
 import actionlib
-import tf2_ros
-from std_msgs.msg import Bool
-from std_srvs.srv import Trigger, TriggerResponse
-from move_base_msgs.msg import MoveBaseAction
+import rospy
+from actionlib_msgs.msg import GoalStatus
 from danger_search_common.msg import (
-    DangerSourceArray, DangerSource, MissionStatus,
-    MappingStatus, NavigationHealth
+    DangerSource,
+    DangerSourceArray,
+    DetectionStatus,
+    MappingStatus,
+    MissionStatus,
+    NavigationHealth,
 )
+from danger_search_mission.mission_core import (
+    build_result_document,
+    DangerTrackStore,
+    MissionLifecycle,
+    normalize_result_file,
+)
+from geometry_msgs.msg import PoseWithCovarianceStamped
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+from std_msgs.msg import Bool, String
+from std_srvs.srv import Trigger, TriggerResponse
 
 
 class MissionManager:
+    """Own the task-level state machine and the return-home goal."""
+
     def __init__(self):
         rospy.init_node("mission_manager", anonymous=False)
 
-        # ========== 从参数读取所有名称 ==========
         self.map_frame = rospy.get_param("~map_frame", "map")
-        self.world_frame = rospy.get_param("~world_frame", "world")
-
-        self.detections_topic = rospy.get_param("~detections_topic", "/danger_detector/detections")
-        self.mapping_status_topic = rospy.get_param("~mapping_status_topic", "/mapping/status")
-        self.navigation_health_topic = rospy.get_param("~navigation_health_topic", "/navigation/health")
-        self.mission_status_topic = rospy.get_param("~mission_status_topic", "/mission/status")
-        self.mission_active_topic = rospy.get_param("~mission_active_topic", "/mission/active")
+        self.pose_topic = rospy.get_param("~pose_topic", "/localization/pose")
+        self.detections_topic = rospy.get_param(
+            "~detections_topic", "/danger_detector/detections"
+        )
+        self.detection_status_topic = rospy.get_param(
+            "~detection_status_topic", "/danger_detector/status"
+        )
+        self.mapping_status_topic = rospy.get_param(
+            "~mapping_status_topic", "/mapping/status"
+        )
+        self.navigation_health_topic = rospy.get_param(
+            "~navigation_health_topic", "/navigation/health"
+        )
+        self.exploration_status_topic = rospy.get_param(
+            "~exploration_status_topic", "/exploration/status"
+        )
+        self.exploration_complete_topic = rospy.get_param(
+            "~exploration_complete_topic", "/exploration/complete"
+        )
+        self.mission_status_topic = rospy.get_param(
+            "~mission_status_topic", "/mission/status"
+        )
+        self.mission_active_topic = rospy.get_param(
+            "~mission_active_topic", "/mission/active"
+        )
+        self.entrance_ready_topic = rospy.get_param(
+            "~entrance_ready_topic", "/entrance/ready"
+        )
 
         self.start_exploration_service = rospy.get_param(
             "~start_exploration_service", "/danger_search/start_exploration"
@@ -57,233 +78,633 @@ class MissionManager:
         self.finish_mission_service = rospy.get_param(
             "~finish_mission_service", "/danger_search/finish"
         )
-        self.move_base_action_name = rospy.get_param("~move_base_action_name", "/move_base")
-
-        # 结果文件（必须是绝对路径，展开环境变量）
-        default_result = os.path.expandvars(
-            os.path.expanduser("~/SimEnv/results/detected_danger.json")
+        self.return_home_service = rospy.get_param(
+            "~return_home_service", "/danger_search/return_home"
         )
-        self.result_file = rospy.get_param("~result_file", default_result)
-        self.result_file = os.path.expandvars(os.path.expanduser(self.result_file))
-        self.dedup_distance = rospy.get_param("~dedup_distance", 0.8)
+        self.move_base_action_name = rospy.get_param(
+            "~move_base_action_name", "/move_base"
+        )
 
-        # ========== 状态 ==========
-        self.mission_state = "IDLE"
+        try:
+            self.result_file = normalize_result_file(
+                rospy.get_param("~result_file", "")
+            )
+            self.tracker = DangerTrackStore(
+                dedup_distance_m=float(rospy.get_param("~dedup_distance", 0.8)),
+                min_detections=int(rospy.get_param("~min_detections", 3)),
+                min_confidence=float(rospy.get_param("~min_confidence", 0.6)),
+            )
+        except ValueError as exc:
+            raise rospy.ROSInitException(str(exc))
+
+        self.preflight_wait_timeout_s = self._positive_param(
+            "~preflight_wait_timeout_s", 20.0
+        )
+        self.return_timeout_s = self._positive_param("~return_timeout_s", 120.0)
+        self.entry_timeout_s = self._positive_param("~entry_timeout_s", 90.0)
+        self.entry_distance_m = self._positive_param("~entry_distance_m", 4.2)
+        self.mission_timeout_s = self._nonnegative_param("~mission_timeout_s", 0.0)
+        self.input_timeout_s = self._positive_param("~input_timeout_s", 2.0)
+        self.entry_enabled = bool(rospy.get_param("~entry_enabled", True))
+        self.require_entrance_ready = bool(
+            rospy.get_param("~require_entrance_ready", True)
+        )
+        self.autostart = bool(rospy.get_param("~autostart", False))
+
+        self.lock = threading.RLock()
+        self.lifecycle = MissionLifecycle()
         self.start_time = None
-        self.scored_time = 0.0
-        self.current_floor = 0
+        self.finish_time = None
+        self.return_start_time = None
+        self.entry_start_time = None
+        self.home_pose = None
         self.finish_reason = ""
+        self.current_floor = 0
+        self.latest_pose = None
+        self.last_pose_time = rospy.Time(0)
+        self.mapping_status = None
+        self.last_mapping_status_time = rospy.Time(0)
+        self.navigation_health = None
+        self.last_navigation_health_time = rospy.Time(0)
+        self.detection_status = None
+        self.last_detection_status_time = rospy.Time(0)
+        self.remaining_frontier_count = 0
+        self.map_coverage_summary = ""
+        self.return_goal_active = False
+        self.entry_goal_active = False
+        self.entrance_ready = not self.require_entrance_ready
+        self.exploration_completion_armed = False
+        self.finalized = False
+        self.autostart_attempted = False
 
-        # 已确认的危险源列表
-        self.confirmed_dangers = []  # list of (x, y, z)
-        self.seen_detection_ids = set()
-
-        # ========== TF（用于坐标转换） ==========
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
-
-        # ========== 发布者 ==========
         self.status_pub = rospy.Publisher(
             self.mission_status_topic, MissionStatus, queue_size=10, latch=True
         )
         self.active_pub = rospy.Publisher(
             self.mission_active_topic, Bool, queue_size=10, latch=True
         )
+        self.entrance_ready_sub = rospy.Subscriber(
+            self.entrance_ready_topic, Bool, self._entrance_ready_callback, queue_size=2
+        )
 
-        # 初始状态
-        self._publish_status()
-        self.active_pub.publish(Bool(data=False))
-
-        # ========== 服务客户端 ==========
-        rospy.loginfo("[mission] Waiting for exploration services...")
-        rospy.wait_for_service(self.start_exploration_service)
         self.start_explore_client = rospy.ServiceProxy(
             self.start_exploration_service, Trigger
         )
         self.stop_explore_client = rospy.ServiceProxy(
             self.stop_exploration_service, Trigger
         )
-
         self.move_base_client = actionlib.SimpleActionClient(
             self.move_base_action_name, MoveBaseAction
         )
-        rospy.loginfo("[mission] Waiting for move_base action server...")
-        self.move_base_client.wait_for_server()
 
-        # ========== 订阅者 ==========
+        self.pose_sub = rospy.Subscriber(
+            self.pose_topic,
+            PoseWithCovarianceStamped,
+            self._pose_callback,
+            queue_size=10,
+        )
+        self.mapping_sub = rospy.Subscriber(
+            self.mapping_status_topic,
+            MappingStatus,
+            self._mapping_status_callback,
+            queue_size=10,
+        )
+        self.navigation_sub = rospy.Subscriber(
+            self.navigation_health_topic,
+            NavigationHealth,
+            self._navigation_health_callback,
+            queue_size=10,
+        )
+        self.detection_status_sub = rospy.Subscriber(
+            self.detection_status_topic,
+            DetectionStatus,
+            self._detection_status_callback,
+            queue_size=10,
+        )
+        self.exploration_status_sub = rospy.Subscriber(
+            self.exploration_status_topic,
+            String,
+            self._exploration_status_callback,
+            queue_size=10,
+        )
+        self.exploration_complete_sub = rospy.Subscriber(
+            self.exploration_complete_topic,
+            Bool,
+            self._exploration_complete_callback,
+            queue_size=2,
+        )
         self.detections_sub = rospy.Subscriber(
-            self.detections_topic, DangerSourceArray, self.detections_callback
+            self.detections_topic,
+            DangerSourceArray,
+            self._detections_callback,
+            queue_size=20,
         )
 
-        # ========== 服务 ==========
         self.start_srv = rospy.Service(
-            self.start_mission_service, Trigger, self.start_mission_cb
+            self.start_mission_service, Trigger, self._start_mission_callback
         )
         self.finish_srv = rospy.Service(
-            self.finish_mission_service, Trigger, self.finish_mission_cb
+            self.finish_mission_service, Trigger, self._finish_mission_callback
+        )
+        self.return_srv = rospy.Service(
+            self.return_home_service, Trigger, self._return_home_callback
         )
 
-        # ========== 定时器 ==========
-        self.status_timer = rospy.Timer(rospy.Duration(0.5), self._publish_status)
-
-        rospy.loginfo(f"[mission] Mission manager started, result file: {self.result_file}")
-
-    def detections_callback(self, msg):
-        """接收检测结果，融合去重"""
-        if self.mission_state != "EXPLORING":
-            return
-
-        for danger in msg.dangers:
-            # 只处理红球危险源
-            if danger.class_id != DangerSource.CLASS_DANGER_RED_SPHERE:
-                continue
-
-            # 去重：同一个detection_id不重复处理
-            if danger.detection_id in self.seen_detection_ids:
-                continue
-            self.seen_detection_ids.add(danger.detection_id)
-
-            # 坐标转换：map -> world
-            pos = danger.position
-            try:
-                # 首版world和map重合，直接使用坐标
-                wx = pos.point.x
-                wy = pos.point.y
-                wz = pos.point.z
-
-                # 空间去重
-                is_duplicate = False
-                for (dx, dy, dz) in self.confirmed_dangers:
-                    dist = math.sqrt((wx-dx)**2 + (wy-dy)**2 + (wz-dz)**2)
-                    if dist < self.dedup_distance:
-                        is_duplicate = True
-                        break
-
-                if not is_duplicate:
-                    self.confirmed_dangers.append((wx, wy, wz))
-                    rospy.loginfo(f"[mission] New danger source at ({wx:.2f}, {wy:.2f}, {wz:.2f}), total: {len(self.confirmed_dangers)}")
-
-            except Exception as e:
-                rospy.logwarn_throttle(5, f"[mission] Transform failed: {e}")
-
-    def start_mission_cb(self, req):
-        """开始任务"""
-        if self.mission_state != "IDLE" and self.mission_state != "FINISHED" and self.mission_state != "ERROR":
-            return TriggerResponse(success=False, message="Mission already running")
-
-        rospy.loginfo("[mission] Starting mission...")
-
-        # 重置状态
-        self.mission_state = "IDLE"
-        self.start_time = rospy.Time.now()
-        self.scored_time = 0.0
-        self.confirmed_dangers = []
-        self.seen_detection_ids = set()
-        self.finish_reason = ""
-
-        # 调用exploration开始
-        try:
-            resp = self.start_explore_client()
-            if not resp.success:
-                self.mission_state = "ERROR"
-                self.finish_reason = "Failed to start exploration"
-                self._publish_status()
-                return TriggerResponse(success=False, message=resp.message)
-        except Exception as e:
-            self.mission_state = "ERROR"
-            self.finish_reason = f"Start exploration error: {e}"
-            self._publish_status()
-            return TriggerResponse(success=False, message=str(e))
-
-        # 进入探索状态
-        self.mission_state = "EXPLORING"
-        self.active_pub.publish(Bool(data=True))
-        self._publish_status()
-
-        rospy.loginfo("[mission] Mission started, exploring...")
-        return TriggerResponse(success=True, message="Mission started")
-
-    def finish_mission_cb(self, req):
-        """结束任务"""
-        if self.mission_state == "FINISHED":
-            return TriggerResponse(success=True, message="Already finished")
-
-        rospy.loginfo("[mission] Finishing mission...")
-
-        # 1. 停止探索
-        try:
-            self.stop_explore_client()
-        except Exception as e:
-            rospy.logwarn(f"[mission] Stop exploration error: {e}")
-
-        # 2. 取消导航目标
-        if self.move_base_client.get_state() in [
-            actionlib.GoalStatus.ACTIVE, actionlib.GoalStatus.PENDING
-        ]:
-            self.move_base_client.cancel_goal()
-
-        # 3. 冻结时间
-        if self.start_time is not None:
-            self.scored_time = (rospy.Time.now() - self.start_time).to_sec()
-
-        # 4. 写结果文件
-        try:
-            self._write_result_file()
-        except Exception as e:
-            self.mission_state = "ERROR"
-            self.finish_reason = f"Write result failed: {e}"
-            self._publish_status()
-            self.active_pub.publish(Bool(data=False))
-            return TriggerResponse(success=False, message=str(e))
-
-        # 5. 完成
-        self.mission_state = "FINISHED"
-        self.finish_reason = "Completed"
+        self.status_timer = rospy.Timer(rospy.Duration(0.5), self._timer_callback)
+        rospy.on_shutdown(self._on_shutdown)
         self._publish_status()
         self.active_pub.publish(Bool(data=False))
+        rospy.loginfo(
+            "[mission] ready: result=%s autostart=%s",
+            self.result_file,
+            self.autostart,
+        )
 
-        rospy.loginfo(f"[mission] Mission finished in {self.scored_time:.2f}s, found {len(self.confirmed_dangers)} dangers")
-        return TriggerResponse(success=True, message=f"Finished, found {len(self.confirmed_dangers)} dangers")
+    @staticmethod
+    def _positive_param(name, default):
+        value = float(rospy.get_param(name, default))
+        if not math.isfinite(value) or value <= 0.0:
+            raise rospy.ROSInitException("%s must be positive and finite" % name)
+        return value
+
+    @staticmethod
+    def _nonnegative_param(name, default):
+        value = float(rospy.get_param(name, default))
+        if not math.isfinite(value) or value < 0.0:
+            raise rospy.ROSInitException("%s must be non-negative and finite" % name)
+        return value
+
+    @property
+    def mission_state(self):
+        return self.lifecycle.state
+
+    def _pose_callback(self, message):
+        if message.header.frame_id != self.map_frame:
+            return
+        pose = message.pose.pose
+        values = (
+            pose.position.x,
+            pose.position.y,
+            pose.position.z,
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        )
+        norm = math.sqrt(sum(float(value) ** 2 for value in values[3:]))
+        if not all(math.isfinite(float(value)) for value in values) or norm < 1e-6:
+            return
+        with self.lock:
+            self.latest_pose = copy.deepcopy(message)
+            self.last_pose_time = rospy.Time.now()
+
+    def _entrance_ready_callback(self, message):
+        with self.lock:
+            self.entrance_ready = bool(message.data)
+
+    def _mapping_status_callback(self, message):
+        with self.lock:
+            self.mapping_status = copy.deepcopy(message)
+            self.current_floor = int(message.current_floor)
+            self.last_mapping_status_time = rospy.Time.now()
+
+    def _navigation_health_callback(self, message):
+        with self.lock:
+            self.navigation_health = copy.deepcopy(message)
+            self.last_navigation_health_time = rospy.Time.now()
+
+    def _detection_status_callback(self, message):
+        with self.lock:
+            self.detection_status = copy.deepcopy(message)
+            self.last_detection_status_time = rospy.Time.now()
+
+    def _exploration_status_callback(self, message):
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError):
+            rospy.logwarn_throttle(5.0, "[mission] invalid exploration status JSON")
+            return
+        with self.lock:
+            self.remaining_frontier_count = max(
+                0, int(payload.get("remaining_frontier_count", 0))
+            )
+            ratio = payload.get("known_grid_ratio")
+            self.map_coverage_summary = (
+                "known_grid_ratio=%.3f" % float(ratio)
+                if ratio is not None and math.isfinite(float(ratio))
+                else ""
+            )
+
+    def _detections_callback(self, message):
+        with self.lock:
+            if self.mission_state != MissionLifecycle.EXPLORING:
+                return
+        for danger in message.dangers:
+            if danger.class_id != DangerSource.CLASS_DANGER_RED_SPHERE:
+                continue
+            if danger.position.header.frame_id != self.map_frame:
+                rospy.logwarn_throttle(
+                    5.0,
+                    "[mission] ignoring detection outside %s frame",
+                    self.map_frame,
+                )
+                continue
+            point = danger.position.point
+            with self.lock:
+                track = self.tracker.add(
+                    danger.detection_id,
+                    point.x,
+                    point.y,
+                    point.z,
+                    danger.floor_id,
+                    danger.confidence,
+                )
+                confirmed = (
+                    track is not None
+                    and track.count == self.tracker.min_detections
+                )
+            if confirmed:
+                rospy.loginfo(
+                    "[mission] confirmed danger floor=%d at (%.2f, %.2f, %.2f)",
+                    track.floor_id,
+                    track.x,
+                    track.y,
+                    track.z,
+                )
+
+    def _preflight_reason(self, now):
+        with self.lock:
+            pose = self.latest_pose
+            pose_time = self.last_pose_time
+            mapping = self.mapping_status
+            mapping_time = self.last_mapping_status_time
+            navigation = self.navigation_health
+            navigation_time = self.last_navigation_health_time
+            detection = self.detection_status
+            detection_time = self.last_detection_status_time
+            entrance_ready = self.entrance_ready
+        if self.require_entrance_ready and not entrance_ready:
+            return "entrance_not_ready"
+        inputs = (
+            (pose, pose_time, "pose"),
+            (mapping, mapping_time, "mapping_status"),
+            (navigation, navigation_time, "navigation_health"),
+            (detection, detection_time, "detection_status"),
+        )
+        for value, stamp, name in inputs:
+            if value is None:
+                return name + "_missing"
+            if (now - stamp).to_sec() > self.input_timeout_s:
+                return name + "_stale"
+        if not mapping.ready or not mapping.stable or mapping.lost:
+            return "mapping_not_ready"
+        if not navigation.ready:
+            return "navigation_not_ready"
+        if not detection.ready:
+            return "perception_not_ready"
+        if not self.move_base_client.wait_for_server(rospy.Duration(0.05)):
+            return "move_base_unavailable"
+        try:
+            rospy.wait_for_service(self.start_exploration_service, timeout=0.05)
+            rospy.wait_for_service(self.stop_exploration_service, timeout=0.05)
+        except rospy.ROSException:
+            return "exploration_services_unavailable"
+        return "ready"
+
+    def _wait_for_preflight(self):
+        deadline = rospy.Time.now() + rospy.Duration(self.preflight_wait_timeout_s)
+        rate = rospy.Rate(10)
+        reason = "waiting"
+        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            reason = self._preflight_reason(rospy.Time.now())
+            if reason == "ready":
+                return True, reason
+            rate.sleep()
+        return False, reason
+
+    def _start_mission_callback(self, _request):
+        return self._start_mission(wait_for_ready=True)
+
+    def _start_mission(self, wait_for_ready):
+        with self.lock:
+            if self.mission_state not in (
+                MissionLifecycle.IDLE,
+                MissionLifecycle.FINISHED,
+                MissionLifecycle.ERROR,
+            ):
+                return TriggerResponse(False, "Mission already running")
+        if wait_for_ready:
+            ready, reason = self._wait_for_preflight()
+        else:
+            reason = self._preflight_reason(rospy.Time.now())
+            ready = reason == "ready"
+        if not ready:
+            return TriggerResponse(False, "Preflight failed: " + reason)
+
+        with self.lock:
+            home_pose = copy.deepcopy(self.latest_pose)
+            self.lifecycle = MissionLifecycle()
+            self.lifecycle.start()
+            self.start_time = rospy.Time.now()
+            self.finish_time = None
+            self.return_start_time = None
+            self.entry_start_time = rospy.Time.now()
+            self.home_pose = home_pose
+            self.finish_reason = ""
+            self.tracker.reset()
+            self.return_goal_active = False
+            self.entry_goal_active = False
+            self.exploration_completion_armed = False
+            self.finalized = False
+            self.remaining_frontier_count = 0
+            self.map_coverage_summary = ""
+        self.active_pub.publish(Bool(data=True))
+        self._publish_status()
+        if self.entry_enabled:
+            success, message = self._send_entry_goal(home_pose)
+            if not success:
+                self._finalize("entry_start_failed:" + message, error=True)
+                return TriggerResponse(False, message)
+            rospy.loginfo(
+                "[mission] ENTERING; home captured, target %.2f m ahead",
+                self.entry_distance_m,
+            )
+            return TriggerResponse(True, "Mission started; entering building")
+
+        success, message = self._start_exploration()
+        if not success:
+            self._finalize("start_exploration_error:" + message, error=True)
+            return TriggerResponse(False, message)
+        return TriggerResponse(True, "Mission started")
+
+    def _send_entry_goal(self, home_pose):
+        if not self.move_base_client.wait_for_server(rospy.Duration(1.0)):
+            return False, "move_base unavailable for entry"
+        orientation = home_pose.pose.pose.orientation
+        yaw = math.atan2(
+            2.0 * (orientation.w * orientation.z + orientation.x * orientation.y),
+            1.0 - 2.0 * (orientation.y ** 2 + orientation.z ** 2),
+        )
+        goal = MoveBaseGoal()
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.header.frame_id = self.map_frame
+        goal.target_pose.pose = copy.deepcopy(home_pose.pose.pose)
+        goal.target_pose.pose.position.x += self.entry_distance_m * math.cos(yaw)
+        goal.target_pose.pose.position.y += self.entry_distance_m * math.sin(yaw)
+        self.move_base_client.send_goal(goal, done_cb=self._entry_done_callback)
+        with self.lock:
+            self.entry_goal_active = True
+        return True, "Entry goal sent"
+
+    def _entry_done_callback(self, state, _result):
+        with self.lock:
+            if self.mission_state != MissionLifecycle.ENTERING or self.finalized:
+                return
+            self.entry_goal_active = False
+        if state != GoalStatus.SUCCEEDED:
+            self._finalize("entry_failed_action_state_%d" % state, error=True)
+            return
+        success, message = self._start_exploration()
+        if not success:
+            self._finalize("start_exploration_error:" + message, error=True)
+
+    def _start_exploration(self):
+        try:
+            response = self.start_explore_client()
+        except rospy.ServiceException as exc:
+            return False, str(exc)
+        if not response.success:
+            return False, response.message
+        with self.lock:
+            if not self.lifecycle.begin_exploration():
+                return False, "Mission is not entering"
+            self.entry_start_time = None
+            # A successful start service response establishes a new exploration
+            # session even when its latched false marker arrives asynchronously.
+            self.exploration_completion_armed = True
+        self._publish_status()
+        rospy.loginfo("[mission] EXPLORING; home pose captured in %s", self.map_frame)
+        return True, "Exploration started"
+
+    def _exploration_complete_callback(self, message):
+        with self.lock:
+            if self.mission_state != MissionLifecycle.EXPLORING:
+                return
+            if not message.data:
+                # Exploration publishes false at the beginning of every session.
+                # Requiring it prevents an old latched true from ending a new run.
+                self.exploration_completion_armed = True
+                return
+            armed = self.exploration_completion_armed
+        if not armed:
+            rospy.logwarn_throttle(
+                2.0, "[mission] ignoring stale exploration completion"
+            )
+            return
+        self._begin_return("exploration_complete")
+
+    def _finish_mission_callback(self, _request):
+        with self.lock:
+            state = self.mission_state
+        if state == MissionLifecycle.FINISHED:
+            return TriggerResponse(True, "Mission already finished")
+        if state == MissionLifecycle.RETURNING:
+            return TriggerResponse(True, "Return already in progress")
+        if state not in (MissionLifecycle.ENTERING, MissionLifecycle.EXPLORING):
+            return TriggerResponse(False, "No active mission")
+        success, message = self._begin_return("manual_finish_requested")
+        return TriggerResponse(success, message)
+
+    def _return_home_callback(self, _request):
+        with self.lock:
+            state = self.mission_state
+        if state == MissionLifecycle.RETURNING:
+            return TriggerResponse(True, "Return already in progress")
+        if state not in (MissionLifecycle.ENTERING, MissionLifecycle.EXPLORING):
+            return TriggerResponse(False, "No active mission")
+        success, message = self._begin_return("return_home_requested")
+        return TriggerResponse(success, message)
+
+    def _begin_return(self, reason):
+        with self.lock:
+            if self.mission_state == MissionLifecycle.RETURNING:
+                return True, "Return already in progress"
+            if not self.lifecycle.begin_return():
+                return False, "Mission is not active"
+            home_pose = copy.deepcopy(self.home_pose)
+            self.return_start_time = rospy.Time.now()
+            self.finish_reason = reason
+            self.return_goal_active = False
+            self.entry_goal_active = False
+            self.exploration_completion_armed = False
+        try:
+            self.stop_explore_client()
+        except rospy.ServiceException as exc:
+            rospy.logwarn("[mission] stop exploration failed: %s", str(exc))
+
+        if home_pose is None:
+            self._finalize("home_pose_missing", error=True)
+            return False, "Home pose missing"
+        if not self.move_base_client.wait_for_server(rospy.Duration(1.0)):
+            self._finalize("move_base_unavailable_for_return", error=True)
+            return False, "move_base unavailable"
+
+        goal = MoveBaseGoal()
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.header.frame_id = self.map_frame
+        goal.target_pose.pose = copy.deepcopy(home_pose.pose.pose)
+        self.move_base_client.send_goal(goal, done_cb=self._return_done_callback)
+        with self.lock:
+            self.return_goal_active = True
+        self._publish_status()
+        rospy.loginfo("[mission] RETURNING to captured home pose: %s", reason)
+        return True, "Return started"
+
+    def _return_done_callback(self, state, _result):
+        with self.lock:
+            if self.mission_state != MissionLifecycle.RETURNING or self.finalized:
+                return
+            self.return_goal_active = False
+        if state == GoalStatus.SUCCEEDED:
+            self._finalize("completed", error=False)
+        else:
+            self._finalize("return_failed_action_state_%d" % state, error=True)
+
+    def _timer_callback(self, _event=None):
+        now = rospy.Time.now()
+        with self.lock:
+            state = self.mission_state
+            start_time = self.start_time
+            return_start_time = self.return_start_time
+            entry_start_time = self.entry_start_time
+            should_autostart = (
+                self.autostart
+                and not self.autostart_attempted
+                and state == MissionLifecycle.IDLE
+            )
+        if should_autostart and self._preflight_reason(now) == "ready":
+            with self.lock:
+                self.autostart_attempted = True
+            response = self._start_mission(wait_for_ready=False)
+            if not response.success:
+                rospy.logerr("[mission] autostart failed: %s", response.message)
+        elif (
+            state == MissionLifecycle.ENTERING
+            and entry_start_time is not None
+            and (now - entry_start_time).to_sec() >= self.entry_timeout_s
+        ):
+            self.move_base_client.cancel_goal()
+            self._finalize("entry_timeout", error=True)
+        elif (
+            state == MissionLifecycle.EXPLORING
+            and self.mission_timeout_s > 0.0
+            and start_time is not None
+            and (now - start_time).to_sec() >= self.mission_timeout_s
+        ):
+            self._begin_return("mission_timeout")
+        elif (
+            state == MissionLifecycle.RETURNING
+            and return_start_time is not None
+            and (now - return_start_time).to_sec() >= self.return_timeout_s
+        ):
+            self.move_base_client.cancel_goal()
+            self._finalize("return_timeout", error=True)
+        self._publish_status()
+
+    def _finalize(self, reason, error):
+        with self.lock:
+            if self.finalized:
+                return
+            self.finalized = True
+            self.finish_time = rospy.Time.now()
+            self.finish_reason = reason
+            if error:
+                self.lifecycle.fail()
+            else:
+                self.lifecycle.finish()
+        try:
+            self._write_result_file()
+        except (OSError, ValueError) as exc:
+            with self.lock:
+                self.finish_reason = "result_write_failed:" + str(exc)
+                self.lifecycle.fail()
+            rospy.logerr("[mission] result write failed: %s", str(exc))
+        self.active_pub.publish(Bool(data=False))
+        self._publish_status()
+        rospy.loginfo(
+            "[mission] %s: reason=%s confirmed=%d result=%s",
+            self.mission_state,
+            self.finish_reason,
+            len(self.tracker.confirmed_tracks()),
+            self.result_file,
+        )
 
     def _write_result_file(self):
-        """写结果文件（原子写入）"""
-        result = {
-            "exploration_time": round(self.scored_time, 2),
-            "detected_danger_sources": [
-                {"position": [round(x, 2), round(y, 2), round(z, 2)]}
-                for (x, y, z) in self.confirmed_dangers
-            ]
-        }
+        with self.lock:
+            home = copy.deepcopy(self.home_pose)
+            tracks = list(self.tracker.confirmed_tracks())
+            start_time = self.start_time
+            finish_time = self.finish_time or rospy.Time.now()
+        if home is None or start_time is None:
+            raise ValueError("mission start pose/time unavailable")
+        orientation = home.pose.pose.orientation
+        yaw = math.atan2(
+            2.0 * (orientation.w * orientation.z + orientation.x * orientation.y),
+            1.0 - 2.0 * (orientation.y ** 2 + orientation.z ** 2),
+        )
+        home_position = home.pose.pose.position
+        result = build_result_document(
+            tracks,
+            (home_position.x, home_position.y, home_position.z, yaw),
+            (finish_time - start_time).to_sec(),
+        )
+        directory = os.path.dirname(self.result_file)
+        os.makedirs(directory, exist_ok=True)
+        temporary = self.result_file + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(result, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, self.result_file)
 
-        # 确保目录存在
-        dirname = os.path.dirname(self.result_file)
-        if dirname and not os.path.exists(dirname):
-            os.makedirs(dirname)
+    def _publish_status(self):
+        now = rospy.Time.now()
+        with self.lock:
+            state = self.mission_state
+            start_time = self.start_time
+            finish_time = self.finish_time
+            navigation = self.navigation_health
+            current_floor = self.current_floor
+            remaining = self.remaining_frontier_count
+            coverage = self.map_coverage_summary
+            finish_reason = self.finish_reason
+        message = MissionStatus()
+        message.header.stamp = now
+        message.header.frame_id = self.map_frame
+        message.mission_state = state
+        message.current_floor = current_floor
+        if start_time is not None:
+            message.start_time = start_time
+            end = finish_time if finish_time is not None else now
+            elapsed = end - start_time
+            message.elapsed_time = elapsed
+            message.scored_exploration_time = elapsed
+        if navigation is not None:
+            message.active_goal_id = navigation.active_goal_id
+        message.map_coverage_summary = coverage
+        message.remaining_frontier_count = remaining
+        message.finish_reason = finish_reason
+        self.status_pub.publish(message)
 
-        # 原子写入：先写临时文件再rename
-        tmp_file = self.result_file + ".tmp"
-        with open(tmp_file, "w") as f:
-            json.dump(result, f, indent=2)
-        os.rename(tmp_file, self.result_file)
-
-        rospy.loginfo(f"[mission] Result written to {self.result_file}")
-
-    def _publish_status(self, event=None):
-        """发布任务状态"""
-        msg = MissionStatus()
-        msg.header.stamp = rospy.Time.now()
-        msg.mission_state = self.mission_state
-        msg.current_floor = self.current_floor
-        if self.start_time is not None:
-            msg.start_time = self.start_time
-            if self.mission_state == "EXPLORING":
-                msg.elapsed_time = rospy.Time.now() - self.start_time
-                msg.scored_exploration_time = msg.elapsed_time
-            else:
-                msg.elapsed_time = rospy.Duration(self.scored_time)
-                msg.scored_exploration_time = rospy.Duration(self.scored_time)
-        msg.finish_reason = self.finish_reason
-        self.status_pub.publish(msg)
+    def _on_shutdown(self):
+        with self.lock:
+            active = self.mission_state in (
+                MissionLifecycle.EXPLORING,
+                MissionLifecycle.ENTERING,
+                MissionLifecycle.RETURNING,
+            )
+        if active:
+            self.move_base_client.cancel_all_goals()
 
     def run(self):
         rospy.spin()
@@ -291,7 +712,6 @@ class MissionManager:
 
 if __name__ == "__main__":
     try:
-        node = MissionManager()
-        node.run()
+        MissionManager().run()
     except rospy.ROSInterruptException:
         pass

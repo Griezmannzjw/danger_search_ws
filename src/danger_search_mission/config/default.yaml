@@ -3,20 +3,39 @@
 
 # 坐标系
 map_frame: map
-world_frame: world
 
 # 话题和服务
+pose_topic: /localization/pose
 detections_topic: /danger_detector/detections
+detection_status_topic: /danger_detector/status
 mapping_status_topic: /mapping/status
 navigation_health_topic: /navigation/health
+exploration_status_topic: /exploration/status
+exploration_complete_topic: /exploration/complete
 mission_status_topic: /mission/status
 mission_active_topic: /mission/active
+entrance_ready_topic: /entrance/ready
 start_exploration_service: /danger_search/start_exploration
 stop_exploration_service: /danger_search/stop_exploration
 start_mission_service: /danger_search/start
 finish_mission_service: /danger_search/finish
+return_home_service: /danger_search/return_home
 move_base_action_name: /move_base
 
-# 结果文件（绝对路径）
-result_file: /home/$USER/SimEnv/results/detected_danger.json
+# 由 launch 根据同级 SimEnv 自动生成绝对路径，也可在启动时覆盖。
+result_file: ""
+
+# 多帧确认与任务时序
 dedup_distance: 0.8
+min_detections: 3
+min_confidence: 0.60
+input_timeout_s: 2.0
+preflight_wait_timeout_s: 20.0
+# 0 表示不设任务总时限。600 秒只是满分线，不是停止条件。
+mission_timeout_s: 0.0
+entry_enabled: true
+entry_distance_m: 4.2
+entry_timeout_s: 90.0
+require_entrance_ready: true
+return_timeout_s: 120.0
+autostart: false

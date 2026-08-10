@@ -1,8 +1,17 @@
 <launch>
   <arg name="config_file" default="$(find danger_search_mission)/config/default.yaml" />
+  <!-- 默认支持 SimEnv 与 danger_search_ws 位于同一父目录。其他布局只需覆盖 simenv_root。 -->
+  <arg name="simenv_root" default="$(find danger_search_mission)/../../../SimEnv" />
+  <arg name="result_file" default="$(arg simenv_root)/results/detected_danger.json" />
+  <arg name="autostart" default="false" />
+  <!-- 独立调试通常不启动 bringup 的开门节点；正式 competition.launch 仍强制等待。 -->
+  <arg name="require_entrance_ready" default="false" />
 
-  <rosparam command="load" file="$(arg config_file)" />
-
-  <node name="mission_manager" pkg="danger_search_mission" type="mission_manager.py" output="screen">
+  <node name="mission" pkg="danger_search_mission" type="mission_manager.py" output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <!-- 必须位于 rosparam 后，以便 launch 参数覆盖 YAML 默认值。 -->
+    <param name="result_file" value="$(arg result_file)" />
+    <param name="autostart" value="$(arg autostart)" />
+    <param name="require_entrance_ready" value="$(arg require_entrance_ready)" />
   </node>
 </launch>

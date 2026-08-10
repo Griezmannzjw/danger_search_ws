@@ -40,8 +40,10 @@ start_exploration_service: /danger_search/start_exploration
 stop_exploration_service: /danger_search/stop_exploration
 start_mission_service: /danger_search/start
 finish_mission_service: /danger_search/finish
+return_home_service: /danger_search/return_home
+exploration_status_topic: /exploration/status
+exploration_complete_topic: /exploration/complete
 
 # ========== 任务参数 ==========
-# 结果文件绝对路径（部署时根据实际用户名修改）
-result_file: /home/$USER/SimEnv/results/detected_danger.json
+# result_file 由 competition.launch 根据 simenv_root 生成，避免写死用户名。
 dedup_distance: 0.8

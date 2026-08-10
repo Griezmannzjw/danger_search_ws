@@ -1,0 +1,16 @@
+<launch>
+  <node name="mission" pkg="danger_search_mission" type="mission_manager.py" output="screen">
+    <rosparam command="load" file="$(find danger_search_mission)/config/default.yaml" />
+    <param name="result_file" value="/tmp/danger_search_mission_smoke/detected_danger.json" />
+    <param name="autostart" value="false" />
+    <param name="min_detections" value="2" />
+    <param name="preflight_wait_timeout_s" value="3.0" />
+    <param name="input_timeout_s" value="1.0" />
+    <param name="return_timeout_s" value="3.0" />
+  </node>
+
+  <test test-name="mission_smoke"
+        pkg="danger_search_mission"
+        type="mission_smoke_test.py"
+        time-limit="20.0" />
+</launch>

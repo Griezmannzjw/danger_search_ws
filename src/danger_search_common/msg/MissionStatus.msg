@@ -1,7 +1,7 @@
 # 任务状态
 std_msgs/Header header
 
-string mission_state                    # IDLE/EXPLORING/RETURNING/FINISHED/ERROR 等
+string mission_state                    # IDLE/ENTERING/EXPLORING/RETURNING/FINISHED/ERROR
 int32 current_floor                     # 当前楼层
 time start_time                         # 任务开始时间
 duration elapsed_time                   # 已耗时

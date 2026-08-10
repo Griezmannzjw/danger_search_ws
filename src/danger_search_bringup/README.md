@@ -1,73 +1,67 @@
 # danger_search_bringup
 
-系统集成启动包。
+P0 系统集成启动包。`competition.launch` 一次装配 localization、perception、navigation、
+exploration、control 和 mission，共九个运行节点。
 
-## 职责
+## 默认目录约定
 
-1. 提供统一的启动入口（launch 文件）
-2. 维护全局配置参数
-3. 各模块的组合启动方案
+为让队员克隆后尽量零配置，默认约定两个仓库位于同一父目录：
 
-## 启动文件
-
-### competition.launch
-**完整比赛启动文件**，启动所有模块。
-
-```bash
-roslaunch danger_search_bringup competition.launch
+```text
+myProject/
+├── SimEnv/
+└── danger_search_ws/
 ```
 
-参数：
-- `result_file`：结果输出路径
-- `autostart`：是否自动开始任务（默认 false）
+launch 会从自身 ROS 包路径推导同级 `SimEnv`，结果默认写入：
 
-### perception_only.launch
-仅启动感知模块，用于单独调试视觉识别。
-
-### navigation_only.launch
-仅启动导航 + 探索 + 定位 + 控制，用于单独调试运动。
-
-## 全局配置
-
-`config/global.yaml`：所有模块共享的基础参数
-- 坐标系名称约定
-- 传感器话题名称（与 SimEnv 对齐）
-- 机器人初始位姿
-- 结果输出路径
-
-## 使用流程
-
-### 1. 先启动仿真环境
-```bash
-cd ~/SimEnv
-./auto.sh
-# 终端按 2 站立，按 6 切换到 /cmd_vel 模式
+```text
+SimEnv/results/detected_danger.json
 ```
 
-### 2. 启动算法框架
+## 参数
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `simenv_root` | 自动查找同级 `SimEnv` | 不同部署布局只需覆盖这一项 |
+| `result_file` | `$(arg simenv_root)/results/detected_danger.json` | 可选的完整结果文件覆盖 |
+| `autostart` | `false` | 为 true 时所有预检就绪后自动开始任务 |
+| `open_main_entrance` | `true` | 调用官方服务实际打开主入口；仅隔离调试时关闭 |
+
+零配置启动：
+
 ```bash
-cd ~/danger_search_ws
-source devel/setup.bash
-roslaunch danger_search_bringup competition.launch
+roslaunch danger_search_bringup competition.launch autostart:=true
 ```
 
-### 3. 开始任务
+赛事组若把 SimEnv 放在其他位置：
+
+```bash
+roslaunch danger_search_bringup competition.launch \
+  autostart:=true simenv_root:=/absolute/path/to/SimEnv
+```
+
+## P0 推荐流程
+
+1. 以单楼层、关闭 referee odom 和真值点云变换的方式启动 SimEnv；
+2. 在 junior_ctrl 终端按 `2` 站立，再按 `6` 进入 `/cmd_vel` 模式；
+3. 启动 `competition.launch autostart:=true`；
+4. bringup 调用官方门服务打开 `main_entrance`；
+5. mission 在门外记录出生点并自动进入建筑，再进入 `EXPLORING`；
+6. exploration 收敛后自动进入 `RETURNING`，返回门外出生点；
+7. 返回起点后自动写结果并进入 `FINISHED`。
+
+如果 `autostart:=false`，第 3 步后手动调用一次：
+
 ```bash
 rosservice call /danger_search/start "{}"
 ```
 
-### 4. 结束任务并输出结果
-```bash
-rosservice call /danger_search/finish "{}"
-```
+任务开始后无需调用 finish。`/danger_search/finish` 仅用于调试时提前结束探索，它也会先
+执行返航，不会直接跳过返航写结果。
 
-结果自动写入 `results/detected_danger.json`。
+## 其他启动文件
 
-## 模块启动顺序
-
-1. localization（定位建图）
-2. perception（危险源感知）
-3. navigation（导航控制）
-4. exploration（探索规划）
-5. control（速度仲裁）
-6. mission（任务总控）
+- `perception_only.launch`：感知模块隔离调试；
+- `navigation_only.launch`：定位、导航、探索和控制联调；
+- `competition.launch`：P0 完整系统唯一正式入口。
