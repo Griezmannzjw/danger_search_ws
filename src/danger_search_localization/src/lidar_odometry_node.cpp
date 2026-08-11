@@ -79,14 +79,6 @@ class LidarOdometryNode {
                       config_.translation_deadband_m, 0.015);
     private_nh_.param("lidar_odom_rotation_deadband_rad",
                       config_.rotation_deadband_rad, 0.008);
-    private_nh_.param("lidar_odom_motion_confirmation_translation_m",
-                      config_.motion_confirmation_translation_m, 0.03);
-    private_nh_.param("lidar_odom_motion_confirmation_rotation_rad",
-                      config_.motion_confirmation_rotation_rad, 0.02);
-    private_nh_.param("lidar_odom_motion_consistency_translation_m",
-                      config_.motion_consistency_translation_m, 0.10);
-    private_nh_.param("lidar_odom_motion_consistency_rotation_rad",
-                      config_.motion_consistency_rotation_rad, 0.12);
     private_nh_.param("lidar_odom_candidate_fitness_slack",
                       config_.candidate_fitness_slack, 0.005);
     private_nh_.param("lidar_odom_imu_yaw_tolerance_rad",
@@ -264,22 +256,6 @@ class LidarOdometryNode {
     return true;
   }
 
-  bool ImuStationary(const ros::Time& stamp) {
-    std::lock_guard<std::mutex> lock(imu_mutex_);
-    if (imu_samples_.empty()) return false;
-    const auto sample = std::min_element(
-        imu_samples_.begin(), imu_samples_.end(),
-        [&stamp](const ImuSample& left, const ImuSample& right) {
-          return std::abs(left.stamp_s - stamp.toSec()) <
-                 std::abs(right.stamp_s - stamp.toSec());
-        });
-    if (std::abs(sample->stamp_s - stamp.toSec()) > imu_fresh_timeout_s_) {
-      return false;
-    }
-    return stamp.toSec() - last_motion_excitation_stamp_s_ >=
-           imu_motion_excitation_hold_s_;
-  }
-
   Cloud::Ptr PrepareCloud(const sensor_msgs::PointCloud& message,
                           double* base_heading_rad) {
     geometry_msgs::TransformStamped transform;
@@ -322,6 +298,22 @@ class LidarOdometryNode {
       return Cloud::Ptr();
     }
     return VoxelFilter(unfiltered);
+  }
+
+  bool ImuStationary(const ros::Time& stamp) {
+    std::lock_guard<std::mutex> lock(imu_mutex_);
+    if (imu_samples_.empty()) return false;
+    const auto sample = std::min_element(
+        imu_samples_.begin(), imu_samples_.end(),
+        [&stamp](const ImuSample& left, const ImuSample& right) {
+          return std::abs(left.stamp_s - stamp.toSec()) <
+                 std::abs(right.stamp_s - stamp.toSec());
+        });
+    if (std::abs(sample->stamp_s - stamp.toSec()) > imu_fresh_timeout_s_) {
+      return false;
+    }
+    return stamp.toSec() - last_motion_excitation_stamp_s_ >=
+           imu_motion_excitation_hold_s_;
   }
 
   Cloud::Ptr VoxelFilter(const Cloud::Ptr& input) const {
@@ -387,15 +379,8 @@ class LidarOdometryNode {
                         result.reason.c_str());
       return;
     }
-    if (result.outcome == LidarOdometryCore::Outcome::kPendingMotion) {
-      ROS_WARN_THROTTLE(
-          1.0,
-          "[localization] GICP motion awaiting confirmation: %s "
-          "translation=%.3f rotation=%.3f",
-          result.reason.c_str(), result.registration.translation,
-          result.registration.rotation);
-    } else if (result.outcome == LidarOdometryCore::Outcome::kRejected ||
-               result.outcome == LidarOdometryCore::Outcome::kRebaseline) {
+    if (result.outcome == LidarOdometryCore::Outcome::kRejected ||
+        result.outcome == LidarOdometryCore::Outcome::kRebaseline) {
       ROS_ERROR_THROTTLE(
           1.0,
           "[localization] GICP rejected (%s): converged=%d fitness=%.3f "

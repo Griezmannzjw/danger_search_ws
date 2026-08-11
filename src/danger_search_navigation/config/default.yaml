@@ -43,7 +43,9 @@ lidar_z: 0.08
 lidar_roll: 0.00
 lidar_pitch: 0.785
 lidar_yaw: 0.00
-obstacle_min_z: -0.30
+# Ground returns cluster near -0.24 m in base. Keep only obstacles that rise
+# into the robot body envelope so ground samples cannot seal the local plan.
+obstacle_min_z: -0.10
 obstacle_max_z: 0.80
 obstacle_range_min: 0.15
 obstacle_range_max: 8.00

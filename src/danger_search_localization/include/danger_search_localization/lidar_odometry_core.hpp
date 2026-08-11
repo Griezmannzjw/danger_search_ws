@@ -46,10 +46,6 @@ class LidarOdometryCore {
     double rotation_margin_rad = 0.06;
     double translation_deadband_m = 0.015;
     double rotation_deadband_rad = 0.008;
-    double motion_confirmation_translation_m = 0.03;
-    double motion_confirmation_rotation_rad = 0.02;
-    double motion_consistency_translation_m = 0.10;
-    double motion_consistency_rotation_rad = 0.12;
     double candidate_fitness_slack = 0.005;
     double imu_yaw_tolerance_rad = 0.20;
     int min_points = 100;
@@ -75,7 +71,6 @@ class LidarOdometryCore {
   enum class Outcome {
     kBootstrap,
     kAccepted,
-    kPendingMotion,
     kRejected,
     kRebaseline,
     kInvalidInput,
@@ -124,9 +119,6 @@ class LidarOdometryCore {
       return output;
     }
 
-    const double input_dt = last_input_stamp_s_ > 0.0
-                                ? stamp_s - last_input_stamp_s_
-                                : config_.max_gate_dt_s;
     last_input_stamp_s_ = stamp_s;
     if (!reference_) {
       Rebaseline(current, stamp_s, imu_heading_valid, imu_heading_rad);
@@ -156,16 +148,18 @@ class LidarOdometryCore {
 
     const Cloud::Ptr target = BuildSubmap();
     output.target_points = target->size();
-    const double gate_dt = std::min(input_dt, config_.max_gate_dt_s);
-    const double confirmation_scale = pending_motion_ ? 2.0 : 1.0;
+    // Registration is always current -> trusted reference.  Pending and
+    // rejected frames do not advance that reference, so the admissible motion
+    // must use the elapsed reference time rather than the last input interval.
+    // The hard per-step limits still reject implausible jumps.
+    const double gate_dt = std::min(
+        std::max(0.0, stamp_s - reference_stamp_s_), config_.max_gate_dt_s);
     output.translation_limit = std::min(
         config_.max_step_translation_m,
-        confirmation_scale *
-            (config_.translation_margin_m + config_.max_linear_speed_mps * gate_dt));
+        config_.translation_margin_m + config_.max_linear_speed_mps * gate_dt);
     output.rotation_limit = std::min(
         config_.max_step_rotation_rad,
-        confirmation_scale *
-            (config_.rotation_margin_rad + config_.max_angular_speed_rps * gate_dt));
+        config_.rotation_margin_rad + config_.max_angular_speed_rps * gate_dt);
 
     const bool imu_delta_valid =
         imu_heading_valid && trusted_imu_heading_valid_ &&
@@ -196,14 +190,11 @@ class LidarOdometryCore {
 
     if (!PassesAllGates(best, output.translation_limit, output.rotation_limit) ||
         !PassesImuYawGate(best, imu_delta_valid)) {
-      // A standing quadruped can produce a geometrically plausible false XY
-      // shift as its body settles. IMU-confirmed stationarity is allowed to
-      // override only the dt-based motion gate: all registration quality,
-      // transform, vertical, and absolute per-step limits still apply. Keep the
-      // trusted submap unchanged so the conflicting scan cannot contaminate it.
+      // The standing Livox pattern changes between frames and can yield a
+      // plausible planar shift.  IMU stationarity may suppress that shift only
+      // when registration geometry and the absolute hard limits remain valid.
       if (imu_stationary && PassesStationaryHoldGates(best) &&
           PassesImuYawGate(best, imu_delta_valid)) {
-        pending_motion_ = false;
         last_increment_.setIdentity();
         reference_stamp_s_ = stamp_s;
         consecutive_failures_ = 0;
@@ -220,7 +211,6 @@ class LidarOdometryCore {
         PopulateState(&output);
         return output;
       }
-      pending_motion_ = false;
       ++consecutive_failures_;
       recovery_accepts_ = 0;
       output.publish = true;
@@ -240,34 +230,22 @@ class LidarOdometryCore {
     }
 
     Eigen::Isometry3d accepted_delta = best.delta;
-    if (imu_stationary) accepted_delta.setIdentity();
-    else if (imu_delta_valid) {
+    if (imu_stationary) {
+      accepted_delta.setIdentity();
+    } else if (imu_delta_valid) {
       accepted_delta.linear() =
           Eigen::AngleAxisd(expected_yaw, Eigen::Vector3d::UnitZ())
               .toRotationMatrix();
     }
-
-    if (IsNontrivial(accepted_delta)) {
-      if (!pending_motion_) {
-        pending_motion_ = true;
-        pending_motion_delta_ = accepted_delta;
-        output.outcome = Outcome::kPendingMotion;
-        output.publish = true;
-        output.reason = "MOTION_CONFIRMATION_PENDING";
-        PopulateState(&output);
-        return output;
-      }
-      if (!MotionConsistent(pending_motion_delta_, accepted_delta)) {
-        pending_motion_delta_ = accepted_delta;
-        output.outcome = Outcome::kPendingMotion;
-        output.publish = true;
-        output.reason = "MOTION_CONFIRMATION_RESTARTED";
-        PopulateState(&output);
-        return output;
-      }
+    if (accepted_delta.translation().head<2>().norm() <=
+        config_.translation_deadband_m) {
+      accepted_delta.translation().x() = 0.0;
+      accepted_delta.translation().y() = 0.0;
+    }
+    if (std::abs(Yaw(accepted_delta)) <= config_.rotation_deadband_rad) {
+      accepted_delta.linear().setIdentity();
     }
 
-    pending_motion_ = false;
     const Eigen::Isometry3d increment = accepted_delta;
     const Eigen::Isometry3d candidate_pose = matching_pose_ * increment;
     if (!IsPoseValid(candidate_pose)) {
@@ -281,9 +259,7 @@ class LidarOdometryCore {
     }
 
     matching_pose_ = candidate_pose;
-    if (IsNontrivial(increment)) {
-      published_pose_ = matching_pose_;
-    }
+    published_pose_ = matching_pose_;
     last_increment_ = increment;
     reference_ = current;
     reference_stamp_s_ = stamp_s;
@@ -298,10 +274,7 @@ class LidarOdometryCore {
     output.outcome = Outcome::kAccepted;
     output.publish = true;
     output.healthy = recovery_accepts_ >= config_.recovery_consecutive_accepts;
-    output.reason = output.healthy
-                        ? (imu_stationary ? "ACCEPTED_IMU_STATIONARY_HOLD"
-                                          : "ACCEPTED")
-                        : "RECOVERING";
+    output.reason = output.healthy ? "ACCEPTED" : "RECOVERING";
     PopulateState(&output);
     return output;
   }
@@ -319,7 +292,6 @@ class LidarOdometryCore {
   int consecutive_failures() const { return consecutive_failures_; }
   int recovery_accepts() const { return recovery_accepts_; }
   std::size_t history_size() const { return history_.size(); }
-  bool pending_motion() const { return pending_motion_; }
 
  private:
   struct HistoryEntry {
@@ -362,10 +334,6 @@ class LidarOdometryCore {
         config_.translation_margin_m < 0.0 || config_.rotation_margin_rad < 0.0 ||
         config_.translation_deadband_m < 0.0 ||
         config_.rotation_deadband_rad < 0.0 ||
-        config_.motion_confirmation_translation_m < 0.0 ||
-        config_.motion_confirmation_rotation_rad < 0.0 ||
-        config_.motion_consistency_translation_m < 0.0 ||
-        config_.motion_consistency_rotation_rad < 0.0 ||
         config_.candidate_fitness_slack < 0.0 ||
         config_.imu_yaw_tolerance_rad <= 0.0 ||
         config_.imu_yaw_tolerance_rad > std::acos(-1.0) ||
@@ -386,8 +354,6 @@ class LidarOdometryCore {
     reference_ = cloud;
     reference_stamp_s_ = stamp_s;
     last_increment_.setIdentity();
-    pending_motion_ = false;
-    pending_motion_delta_.setIdentity();
     consecutive_failures_ = 0;
     recovery_accepts_ = 0;
     history_.clear();
@@ -462,11 +428,9 @@ class LidarOdometryCore {
   static Cloud::Ptr Se2RegistrationCloud(const Cloud::Ptr& cloud) {
     if (!cloud) return Cloud::Ptr();
     Cloud::Ptr weighted(new Cloud(*cloud));
-    // Preserve a small vertical spread so PCL GICP covariance estimation does
-    // not become singular, while preventing Livox height-layer changes from
-    // dominating the SE(2) correspondence search.
-    constexpr float kVerticalScale = 0.05F;
-    for (auto& point : weighted->points) point.z *= kVerticalScale;
+    // P0 odometry is planar. Consecutive Livox frames sample different height
+    // layers, so retained Z weight can be explained by a false XY shift.
+    for (auto& point : weighted->points) point.z = 0.0F;
     return weighted;
   }
 
@@ -629,29 +593,6 @@ class LidarOdometryCore {
     return predicted;
   }
 
-  bool IsNontrivial(const Eigen::Isometry3d& transform) const {
-    return transform.translation().head<2>().norm() >
-               config_.motion_confirmation_translation_m ||
-           std::abs(Yaw(transform)) >
-               config_.motion_confirmation_rotation_rad;
-  }
-
-  bool MotionConsistent(const Eigen::Isometry3d& first,
-                        const Eigen::Isometry3d& second) const {
-    const Eigen::Isometry3d difference = first.inverse() * second;
-    const Eigen::Vector2d first_translation = first.translation().head<2>();
-    const Eigen::Vector2d second_translation = second.translation().head<2>();
-    const bool direction_consistent =
-        first_translation.norm() < config_.motion_confirmation_translation_m ||
-        second_translation.norm() < config_.motion_confirmation_translation_m ||
-        first_translation.dot(second_translation) >= 0.0;
-    return direction_consistent &&
-           difference.translation().head<2>().norm() <=
-               config_.motion_consistency_translation_m &&
-           std::abs(Yaw(difference)) <=
-               config_.motion_consistency_rotation_rad;
-  }
-
   static double Yaw(const Eigen::Isometry3d& transform) {
     return std::atan2(transform.rotation()(1, 0),
                       transform.rotation()(0, 0));
@@ -714,8 +655,6 @@ class LidarOdometryCore {
   double last_input_stamp_s_ = 0.0;
   int consecutive_failures_ = 0;
   int recovery_accepts_ = 0;
-  bool pending_motion_ = false;
-  Eigen::Isometry3d pending_motion_delta_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d matching_pose_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d published_pose_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d last_increment_ = Eigen::Isometry3d::Identity();
