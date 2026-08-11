@@ -94,13 +94,16 @@ ENABLE_REALSENSE=1 \
 ENABLE_POINTCLOUD_CONVERTER=0 \
 POINTCLOUD_USE_GROUND_TRUTH_ODOM=0 \
 ENABLE_REFEREE_ODOM=0 \
-ENABLE_GROUND_TRUTH=0 \
+ENABLE_GROUND_TRUTH=1 \
 ./auto.sh
 ```
 
-这组参数保留 P0 必需的 Livox 点云、机身 IMU 和 RealSense RGB-D，关闭算法不使用的
-Livox IMU、真值位姿和点云真值转换。终端摘要中应显示 `Ground truth topics: false`、
-`Referee odom: false`、`PointCloud2 converter: false`。
+这组参数保留 P0 必需的 Livox 点云、机身 IMU 和 RealSense RGB-D。当前 SimEnv 的
+model-based 模式 `6` 会在底层步态控制器内部订阅 `/ground_truth/base_w`、
+`/ground_truth/base_trunk` 和足端状态，因此必须设置 `ENABLE_GROUND_TRUTH=1`；
+`danger_search_ws` 的定位、建图、导航、探索、感知和 mission 均不得订阅这些话题。
+算法侧仍关闭 referee odom 和真值点云转换。终端摘要中应显示
+`Ground truth topics: true`、`Referee odom: false`、`PointCloud2 converter: false`。
 
 等待终端出现以下含义相同的信息：
 

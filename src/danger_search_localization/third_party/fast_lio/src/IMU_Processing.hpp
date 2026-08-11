@@ -49,6 +49,11 @@ class ImuProcess
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
+  void set_initialization_stationarity(double hold_seconds,
+                                       double max_gyro_rps,
+                                       double max_accel_spread_mps2,
+                                       double accel_norm_tolerance_mps2,
+                                       int min_samples);
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
@@ -64,6 +69,8 @@ class ImuProcess
 
  private:
   void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
+  bool InitializationBundleIsStationary(const MeasureGroup &meas) const;
+  void RestartInitialization(const MeasureGroup &meas);
   void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
 
   PointCloudXYZI::Ptr cur_pcl_un_;
@@ -79,13 +86,20 @@ class ImuProcess
   V3D acc_s_last;
   double start_timestamp_;
   double last_lidar_end_time_;
+  double initialization_stationary_start_time_;
+  double initialization_hold_seconds_ = 1.0;
+  double initialization_max_gyro_rps_ = 0.05;
+  double initialization_max_accel_spread_mps2_ = 0.15;
+  double initialization_accel_norm_tolerance_mps2_ = 0.35;
+  int initialization_min_samples_ = 100;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
 };
 
 ImuProcess::ImuProcess()
-    : b_first_frame_(true), imu_need_init_(true), start_timestamp_(-1)
+    : b_first_frame_(true), imu_need_init_(true), start_timestamp_(-1),
+      last_lidar_end_time_(-1.0), initialization_stationary_start_time_(-1.0)
 {
   init_iter_num = 1;
   Q = process_noise_cov();
@@ -111,6 +125,8 @@ void ImuProcess::Reset()
   angvel_last       = Zero3d;
   imu_need_init_    = true;
   start_timestamp_  = -1;
+  last_lidar_end_time_ = -1.0;
+  initialization_stationary_start_time_ = -1.0;
   init_iter_num     = 1;
   v_imu_.clear();
   IMUpose.clear();
@@ -154,6 +170,66 @@ void ImuProcess::set_gyr_bias_cov(const V3D &b_g)
 void ImuProcess::set_acc_bias_cov(const V3D &b_a)
 {
   cov_bias_acc = b_a;
+}
+
+void ImuProcess::set_initialization_stationarity(
+    double hold_seconds, double max_gyro_rps,
+    double max_accel_spread_mps2, double accel_norm_tolerance_mps2,
+    int min_samples)
+{
+  initialization_hold_seconds_ = std::max(0.0, hold_seconds);
+  initialization_max_gyro_rps_ = std::max(0.0, max_gyro_rps);
+  initialization_max_accel_spread_mps2_ =
+      std::max(0.0, max_accel_spread_mps2);
+  initialization_accel_norm_tolerance_mps2_ =
+      std::max(0.0, accel_norm_tolerance_mps2);
+  initialization_min_samples_ = std::max(1, min_samples);
+}
+
+bool ImuProcess::InitializationBundleIsStationary(
+    const MeasureGroup &meas) const
+{
+  if (meas.imu.empty()) return false;
+  V3D first_acceleration = Zero3d;
+  double maximum_gyro = 0.0;
+  double maximum_acceleration_spread = 0.0;
+  double acceleration_norm_sum = 0.0;
+  bool first = true;
+  for (const auto &imu : meas.imu)
+  {
+    const V3D acceleration(imu->linear_acceleration.x,
+                           imu->linear_acceleration.y,
+                           imu->linear_acceleration.z);
+    const V3D gyro(imu->angular_velocity.x, imu->angular_velocity.y,
+                   imu->angular_velocity.z);
+    if (!acceleration.allFinite() || !gyro.allFinite()) return false;
+    if (first)
+    {
+      first_acceleration = acceleration;
+      first = false;
+    }
+    maximum_gyro = std::max(maximum_gyro, gyro.norm());
+    maximum_acceleration_spread = std::max(
+        maximum_acceleration_spread,
+        (acceleration - first_acceleration).norm());
+    acceleration_norm_sum += acceleration.norm();
+  }
+  const double mean_acceleration_norm =
+      acceleration_norm_sum / static_cast<double>(meas.imu.size());
+  return maximum_gyro <= initialization_max_gyro_rps_ &&
+         maximum_acceleration_spread <=
+             initialization_max_accel_spread_mps2_ &&
+         std::abs(mean_acceleration_norm - G_m_s2) <=
+             initialization_accel_norm_tolerance_mps2_;
+}
+
+void ImuProcess::RestartInitialization(const MeasureGroup &meas)
+{
+  b_first_frame_ = true;
+  init_iter_num = 1;
+  initialization_stationary_start_time_ = -1.0;
+  last_imu_ = meas.imu.back();
+  last_lidar_end_time_ = meas.lidar_end_time;
 }
 
 void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
@@ -210,11 +286,33 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   init_P(21,21) = init_P(22,22) = 0.00001; 
   kf_state.change_P(init_P);
   last_imu_ = meas.imu.back();
+  // MARSIM treats every simulated cloud as an instantaneous scan and uses the
+  // previous cloud stamp as the beginning of the next IMU integration window.
+  // Keep this value current during initialization; otherwise the first motion
+  // frame reads an indeterminate timestamp and can integrate an enormous dt.
+  last_lidar_end_time_ = meas.lidar_end_time;
 
 }
 
 void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
 {
+  state_ikfom state_before_propagation = kf_state.get_x();
+  auto covariance_before_propagation = kf_state.get_P();
+  constexpr double kTimestampEpsilon = 1e-9;
+  constexpr double kMaxSensorGapSeconds = 2.0;
+  constexpr double kMaxPredictionSubstepSeconds = 0.01;
+
+  auto reject_propagation = [&](const char *reason, double dt) {
+    ROS_ERROR_THROTTLE(1.0,
+                       "[FAST-LIO] rejected invalid IMU integration (%s, dt=%.6f s)",
+                       reason, dt);
+    kf_state.change_x(state_before_propagation);
+    kf_state.change_P(covariance_before_propagation);
+    last_imu_ = meas.imu.back();
+    last_lidar_end_time_ = meas.lidar_end_time;
+    pcl_out.clear();
+  };
+
   /*** add the imu of the last frame-tail to the of current frame-head ***/
   auto v_imu = meas.imu;
   v_imu.push_front(last_imu_);
@@ -225,8 +323,20 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   double pcl_end_time = meas.lidar_end_time;
 
     if (lidar_type == MARSIM) {
+        if (!std::isfinite(last_lidar_end_time_) || last_lidar_end_time_ < 0.0 ||
+            last_lidar_end_time_ > meas.lidar_beg_time + kTimestampEpsilon) {
+            ROS_WARN_THROTTLE(1.0,
+                              "[FAST-LIO] rebaselining invalid simulated lidar time");
+            last_lidar_end_time_ = meas.lidar_beg_time;
+        }
         pcl_beg_time = last_lidar_end_time_;
         pcl_end_time = meas.lidar_beg_time;
+        const double frame_gap = pcl_end_time - pcl_beg_time;
+        if (!std::isfinite(frame_gap) || frame_gap < -kTimestampEpsilon ||
+            frame_gap > kMaxSensorGapSeconds) {
+            reject_propagation("lidar frame gap", frame_gap);
+            return;
+        }
     }
 
     /*** sort point clouds by offset time ***/
@@ -247,6 +357,26 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   double dt = 0;
 
   input_ikfom in;
+  bool have_imu_input = false;
+  auto predict_interval = [&](double interval, const char *reason) {
+    if (!std::isfinite(interval) || interval < -kTimestampEpsilon ||
+        interval > kMaxSensorGapSeconds)
+    {
+      reject_propagation(reason, interval);
+      return false;
+    }
+    if (interval <= kTimestampEpsilon) return true;
+    const int substeps = std::max(
+        1, static_cast<int>(std::ceil(interval / kMaxPredictionSubstepSeconds)));
+    const double substep_size = interval / static_cast<double>(substeps);
+    for (int step = 0; step < substeps; ++step)
+    {
+      double substep = substep_size;
+      kf_state.predict(substep, Q, in);
+    }
+    return true;
+  };
+
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
   {
     auto &&head = *(it_imu);
@@ -277,11 +407,12 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     
     in.acc = acc_avr;
     in.gyro = angvel_avr;
+    have_imu_input = true;
     Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
     Q.block<3, 3>(3, 3).diagonal() = cov_acc;
     Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
     Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
-    kf_state.predict(dt, Q, in);
+    if (!predict_interval(dt, "IMU sample step")) return;
 
     /* save the poses at each IMU measurements */
     imu_state = kf_state.get_x();
@@ -298,7 +429,12 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   /*** calculated the pos and attitude prediction at the frame-end ***/
   double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
   dt = note * (pcl_end_time - imu_end_time);
-  kf_state.predict(dt, Q, in);
+  if (dt > kTimestampEpsilon && !have_imu_input)
+  {
+    reject_propagation("missing IMU input", dt);
+    return;
+  }
+  if (!predict_interval(dt, "frame-end extrapolation")) return;
   
   imu_state = kf_state.get_x();
   last_imu_ = meas.imu.back();
@@ -355,15 +491,35 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
 
   if (imu_need_init_)
   {
+    // SimEnv may unpause while the quadruped is falling or settling.  Dynamic
+    // acceleration must not be learned as gravity or gyro bias: the resulting
+    // tilt error is double-integrated into horizontal drift.  This gate is
+    // used only during startup and leaves normal 6-DoF motion unconstrained.
+    if (!InitializationBundleIsStationary(meas))
+    {
+      ROS_WARN_THROTTLE(2.0,
+                        "[FAST-LIO] waiting for stationary IMU initialization");
+      RestartInitialization(meas);
+      return;
+    }
+
     /// The very first lidar frame
     IMU_init(meas, kf_state, init_iter_num);
+
+    if (initialization_stationary_start_time_ < 0.0)
+      initialization_stationary_start_time_ =
+          meas.imu.front()->header.stamp.toSec();
+    const double stationary_duration =
+        meas.imu.back()->header.stamp.toSec() -
+        initialization_stationary_start_time_;
 
     imu_need_init_ = true;
     
     last_imu_   = meas.imu.back();
 
     state_ikfom imu_state = kf_state.get_x();
-    if (init_iter_num > MAX_INI_COUNT)
+    if (init_iter_num >= initialization_min_samples_ &&
+        stationary_duration >= initialization_hold_seconds_)
     {
       cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init_ = false;

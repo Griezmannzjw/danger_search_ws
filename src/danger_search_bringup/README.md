@@ -44,7 +44,8 @@ roslaunch danger_search_bringup competition.launch \
 
 ## P0 推荐流程
 
-1. 以单楼层、关闭 referee odom 和真值点云变换的方式启动 SimEnv；
+1. 启动 SimEnv：为官方底层步态控制保留 ground-truth 状态话题，但关闭 referee odom
+   和真值点云变换；算法节点不得订阅 `/ground_truth/*`；
 2. 在 junior_ctrl 终端按 `2` 站立，再按 `6` 进入 `/cmd_vel` 模式；
 3. 启动 `competition.launch autostart:=true`；
 4. bringup 调用官方门服务打开 `main_entrance`；

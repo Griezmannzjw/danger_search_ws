@@ -68,7 +68,9 @@ POINTCLOUD_USE_GROUND_TRUTH_ODOM=0 ENABLE_POINTCLOUD_CONVERTER=0 \
 ```
 
 定位使用机器人机身已有的 `/trunk_imu`，因此额外的 Livox IMU 插件可关闭；完整 P0
-需要相机识别危险源时，再把 `ENABLE_REALSENSE` 改回 `1`。
+需要相机识别危险源时，再把 `ENABLE_REALSENSE` 改回 `1`。上述命令只用于机器人不行走
+的定位隔离测试；完整 P0 的模式 `6` 底层控制还需要设置 `ENABLE_GROUND_TRUTH=1`，但
+本包不会订阅这些真值话题。
 
 检查输出：
 
@@ -98,6 +100,16 @@ rosrun tf tf_echo map base
 正常 P0 不需要修改这些默认值。尤其不要随意改变 `extrinsic_T`、`extrinsic_R`：传感器
 适配节点已把点云统一到机身/IMU 坐标系，FAST-LIO 使用单位外参。FAST-LIO 核心源码及
 原始许可证位于 `third_party/fast_lio`，来源和集成差异见其中 `README.vendor.md`。
+
+MARSIM 时间链会在 IMU 初始化期间记录上一帧雷达时间。仿真负载造成合理传感器丢帧时，
+较长 IMU 间隔会拆成不超过 10ms 的预测子步；负时间、非有限时间或超过 2s 的异常间隔
+会回滚本帧状态和协方差。地图节点还会独立拒绝不符合物理速度/角速度约束的 LIO 位姿，
+避免后端异常时继续污染 `/map`。
+
+FAST-LIO 不再使用启动后的第一批 IMU 数据立即估计重力。只有陀螺、加速度幅值和加速度
+波动同时满足阈值，并连续保持 `imu_initialization/stationary_hold_s` 后才完成初始化；若机器
+人仍在下落、站立或晃动，累计数据会清空并重新等待。该检查只作用于初始化，完成后滤波器
+仍估计完整 6DoF 位姿，不锁定水平、高度或姿态轴，因此可以继续扩展到楼梯和多楼层 P1。
 
 ## 当前范围
 

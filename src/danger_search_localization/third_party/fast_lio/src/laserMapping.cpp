@@ -100,6 +100,11 @@ double zupt_max_gyro_rps = 0.05;
 double zupt_max_accel_spread_mps2 = 0.15;
 double zupt_accel_norm_tolerance_mps2 = 0.35;
 int zupt_min_imu_samples = 20;
+double imu_initialization_hold_s = 1.0;
+double imu_initialization_max_gyro_rps = 0.05;
+double imu_initialization_max_accel_spread_mps2 = 0.15;
+double imu_initialization_accel_norm_tolerance_mps2 = 0.35;
+int imu_initialization_min_samples = 100;
 state_ikfom zupt_anchor_state;
 
 vector<vector<int>>  pointSearchInd_surf; 
@@ -827,6 +832,16 @@ int main(int argc, char** argv)
     pnh.param<double>("stationary_constraint/accel_norm_tolerance_mps2",
                       zupt_accel_norm_tolerance_mps2, 0.35);
     pnh.param<int>("stationary_constraint/min_imu_samples", zupt_min_imu_samples, 20);
+    pnh.param<double>("imu_initialization/stationary_hold_s",
+                      imu_initialization_hold_s, 1.0);
+    pnh.param<double>("imu_initialization/max_gyro_rps",
+                      imu_initialization_max_gyro_rps, 0.05);
+    pnh.param<double>("imu_initialization/max_accel_spread_mps2",
+                      imu_initialization_max_accel_spread_mps2, 0.15);
+    pnh.param<double>("imu_initialization/accel_norm_tolerance_mps2",
+                      imu_initialization_accel_norm_tolerance_mps2, 0.35);
+    pnh.param<int>("imu_initialization/min_samples",
+                   imu_initialization_min_samples, 100);
     pnh.param<bool>("common/time_sync_en", time_sync_en, false);
     pnh.param<double>("common/time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
     pnh.param<double>("filter_size_corner",filter_size_corner_min,0.5);
@@ -883,6 +898,11 @@ int main(int argc, char** argv)
     p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
     p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
     p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+    p_imu->set_initialization_stationarity(
+        imu_initialization_hold_s, imu_initialization_max_gyro_rps,
+        imu_initialization_max_accel_spread_mps2,
+        imu_initialization_accel_norm_tolerance_mps2,
+        imu_initialization_min_samples);
     p_imu->lidar_type = lidar_type;
     double epsi[23] = {0.001};
     fill(epsi, epsi+23, 0.001);

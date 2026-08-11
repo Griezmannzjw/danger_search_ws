@@ -91,3 +91,37 @@ class TestLocalizationConfig(unittest.TestCase):
             for remap in lio_node.findall("remap")
         }
         self.assertEqual(remaps["/Odometry"], "/localization/lio/odometry")
+
+    def test_simulated_lidar_time_is_initialized_and_guarded(self):
+        imu_source = (self.package_dir / "third_party" / "fast_lio" / "src" /
+                      "IMU_Processing.hpp").read_text()
+        config = yaml.safe_load(
+            (self.package_dir / "config" / "default.yaml").read_text()
+        )
+
+        self.assertIn("last_lidar_end_time_(-1.0)", imu_source)
+        self.assertIn("last_lidar_end_time_ = meas.lidar_end_time", imu_source)
+        self.assertIn("kMaxSensorGapSeconds", imu_source)
+        self.assertIn("kMaxPredictionSubstepSeconds", imu_source)
+        self.assertIn("predict_interval", imu_source)
+        self.assertIn("change_P(covariance_before_propagation)", imu_source)
+        self.assertIn("InitializationBundleIsStationary", imu_source)
+        self.assertIn("stationary_duration >= initialization_hold_seconds_",
+                      imu_source)
+        initialization = config["imu_initialization"]
+        self.assertGreaterEqual(initialization["stationary_hold_s"], 0.5)
+        self.assertGreaterEqual(initialization["min_samples"], 50)
+        self.assertGreater(initialization["max_gyro_rps"], 0.0)
+        self.assertGreater(initialization["max_accel_spread_mps2"], 0.0)
+
+    def test_occupancy_map_rejects_unhealthy_lio_pose(self):
+        config_path = self.package_dir / "config" / "default.yaml"
+        config = yaml.safe_load(config_path.read_text())
+        mapper_source = (self.package_dir / "src" /
+                         "lio_occupancy_mapper_node.cpp").read_text()
+
+        self.assertGreater(config["map_pose_cloud_max_age_s"], 0.0)
+        self.assertLessEqual(config["map_pose_cloud_max_age_s"],
+                             config["pose_fresh_timeout_s"])
+        self.assertIn("[mapping] rejected LIO jump", mapper_source)
+        self.assertIn("!pose_valid_", mapper_source)

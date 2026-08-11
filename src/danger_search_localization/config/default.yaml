@@ -206,6 +206,14 @@ filter_size_surf: 0.18
 filter_size_map: 0.25
 cube_side_length: 80.0
 runtime_pos_log_enable: false
+# 只有连续静止的 IMU 数据才能用于估计初始重力和陀螺零偏。该门控仅在启动
+# 阶段生效，正常运行仍保留完整 6DoF，因此不限制楼梯和多楼层运动。
+imu_initialization:
+  stationary_hold_s: 1.0
+  max_gyro_rps: 0.05
+  max_accel_spread_mps2: 0.15
+  accel_norm_tolerance_mps2: 0.35
+  min_samples: 100
 stationary_constraint:
   enable: true
   max_gyro_rps: 0.05
@@ -221,6 +229,8 @@ map_obstacle_max_height_m: 1.20
 map_ground_min_height_m: -0.55
 map_ground_max_height_m: -0.12
 map_voxel_size_m: 0.12
+# 注册点云只有在同时间的原始 LIO 位姿通过物理跳变门后才允许更新地图。
+map_pose_cloud_max_age_s: 0.20
 
 # 公共接口的最后一道异常跳变保护，不参与正常 LIO 状态估计。
 lio_guard_max_linear_speed_mps: 2.0

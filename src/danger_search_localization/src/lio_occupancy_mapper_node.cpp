@@ -29,6 +29,11 @@ class LioOccupancyMapper {
     private_nh_.param("map_ground_min_height_m", ground_min_height_, -0.55);
     private_nh_.param("map_ground_max_height_m", ground_max_height_, -0.12);
     private_nh_.param("map_voxel_size_m", voxel_size_, 0.12);
+    private_nh_.param("lio_guard_max_linear_speed_mps", max_speed_, 2.0);
+    private_nh_.param("lio_guard_translation_margin_m", translation_margin_, 0.15);
+    private_nh_.param("lio_guard_max_yaw_rate_rps", max_yaw_rate_, 3.0);
+    private_nh_.param("lio_guard_yaw_margin_rad", yaw_margin_, 0.20);
+    private_nh_.param("map_pose_cloud_max_age_s", pose_cloud_max_age_, 0.20);
     private_nh_.param<std::string>("map_frame", map_frame_, "map");
     log_odds_.assign(static_cast<std::size_t>(size_) * size_, 0);
     publisher_ = nh_.advertise<nav_msgs::OccupancyGrid>("/map", 1, true);
@@ -46,14 +51,42 @@ class LioOccupancyMapper {
     const auto& p = message->pose.pose.position;
     const auto& q = message->pose.pose.orientation;
     const Eigen::Quaterniond orientation(q.w, q.x, q.y, q.z);
+    const Eigen::Vector3d raw_position(p.x, p.y, p.z);
+    if (!raw_position.allFinite() || !orientation.coeffs().allFinite() ||
+        orientation.norm() < 1e-9) {
+      pose_valid_ = false;
+      ROS_WARN_THROTTLE(1.0, "[mapping] rejected non-finite LIO odometry");
+      return;
+    }
+    const Eigen::Quaterniond normalized = orientation.normalized();
     if (!initialized_) {
-      anchor_position_ = Eigen::Vector3d(p.x, p.y, p.z);
-      anchor_inverse_ = orientation.normalized().conjugate();
+      anchor_position_ = raw_position;
+      anchor_inverse_ = normalized.conjugate();
       initialized_ = true;
     }
-    sensor_position_ = anchor_inverse_ * (Eigen::Vector3d(p.x, p.y, p.z) -
-                                           anchor_position_);
+    const Eigen::Vector3d candidate_position =
+        anchor_inverse_ * (raw_position - anchor_position_);
+    const Eigen::Quaterniond candidate_orientation = anchor_inverse_ * normalized;
+    if (has_accepted_pose_) {
+      const double dt = (message->header.stamp - last_odom_stamp_).toSec();
+      if (!std::isfinite(dt) || dt <= 0.0) return;
+      const double distance = (candidate_position - sensor_position_).norm();
+      const double angle = accepted_orientation_.angularDistance(candidate_orientation);
+      const double bounded_dt = std::min(dt, 0.5);
+      if (distance > translation_margin_ + max_speed_ * bounded_dt ||
+          angle > yaw_margin_ + max_yaw_rate_ * bounded_dt) {
+        pose_valid_ = false;
+        ROS_WARN_THROTTLE(1.0,
+                          "[mapping] rejected LIO jump: %.3fm %.3frad",
+                          distance, angle);
+        return;
+      }
+    }
+    sensor_position_ = candidate_position;
+    accepted_orientation_ = candidate_orientation;
     last_odom_stamp_ = message->header.stamp;
+    has_accepted_pose_ = true;
+    pose_valid_ = true;
   }
 
   bool cell(double x, double y, int& cx, int& cy) const {
@@ -85,7 +118,10 @@ class LioOccupancyMapper {
     pcl::PointCloud<pcl::PointXYZI> cloud;
     pcl::fromROSMsg(*message, cloud);
     std::lock_guard<std::mutex> guard(mutex_);
-    if (!initialized_ || cloud.empty()) return;
+    if (!initialized_ || !pose_valid_ || cloud.empty()) return;
+    const double pose_cloud_age =
+        std::abs((message->header.stamp - last_odom_stamp_).toSec());
+    if (!std::isfinite(pose_cloud_age) || pose_cloud_age > pose_cloud_max_age_) return;
     int origin_x, origin_y;
     if (!cell(sensor_position_.x(), sensor_position_.y(), origin_x, origin_y)) return;
     std::unordered_set<std::uint64_t> visited;
@@ -144,13 +180,17 @@ class LioOccupancyMapper {
   ros::Timer timer_;
   std::mutex mutex_;
   std::vector<int8_t> log_odds_;
-  bool initialized_ = false, dirty_ = false;
+  bool initialized_ = false, has_accepted_pose_ = false, pose_valid_ = false;
+  bool dirty_ = false;
   int size_;
   double resolution_, publish_rate_, max_range_, obstacle_min_height_;
   double obstacle_max_height_, ground_min_height_, ground_max_height_, voxel_size_;
+  double max_speed_, translation_margin_, max_yaw_rate_, yaw_margin_;
+  double pose_cloud_max_age_;
   std::string map_frame_;
   Eigen::Vector3d anchor_position_ = Eigen::Vector3d::Zero();
   Eigen::Quaterniond anchor_inverse_ = Eigen::Quaterniond::Identity();
+  Eigen::Quaterniond accepted_orientation_ = Eigen::Quaterniond::Identity();
   Eigen::Vector3d sensor_position_ = Eigen::Vector3d::Zero();
   ros::Time last_odom_stamp_, last_cloud_stamp_;
 };
