@@ -66,28 +66,28 @@ class TestLocalizationConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             AdapterConfig(pose_publish_rate_hz=5.0)
 
-    def test_default_pose_wiring_separates_hector_and_gicp(self):
+    def test_default_launch_uses_lio_without_legacy_backends(self):
         config_path = self.package_dir / "config" / "default.yaml"
         config = yaml.safe_load(config_path.read_text())
 
-        self.assertEqual(config["backend_pose_topic"], "/localization/hector_pose")
-        self.assertEqual(config["gicp_pose_topic"], "/localization/raw_pose")
-        self.assertNotEqual(
-            config["backend_pose_topic"], config["gicp_pose_topic"]
-        )
+        self.assertEqual(config["common"]["lid_topic"], "/localization/lio/points")
+        self.assertEqual(config["common"]["imu_topic"], "/trunk_imu")
+        self.assertEqual(config["preprocess"]["lidar_type"], 4)
+        self.assertFalse(config["mapping"]["extrinsic_est_en"])
 
         launch_path = self.package_dir / "launch" / "localization.launch"
         root = ElementTree.parse(launch_path).getroot()
-        hector_node = next(
-            node for node in root.findall("node") if node.attrib["name"] == "hector_mapping"
-        )
+        names = {node.attrib["name"] for node in root.findall("node")}
+        self.assertIn("fast_lio_mapping", names)
+        self.assertIn("sim_sensor_adapter", names)
+        self.assertIn("lio_occupancy_mapper", names)
+        self.assertIn("localization_adapter", names)
+        self.assertNotIn("hector_mapping", names)
+        self.assertNotIn("lidar_odometry", names)
+        lio_node = next(node for node in root.findall("node")
+                        if node.attrib["name"] == "fast_lio_mapping")
         remaps = {
             remap.attrib["from"]: remap.attrib["to"]
-            for remap in hector_node.findall("remap")
+            for remap in lio_node.findall("remap")
         }
-        self.assertEqual(remaps["poseupdate"], config["backend_pose_topic"])
-        parameters = {
-            parameter.attrib["name"]: parameter.attrib["value"]
-            for parameter in hector_node.findall("param")
-        }
-        self.assertEqual(parameters["use_tf_pose_start_estimate"], "false")
+        self.assertEqual(remaps["/Odometry"], "/localization/lio/odometry")

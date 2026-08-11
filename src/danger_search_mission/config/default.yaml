@@ -33,9 +33,21 @@ input_timeout_s: 2.0
 preflight_wait_timeout_s: 20.0
 # 0 表示不设任务总时限。600 秒只是满分线，不是停止条件。
 mission_timeout_s: 0.0
+# 入口阶段：先在门外保存返航起点，再沿起始朝向分段进入建筑。
 entry_enabled: true
+# 从门外任务起点量取的总前向进入距离；达到 distance-tolerance 后开始探索。
 entry_distance_m: 4.2
+# 每段短目标的前向增量。避免目标一次落到尚未建图的室内深处。
+entry_step_m: 0.6
+entry_completion_tolerance_m: 0.25
+# Action 单段失败时先等待新地图，再从当前实际位姿生成下一短目标。
+entry_retry_delay_s: 1.0
+# 只累计“没有 entry_min_progress_m 进展”的连续失败；有进展后重新计数。
+entry_max_retries: 8
+entry_min_progress_m: 0.10
+# ENTERING 整体时限独立于单段重试，防止有微小进展时无限循环。
 entry_timeout_s: 90.0
+# 正式 P0 必须等 /entrance/ready=true；仅 mission 隔离测试时才关闭。
 require_entrance_ready: true
 return_timeout_s: 120.0
 autostart: false

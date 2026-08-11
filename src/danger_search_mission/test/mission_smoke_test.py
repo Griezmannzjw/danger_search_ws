@@ -32,6 +32,9 @@ class MissionSmokeTest(unittest.TestCase):
             os.remove(RESULT_FILE)
         self.latest_status = None
         self.move_base_goals = []
+        self.robot_pose_x = 1.0
+        self.robot_pose_y = 2.0
+        self.failed_entry_once = False
         self.exploration_started = False
         self.stop_called = False
         self.complete_pub = rospy.Publisher(
@@ -96,6 +99,14 @@ class MissionSmokeTest(unittest.TestCase):
 
     def _execute_goal(self, goal):
         self.move_base_goals.append(goal)
+        if not self.failed_entry_once:
+            self.failed_entry_once = True
+            rospy.sleep(0.05)
+            self.move_base_server.set_aborted(MoveBaseResult(), "synthetic entry failure")
+            return
+        self.robot_pose_x = goal.target_pose.pose.position.x
+        self.robot_pose_y = goal.target_pose.pose.position.y
+        self._publish_health(None)
         rospy.sleep(0.05)
         self.move_base_server.set_succeeded(MoveBaseResult())
 
@@ -104,8 +115,8 @@ class MissionSmokeTest(unittest.TestCase):
         pose = PoseWithCovarianceStamped()
         pose.header.stamp = now
         pose.header.frame_id = "map"
-        pose.pose.pose.position.x = 1.0
-        pose.pose.pose.position.y = 2.0
+        pose.pose.pose.position.x = self.robot_pose_x
+        pose.pose.pose.position.y = self.robot_pose_y
         pose.pose.pose.orientation.w = 1.0
         self.pose_pub.publish(pose)
 
@@ -167,11 +178,11 @@ class MissionSmokeTest(unittest.TestCase):
         start = rospy.ServiceProxy("/danger_search/start", Trigger)
         response = start()
         self.assertTrue(response.success, response.message)
-        self.assertTrue(self._wait_for(lambda: self.exploration_started, 2.0))
+        self.assertTrue(self._wait_for(lambda: self.exploration_started, 8.0))
         self.assertTrue(self._wait_for(
             lambda: self.latest_status is not None
             and self.latest_status.mission_state == "EXPLORING",
-            2.0,
+            8.0,
         ))
         # Allow the latched false session marker to reach mission before true.
         rospy.sleep(0.1)
@@ -188,10 +199,22 @@ class MissionSmokeTest(unittest.TestCase):
             5.0,
         ))
         self.assertTrue(self.stop_called)
-        self.assertEqual(len(self.move_base_goals), 2)
-        entry_goal, return_goal = self.move_base_goals
-        self.assertAlmostEqual(entry_goal.target_pose.pose.position.x, 5.2)
-        self.assertAlmostEqual(entry_goal.target_pose.pose.position.y, 2.0)
+        self.assertGreater(len(self.move_base_goals), 2)
+        entry_goals = self.move_base_goals[:-1]
+        return_goal = self.move_base_goals[-1]
+        self.assertAlmostEqual(entry_goals[0].target_pose.pose.position.x, 1.6)
+        self.assertAlmostEqual(entry_goals[0].target_pose.pose.position.y, 2.0)
+        self.assertAlmostEqual(entry_goals[-1].target_pose.pose.position.x, 5.2)
+        self.assertAlmostEqual(entry_goals[-1].target_pose.pose.position.y, 2.0)
+        for previous, current in zip(entry_goals, entry_goals[1:]):
+            self.assertGreaterEqual(
+                current.target_pose.pose.position.x,
+                previous.target_pose.pose.position.x,
+            )
+        self.assertAlmostEqual(
+            entry_goals[0].target_pose.pose.position.x,
+            entry_goals[1].target_pose.pose.position.x,
+        )
         self.assertAlmostEqual(return_goal.target_pose.pose.position.x, 1.0)
         self.assertAlmostEqual(return_goal.target_pose.pose.position.y, 2.0)
         self.assertTrue(os.path.isfile(RESULT_FILE))

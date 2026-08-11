@@ -148,6 +148,39 @@ def task_relative_position(x, y, z, home_x, home_y, home_z, home_yaw):
     )
 
 
+def entry_progress(current_x, current_y, home_x, home_y, home_yaw):
+    """Return forward and lateral displacement in the captured entry frame."""
+    values = (current_x, current_y, home_x, home_y, home_yaw)
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("entry progress requires finite values")
+    dx = float(current_x) - float(home_x)
+    dy = float(current_y) - float(home_y)
+    cosine = math.cos(float(home_yaw))
+    sine = math.sin(float(home_yaw))
+    return (
+        cosine * dx + sine * dy,
+        -sine * dx + cosine * dy,
+    )
+
+
+def next_entry_target(home_x, home_y, home_yaw, current_progress, distance, step):
+    """Build the next center-line target for incremental entrance traversal."""
+    values = (home_x, home_y, home_yaw, current_progress, distance, step)
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("entry target requires finite values")
+    if float(distance) <= 0.0 or float(step) <= 0.0:
+        raise ValueError("entry distance and step must be positive")
+    target_progress = min(
+        float(distance),
+        max(0.0, float(current_progress)) + float(step),
+    )
+    return (
+        float(home_x) + target_progress * math.cos(float(home_yaw)),
+        float(home_y) + target_progress * math.sin(float(home_yaw)),
+        target_progress,
+    )
+
+
 def normalize_result_file(path):
     """Expand and normalize a configured absolute result path."""
     expanded = os.path.expandvars(os.path.expanduser(str(path or "").strip()))

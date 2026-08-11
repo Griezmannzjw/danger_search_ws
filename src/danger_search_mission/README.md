@@ -13,7 +13,7 @@ IDLE -> ENTERING -> EXPLORING -> RETURNING -> FINISHED
 - 在任务开始时记录本次 `map` 中的起点位姿；
 - 启动 exploration 并接收 `/exploration/complete`；
 - 对红球检测做置信度过滤、空间融合和至少三帧确认；
-- 在门外保存官方出生点，自动前进穿过入口后才启动 exploration；
+- 在门外保存官方出生点，沿初始朝向用短目标滚动前进，确认达到门内距离后才启动 exploration；
 - 探索完成后停止 exploration，独占发送返航 `/move_base` 目标；
 - `600s` 仅是评分满分线，默认任务总超时为 `0`，不会据此中断探索；
 - 返航成功后把坐标转换为以本次起点为原点的任务坐标；
@@ -52,6 +52,28 @@ IDLE -> ENTERING -> EXPLORING -> RETURNING -> FINISHED
 
 mission 在 `ENTERING` 和 `RETURNING` 阶段作为 `/move_base` Action 客户端；只有入口
 目标成功后才启动 exploration，返航前则先调用其 stop 服务，避免目标竞争。
+
+入口不是一次发送远处目标：默认每次推进 `0.6 m`，navigation 只沿当前已知自由区执行，
+新点云更新地图后再推进下一段。单段失败会等待地图更新并重试；只有相对门外起点的前向
+进度达到 `entry_distance_m - entry_completion_tolerance_m` 才进入探索。
+
+## 入口参数
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `entry_enabled` | `true` | 是否在探索前执行进门阶段 |
+| `entry_distance_m` | `4.2` | 相对门外任务起点的总前向距离 |
+| `entry_step_m` | `0.6` | 滚动短目标增量 |
+| `entry_completion_tolerance_m` | `0.25` | 入口完成距离容差 |
+| `entry_retry_delay_s` | `1.0` | 失败后等待地图刷新的时间 |
+| `entry_max_retries` | `8` | 连续无进展失败上限 |
+| `entry_min_progress_m` | `0.10` | 重置失败计数所需的最小进展 |
+| `entry_timeout_s` | `90.0` | 整个入口阶段总超时 |
+| `require_entrance_ready` | `true` | 要求开门节点确认成功 |
+
+单段 Action 成功后不会在 actionlib 完成回调里直接发送下一目标，而是交给 mission 定时器
+继续推进，避免连续目标触发 `SimpleActionClient` 状态竞争。单段失败不会立即终止任务；
+mission 等待地图清除动态门残影后重试。
 
 ## 结果路径
 

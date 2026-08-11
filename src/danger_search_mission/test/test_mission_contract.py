@@ -20,6 +20,12 @@ class MissionContractTest(unittest.TestCase):
         self.assertGreater(config["return_timeout_s"], 0)
         self.assertEqual(config["mission_timeout_s"], 0.0)
         self.assertTrue(config["entry_enabled"])
+        self.assertGreater(config["entry_step_m"], 0.0)
+        self.assertLess(config["entry_step_m"], config["entry_distance_m"])
+        self.assertGreaterEqual(config["entry_max_retries"], 1)
+        self.assertLess(
+            config["entry_completion_tolerance_m"], config["entry_distance_m"]
+        )
         self.assertTrue(config["require_entrance_ready"])
 
     def test_manager_owns_complete_subscription_and_return_goal(self):
@@ -27,7 +33,8 @@ class MissionContractTest(unittest.TestCase):
         self.assertIn("self.exploration_complete_sub = rospy.Subscriber", source)
         self.assertIn("goal = MoveBaseGoal()", source)
         self.assertIn("done_cb=self._return_done_callback", source)
-        self.assertIn("done_cb=self._entry_done_callback", source)
+        self.assertIn("self._entry_done_callback(", source)
+        self.assertIn("self.entry_retry_at = rospy.Time.now()", source)
         self.assertIn("os.replace(temporary, self.result_file)", source)
 
 

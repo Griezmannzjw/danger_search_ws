@@ -156,3 +156,74 @@ vertical_acceleration_deadband_mps2: 0.15
 floor_heights: [0.0, 2.6, 5.2]
 floor_switch_hysteresis_m: 0.20
 floor_snap_tolerance_m: 0.35
+
+# P0 默认长期后端：FAST-LIO2 的 MARSIM 模式。SimEnv 每一帧 /scan 是
+# 同一仿真时刻生成的，因此按“瞬时点云”处理，不伪造逐点时间戳。
+input_topic: /scan
+output_topic: /localization/lio/points
+output_frame: base
+min_range_m: 0.35
+max_range_m: 20.0
+
+common:
+  lid_topic: /localization/lio/points
+  imu_topic: /trunk_imu
+  world_frame: map
+  body_frame: base
+  time_sync_en: false
+  time_offset_lidar_to_imu: 0.0
+preprocess:
+  lidar_type: 4
+  scan_line: 4
+  blind: 0.35
+  scan_rate: 10
+  timestamp_unit: 2
+mapping:
+  acc_cov: 0.03
+  gyr_cov: 0.01
+  b_acc_cov: 0.0001
+  b_gyr_cov: 0.0001
+  fov_degree: 179.0
+  det_range: 20.0
+  extrinsic_est_en: false
+  extrinsic_T: [0.0, 0.0, 0.0]
+  extrinsic_R: [1.0, 0.0, 0.0,
+                0.0, 1.0, 0.0,
+                0.0, 0.0, 1.0]
+publish:
+  path_en: false
+  scan_publish_en: true
+  dense_publish_en: false
+  scan_bodyframe_pub_en: false
+  tf_en: false
+pcd_save:
+  pcd_save_en: false
+  interval: -1
+feature_extract_enable: false
+point_filter_num: 3
+max_iteration: 4
+filter_size_surf: 0.18
+filter_size_map: 0.25
+cube_side_length: 80.0
+runtime_pos_log_enable: false
+stationary_constraint:
+  enable: true
+  max_gyro_rps: 0.05
+  max_accel_spread_mps2: 0.15
+  accel_norm_tolerance_mps2: 0.35
+  min_imu_samples: 20
+
+# 从校正后的三维点云增量生成 navigation 使用的 OccupancyGrid。
+map_publish_rate_hz: 2.0
+map_max_range_m: 12.0
+map_obstacle_min_height_m: -0.12
+map_obstacle_max_height_m: 1.20
+map_ground_min_height_m: -0.55
+map_ground_max_height_m: -0.12
+map_voxel_size_m: 0.12
+
+# 公共接口的最后一道异常跳变保护，不参与正常 LIO 状态估计。
+lio_guard_max_linear_speed_mps: 2.0
+lio_guard_translation_margin_m: 0.15
+lio_guard_max_yaw_rate_rps: 3.0
+lio_guard_yaw_margin_rad: 0.20
