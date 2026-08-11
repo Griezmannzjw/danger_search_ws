@@ -40,7 +40,7 @@ class LidarOdometryNode {
                       imu_stationary_gyro_threshold_rps_, 0.12);
     private_nh_.param("lidar_odom_imu_motion_excitation_hold_s",
                       imu_motion_excitation_hold_s_, 0.75);
-    private_nh_.param("lidar_odom_observation_scans", observation_scans_, 5);
+    private_nh_.param("lidar_odom_observation_scans", observation_scans_, 1);
     private_nh_.param("lidar_odom_observation_max_points",
                       observation_max_points_, 1000);
     private_nh_.param("lidar_odom_voxel_size_m", config_.voxel_size_m, 0.25F);
@@ -89,6 +89,8 @@ class LidarOdometryNode {
                       config_.motion_consistency_rotation_rad, 0.12);
     private_nh_.param("lidar_odom_candidate_fitness_slack",
                       config_.candidate_fitness_slack, 0.005);
+    private_nh_.param("lidar_odom_imu_yaw_tolerance_rad",
+                      config_.imu_yaw_tolerance_rad, 0.20);
     private_nh_.param("lidar_odom_min_points", config_.min_points, 100);
     private_nh_.param("lidar_odom_rebaseline_after_failures",
                       config_.rebaseline_after_failures, 3);
@@ -197,7 +199,11 @@ class LidarOdometryNode {
     }
   }
 
-  bool LevelWithImu(const ros::Time& stamp, Cloud* cloud) {
+  bool LevelWithImu(const ros::Time& stamp, Cloud* cloud,
+                    double* base_heading_rad) {
+    if (base_heading_rad) {
+      *base_heading_rad = std::numeric_limits<double>::quiet_NaN();
+    }
     if (!enable_imu_leveling_) return true;
     ImuSample sample;
     bool found = false;
@@ -243,6 +249,7 @@ class LidarOdometryNode {
     const Eigen::Matrix3f world_rotation = world_from_base.toRotationMatrix();
     const float yaw =
         std::atan2(world_rotation(1, 0), world_rotation(0, 0));
+    if (base_heading_rad) *base_heading_rad = static_cast<double>(yaw);
     const Eigen::Matrix3f heading_from_world =
         Eigen::AngleAxisf(-yaw, Eigen::Vector3f::UnitZ()).toRotationMatrix();
     const Eigen::Matrix3f heading_from_base =
@@ -273,7 +280,8 @@ class LidarOdometryNode {
            imu_motion_excitation_hold_s_;
   }
 
-  Cloud::Ptr PrepareCloud(const sensor_msgs::PointCloud& message) {
+  Cloud::Ptr PrepareCloud(const sensor_msgs::PointCloud& message,
+                          double* base_heading_rad) {
     geometry_msgs::TransformStamped transform;
     try {
       transform = tf_buffer_.lookupTransform(base_frame_, message.header.frame_id,
@@ -310,7 +318,7 @@ class LidarOdometryNode {
     }
     unfiltered->width = unfiltered->size();
     unfiltered->height = 1;
-    if (!LevelWithImu(message.header.stamp, unfiltered.get())) {
+    if (!LevelWithImu(message.header.stamp, unfiltered.get(), base_heading_rad)) {
       return Cloud::Ptr();
     }
     return VoxelFilter(unfiltered);
@@ -359,11 +367,14 @@ class LidarOdometryNode {
   void ProcessMessage(const sensor_msgs::PointCloud::ConstPtr& message) {
     const ros::WallTime started = ros::WallTime::now();
     if (!message || message->header.frame_id.empty()) return;
-    const Cloud::Ptr current = PrepareCloud(*message);
+    double base_heading_rad = std::numeric_limits<double>::quiet_NaN();
+    const Cloud::Ptr current = PrepareCloud(*message, &base_heading_rad);
     const Cloud::Ptr observation = AddObservationFrame(current);
     if (!observation) return;
-    const auto result = core_->Process(observation, message->header.stamp.toSec(),
-                                       ImuStationary(message->header.stamp));
+    const auto result = core_->Process(
+        observation, message->header.stamp.toSec(),
+        ImuStationary(message->header.stamp),
+        std::isfinite(base_heading_rad), base_heading_rad);
     if (result.outcome == LidarOdometryCore::Outcome::kInvalidInput) {
       ROS_WARN_THROTTLE(
           1.0, "[localization] too few or invalid lidar points: %zu/%d",
@@ -389,13 +400,14 @@ class LidarOdometryNode {
           1.0,
           "[localization] GICP rejected (%s): converged=%d fitness=%.3f "
           "correspondence=%.3f translation=%.3f/%.3f rotation=%.3f/%.3f "
-          "z=%.3f roll_pitch=%.3f failures=%d%s",
+          "z=%.3f roll_pitch=%.3f imu_yaw_error=%.3f failures=%d%s",
           result.reason.c_str(), result.registration.converged,
           result.registration.fitness,
           result.registration.correspondence_ratio,
           result.registration.translation, result.translation_limit,
           result.registration.rotation, result.rotation_limit,
           result.registration.z_translation, result.registration.roll_pitch,
+          result.registration.imu_yaw_error,
           result.consecutive_failures,
           result.rebuilt_reference ? "; rebuilding reference frame"
                                    : "; retaining trusted reference");
@@ -471,7 +483,7 @@ class LidarOdometryNode {
   double imu_stationary_gyro_threshold_rps_ = 0.12;
   double imu_motion_excitation_hold_s_ = 0.75;
   double last_motion_excitation_stamp_s_ = 0.0;
-  int observation_scans_ = 5;
+  int observation_scans_ = 1;
   int observation_max_points_ = 1000;
   int observation_count_ = 0;
   Cloud::Ptr observation_cloud_{new Cloud()};

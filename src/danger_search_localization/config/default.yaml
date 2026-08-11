@@ -18,7 +18,7 @@ gicp_pose_topic: /localization/raw_pose
 raw_map_topic: /localization/raw_map
 use_hector_correction: false
 
-# 三维 scan-to-scan GICP 维护连续 odom->base；Hector 提供受限 map->odom 修正。
+# 垂直低权重 SE(2) GICP 维护连续 odom->base，避免 Livox 高度层差异主导平面里程计。
 lidar_odom_voxel_size_m: 0.25
 lidar_odom_min_range_m: 0.40
 lidar_odom_max_range_m: 12.0
@@ -42,12 +42,16 @@ lidar_odom_motion_confirmation_rotation_rad: 0.02
 lidar_odom_motion_consistency_translation_m: 0.10
 lidar_odom_motion_consistency_rotation_rad: 0.12
 lidar_odom_candidate_fitness_slack: 0.005
+lidar_odom_imu_yaw_tolerance_rad: 0.20
 lidar_odom_imu_stationary_accel_tolerance_mps2: 0.35
 lidar_odom_imu_stationary_gyro_threshold_rps: 0.12
 lidar_odom_imu_motion_excitation_hold_s: 0.75
 lidar_odom_min_points: 100
 lidar_odom_max_reference_age_s: 3.0
-lidar_odom_observation_scans: 5
+# The current observation is one scan. Temporal support belongs only in the
+# motion-compensated trusted reference submap; concatenating raw current scans
+# smears motion and reduces the formal odometry update rate.
+lidar_odom_observation_scans: 1
 lidar_odom_observation_max_points: 1000
 lidar_odom_submap_scans: 5
 lidar_odom_submap_max_points: 1200

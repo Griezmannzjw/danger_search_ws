@@ -34,6 +34,10 @@ preflight_wait_timeout_s: 20.0
 # 0 表示不设任务总时限。600 秒只是满分线，不是停止条件。
 mission_timeout_s: 0.0
 entry_enabled: true
+# map 在 GICP 首帧定义为比赛起点朝向；入口按该固定方向分两段通过，
+# 不受站立阶段机身瞬时偏航影响。
+entry_heading_rad: 0.0
+entry_approach_distance_m: 2.4
 entry_distance_m: 4.2
 entry_timeout_s: 90.0
 require_entrance_ready: true

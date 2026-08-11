@@ -188,8 +188,10 @@ class MissionSmokeTest(unittest.TestCase):
             5.0,
         ))
         self.assertTrue(self.stop_called)
-        self.assertEqual(len(self.move_base_goals), 2)
-        entry_goal, return_goal = self.move_base_goals
+        self.assertEqual(len(self.move_base_goals), 3)
+        approach_goal, entry_goal, return_goal = self.move_base_goals
+        self.assertAlmostEqual(approach_goal.target_pose.pose.position.x, 3.4)
+        self.assertAlmostEqual(approach_goal.target_pose.pose.position.y, 2.0)
         self.assertAlmostEqual(entry_goal.target_pose.pose.position.x, 5.2)
         self.assertAlmostEqual(entry_goal.target_pose.pose.position.y, 2.0)
         self.assertAlmostEqual(return_goal.target_pose.pose.position.x, 1.0)

@@ -51,6 +51,7 @@ class LidarOdometryCore {
     double motion_consistency_translation_m = 0.10;
     double motion_consistency_rotation_rad = 0.12;
     double candidate_fitness_slack = 0.005;
+    double imu_yaw_tolerance_rad = 0.20;
     int min_points = 100;
     int rebaseline_after_failures = 3;
     int recovery_consecutive_accepts = 2;
@@ -67,6 +68,7 @@ class LidarOdometryCore {
     double z_translation = 0.0;
     double roll_pitch = 0.0;
     double correspondence_ratio = 0.0;
+    double imu_yaw_error = 0.0;
     Eigen::Isometry3d delta = Eigen::Isometry3d::Identity();
   };
 
@@ -100,7 +102,9 @@ class LidarOdometryCore {
   }
 
   ProcessResult Process(const Cloud::Ptr& current, double stamp_s,
-                        bool imu_stationary = false) {
+                        bool imu_stationary = false,
+                        bool imu_heading_valid = false,
+                        double imu_heading_rad = 0.0) {
     ProcessResult output;
     output.pose = published_pose_;
     if (!current || static_cast<int>(current->size()) < config_.min_points ||
@@ -125,7 +129,7 @@ class LidarOdometryCore {
                                 : config_.max_gate_dt_s;
     last_input_stamp_s_ = stamp_s;
     if (!reference_) {
-      Rebaseline(current, stamp_s);
+      Rebaseline(current, stamp_s, imu_heading_valid, imu_heading_rad);
       history_.push_back(HistoryEntry{current, matching_pose_});
       output.outcome = Outcome::kBootstrap;
       output.publish = true;
@@ -141,7 +145,7 @@ class LidarOdometryCore {
     }
 
     if (stamp_s - reference_stamp_s_ > config_.max_reference_age_s) {
-      Rebaseline(current, stamp_s);
+      Rebaseline(current, stamp_s, imu_heading_valid, imu_heading_rad);
       output.outcome = Outcome::kRebaseline;
       output.publish = true;
       output.rebuilt_reference = true;
@@ -163,25 +167,69 @@ class LidarOdometryCore {
         confirmation_scale *
             (config_.rotation_margin_rad + config_.max_angular_speed_rps * gate_dt));
 
-    const RegistrationResult predicted = Register(current, target, last_increment_);
-    const RegistrationResult identity =
-        IsNearlyIdentity(last_increment_)
-            ? predicted
-            : Register(current, target, Eigen::Isometry3d::Identity());
+    const bool imu_delta_valid =
+        imu_heading_valid && trusted_imu_heading_valid_ &&
+        std::isfinite(imu_heading_rad);
+    const double expected_yaw =
+        imu_delta_valid
+            ? NormalizeAngle(imu_heading_rad - trusted_imu_heading_rad_)
+            : 0.0;
+    Eigen::Isometry3d predicted_guess = last_increment_;
+    Eigen::Isometry3d identity_guess = Eigen::Isometry3d::Identity();
+    if (imu_delta_valid) {
+      const Eigen::Matrix3d expected_rotation =
+          Eigen::AngleAxisd(expected_yaw, Eigen::Vector3d::UnitZ())
+              .toRotationMatrix();
+      predicted_guess.linear() = expected_rotation;
+      identity_guess.linear() = expected_rotation;
+    }
+    RegistrationResult predicted = Register(current, target, predicted_guess);
+    RegistrationResult identity =
+        IsNearlyIdentity(predicted_guess) ? predicted
+                                          : Register(current, target, identity_guess);
+    PopulateImuYawError(&predicted, imu_delta_valid, expected_yaw);
+    PopulateImuYawError(&identity, imu_delta_valid, expected_yaw);
     const RegistrationResult best = SelectCandidate(
-        predicted, identity, output.translation_limit, output.rotation_limit);
+        predicted, identity, output.translation_limit, output.rotation_limit,
+        imu_delta_valid);
     output.registration = best;
 
-    if (!PassesAllGates(best, output.translation_limit, output.rotation_limit)) {
+    if (!PassesAllGates(best, output.translation_limit, output.rotation_limit) ||
+        !PassesImuYawGate(best, imu_delta_valid)) {
+      // A standing quadruped can produce a geometrically plausible false XY
+      // shift as its body settles. IMU-confirmed stationarity is allowed to
+      // override only the dt-based motion gate: all registration quality,
+      // transform, vertical, and absolute per-step limits still apply. Keep the
+      // trusted submap unchanged so the conflicting scan cannot contaminate it.
+      if (imu_stationary && PassesStationaryHoldGates(best) &&
+          PassesImuYawGate(best, imu_delta_valid)) {
+        pending_motion_ = false;
+        last_increment_.setIdentity();
+        reference_stamp_s_ = stamp_s;
+        consecutive_failures_ = 0;
+        recovery_accepts_ = std::min(config_.recovery_consecutive_accepts,
+                                     recovery_accepts_ + 1);
+        UpdateTrustedImuHeading(imu_heading_valid, imu_heading_rad);
+        output.outcome = Outcome::kAccepted;
+        output.publish = true;
+        output.healthy =
+            recovery_accepts_ >= config_.recovery_consecutive_accepts;
+        output.reason = output.healthy
+                            ? "ACCEPTED_IMU_STATIONARY_CONFLICT_HOLD"
+                            : "RECOVERING_IMU_STATIONARY_CONFLICT_HOLD";
+        PopulateState(&output);
+        return output;
+      }
       pending_motion_ = false;
       ++consecutive_failures_;
       recovery_accepts_ = 0;
       output.publish = true;
       output.outcome = Outcome::kRejected;
       output.reason =
-          RejectionReason(best, output.translation_limit, output.rotation_limit);
+          RejectionReason(best, output.translation_limit, output.rotation_limit,
+                          imu_delta_valid);
       if (consecutive_failures_ >= config_.rebaseline_after_failures) {
-        Rebaseline(current, stamp_s);
+        Rebaseline(current, stamp_s, imu_heading_valid, imu_heading_rad);
         output.outcome = Outcome::kRebaseline;
         output.rebuilt_reference = true;
       } else {
@@ -193,19 +241,24 @@ class LidarOdometryCore {
 
     Eigen::Isometry3d accepted_delta = best.delta;
     if (imu_stationary) accepted_delta.setIdentity();
+    else if (imu_delta_valid) {
+      accepted_delta.linear() =
+          Eigen::AngleAxisd(expected_yaw, Eigen::Vector3d::UnitZ())
+              .toRotationMatrix();
+    }
 
     if (IsNontrivial(accepted_delta)) {
       if (!pending_motion_) {
         pending_motion_ = true;
-        pending_motion_delta_ = best.delta;
+        pending_motion_delta_ = accepted_delta;
         output.outcome = Outcome::kPendingMotion;
         output.publish = true;
         output.reason = "MOTION_CONFIRMATION_PENDING";
         PopulateState(&output);
         return output;
       }
-      if (!MotionConsistent(pending_motion_delta_, best.delta)) {
-        pending_motion_delta_ = best.delta;
+      if (!MotionConsistent(pending_motion_delta_, accepted_delta)) {
+        pending_motion_delta_ = accepted_delta;
         output.outcome = Outcome::kPendingMotion;
         output.publish = true;
         output.reason = "MOTION_CONFIRMATION_RESTARTED";
@@ -237,6 +290,7 @@ class LidarOdometryCore {
     consecutive_failures_ = 0;
     recovery_accepts_ =
         std::min(config_.recovery_consecutive_accepts, recovery_accepts_ + 1);
+    UpdateTrustedImuHeading(imu_heading_valid, imu_heading_rad);
     history_.push_back(HistoryEntry{current, matching_pose_});
     while (static_cast<int>(history_.size()) > config_.submap_scans) {
       history_.pop_front();
@@ -312,7 +366,10 @@ class LidarOdometryCore {
         config_.motion_confirmation_rotation_rad < 0.0 ||
         config_.motion_consistency_translation_m < 0.0 ||
         config_.motion_consistency_rotation_rad < 0.0 ||
-        config_.candidate_fitness_slack < 0.0 || config_.min_points < 3 ||
+        config_.candidate_fitness_slack < 0.0 ||
+        config_.imu_yaw_tolerance_rad <= 0.0 ||
+        config_.imu_yaw_tolerance_rad > std::acos(-1.0) ||
+        config_.min_points < 3 ||
         config_.submap_scans < 2 ||
         config_.submap_max_points < config_.min_points ||
         config_.registration_max_points < config_.min_points ||
@@ -323,7 +380,9 @@ class LidarOdometryCore {
     }
   }
 
-  void Rebaseline(const Cloud::Ptr& cloud, double stamp_s) {
+  void Rebaseline(const Cloud::Ptr& cloud, double stamp_s,
+                  bool imu_heading_valid = false,
+                  double imu_heading_rad = 0.0) {
     reference_ = cloud;
     reference_stamp_s_ = stamp_s;
     last_increment_.setIdentity();
@@ -332,6 +391,11 @@ class LidarOdometryCore {
     consecutive_failures_ = 0;
     recovery_accepts_ = 0;
     history_.clear();
+    trusted_imu_heading_valid_ =
+        imu_heading_valid && std::isfinite(imu_heading_rad);
+    if (trusted_imu_heading_valid_) {
+      trusted_imu_heading_rad_ = NormalizeAngle(imu_heading_rad);
+    }
   }
 
   Cloud::Ptr BuildSubmap() const {
@@ -395,12 +459,29 @@ class LidarOdometryCore {
     return limited;
   }
 
+  static Cloud::Ptr Se2RegistrationCloud(const Cloud::Ptr& cloud) {
+    if (!cloud) return Cloud::Ptr();
+    Cloud::Ptr weighted(new Cloud(*cloud));
+    // Preserve a small vertical spread so PCL GICP covariance estimation does
+    // not become singular, while preventing Livox height-layer changes from
+    // dominating the SE(2) correspondence search.
+    constexpr float kVerticalScale = 0.05F;
+    for (auto& point : weighted->points) point.z *= kVerticalScale;
+    return weighted;
+  }
+
   RegistrationResult Register(const Cloud::Ptr& source,
                               const Cloud::Ptr& target,
                               const Eigen::Isometry3d& guess) const {
     RegistrationResult result;
-    const Cloud::Ptr registration_source = LimitRegistrationCloud(source);
-    const Cloud::Ptr registration_target = LimitRegistrationCloud(target);
+    // The P0 state is SE(2). Livox consecutive scans sample different vertical
+    // layers, so unconstrained 3D GICP invents z/roll/pitch motion even while
+    // the base is stationary. Register the same official /scan points on the
+    // gravity-levelled horizontal geometry and retain all XY/yaw quality gates.
+    const Cloud::Ptr registration_source =
+        Se2RegistrationCloud(LimitRegistrationCloud(source));
+    const Cloud::Ptr registration_target =
+        Se2RegistrationCloud(LimitRegistrationCloud(target));
     if (!registration_source || !registration_target ||
         registration_source->empty() || registration_target->empty()) {
       return result;
@@ -495,14 +576,39 @@ class LidarOdometryCore {
            result.rotation <= rotation_limit;
   }
 
+  bool PassesStationaryHoldGates(const RegistrationResult& result) const {
+    return result.transform_valid && result.quality_valid &&
+           result.translation <= config_.max_step_translation_m &&
+           result.rotation <= config_.max_step_rotation_rad;
+  }
+
+  bool PassesImuYawGate(const RegistrationResult& result,
+                        bool imu_delta_valid) const {
+    return !imu_delta_valid ||
+           result.imu_yaw_error <= config_.imu_yaw_tolerance_rad;
+  }
+
+  void PopulateImuYawError(RegistrationResult* result, bool imu_delta_valid,
+                           double expected_yaw) const {
+    if (!imu_delta_valid) {
+      result->imu_yaw_error = 0.0;
+      return;
+    }
+    result->imu_yaw_error =
+        std::abs(NormalizeAngle(Yaw(result->delta) - expected_yaw));
+  }
+
   RegistrationResult SelectCandidate(const RegistrationResult& predicted,
                                      const RegistrationResult& identity,
                                      double translation_limit,
-                                     double rotation_limit) const {
+                                     double rotation_limit,
+                                     bool imu_delta_valid) const {
     const bool predicted_valid =
-        PassesAllGates(predicted, translation_limit, rotation_limit);
+        PassesAllGates(predicted, translation_limit, rotation_limit) &&
+        PassesImuYawGate(predicted, imu_delta_valid);
     const bool identity_valid =
-        PassesAllGates(identity, translation_limit, rotation_limit);
+        PassesAllGates(identity, translation_limit, rotation_limit) &&
+        PassesImuYawGate(identity, imu_delta_valid);
     if (predicted_valid && !identity_valid) return predicted;
     if (identity_valid && !predicted_valid) return identity;
     if (!predicted_valid && !identity_valid) {
@@ -551,6 +657,16 @@ class LidarOdometryCore {
                       transform.rotation()(0, 0));
   }
 
+  static double NormalizeAngle(double angle) {
+    return std::atan2(std::sin(angle), std::cos(angle));
+  }
+
+  void UpdateTrustedImuHeading(bool valid, double heading) {
+    if (!valid || !std::isfinite(heading)) return;
+    trusted_imu_heading_valid_ = true;
+    trusted_imu_heading_rad_ = NormalizeAngle(heading);
+  }
+
   static double TransformDifference(const Eigen::Isometry3d& first,
                                     const Eigen::Isometry3d& second) {
     const Eigen::Isometry3d difference = first.inverse() * second;
@@ -565,7 +681,8 @@ class LidarOdometryCore {
 
   std::string RejectionReason(const RegistrationResult& result,
                               double translation_limit,
-                              double rotation_limit) const {
+                              double rotation_limit,
+                              bool imu_delta_valid) const {
     if (!result.converged) return "NOT_CONVERGED";
     if (!std::isfinite(result.fitness)) return "NON_FINITE_FITNESS";
     if (result.z_translation > config_.max_step_z_m) return "Z_TRANSLATION_LIMIT";
@@ -576,6 +693,9 @@ class LidarOdometryCore {
     if (result.fitness > config_.max_fitness) return "FITNESS_LIMIT";
     if (result.correspondence_ratio < config_.min_correspondence_ratio) {
       return "CORRESPONDENCE_RATIO_LIMIT";
+    }
+    if (!PassesImuYawGate(result, imu_delta_valid)) {
+      return "IMU_YAW_CONSISTENCY_LIMIT";
     }
     if (result.translation > translation_limit) return "TRANSLATION_LIMIT";
     if (result.rotation > rotation_limit) return "ROTATION_LIMIT";
@@ -600,6 +720,8 @@ class LidarOdometryCore {
   Eigen::Isometry3d published_pose_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d last_increment_ = Eigen::Isometry3d::Identity();
   std::deque<HistoryEntry> history_;
+  bool trusted_imu_heading_valid_ = false;
+  double trusted_imu_heading_rad_ = 0.0;
 };
 
 }  // namespace danger_search_localization

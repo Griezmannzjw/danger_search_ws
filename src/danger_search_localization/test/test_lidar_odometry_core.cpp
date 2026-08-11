@@ -27,6 +27,28 @@ Core::Cloud::Ptr TransformCloud(const Core::Cloud::Ptr& cloud, double x) {
   pcl::transformPointCloud(*cloud, *transformed, transform.matrix()); return transformed;
 }
 
+Core::Cloud::Ptr TransformCloud2d(const Core::Cloud::Ptr& cloud, double x,
+                                  double y, double yaw) {
+  Eigen::Isometry3f transform = Eigen::Isometry3f::Identity();
+  transform.linear() = Eigen::AngleAxisf(static_cast<float>(yaw),
+                                         Eigen::Vector3f::UnitZ())
+                           .toRotationMatrix();
+  transform.translation() =
+      Eigen::Vector3f(static_cast<float>(x), static_cast<float>(y), 0.0F);
+  Core::Cloud::Ptr transformed(new Core::Cloud());
+  pcl::transformPointCloud(*cloud, *transformed, transform.matrix());
+  return transformed;
+}
+
+Core::Cloud::Ptr ReplaceHeights(const Core::Cloud::Ptr& cloud) {
+  Core::Cloud::Ptr changed(new Core::Cloud(*cloud));
+  for (std::size_t index = 0; index < changed->size(); ++index) {
+    changed->points[index].z =
+        static_cast<float>(1.5 * std::sin(static_cast<double>(index)));
+  }
+  return changed;
+}
+
 Core::Config TestConfig() {
   Core::Config config; config.voxel_size_m = 0.05F; config.max_correspondence_m = 0.50;
   config.max_iterations = 30; config.min_correspondence_ratio = 0.80; config.max_fitness = 0.05;
@@ -53,6 +75,23 @@ TEST(LidarOdometryCore, LegalTranslationIsAcceptedContinuously) {
   ASSERT_EQ(pending.outcome, Core::Outcome::kPendingMotion);
   EXPECT_NEAR(pending.pose.translation().x(), 0.0, 1e-6);
   const auto result = core.Process(moved, 1.2); ASSERT_EQ(result.outcome, Core::Outcome::kAccepted); EXPECT_NEAR(result.pose.translation().x(), 0.10, 0.02);
+}
+TEST(LidarOdometryCore, ImuStationaryDifferentVerticalSamplesHoldSe2Pose) {
+  Core core(TestConfig());
+  const auto scene = MakeScene();
+  core.Process(scene, 1.0);
+  const auto different_heights = ReplaceHeights(scene);
+
+  const auto recovering = core.Process(different_heights, 1.1, true);
+  const auto healthy = core.Process(different_heights, 1.2, true);
+
+  EXPECT_EQ(recovering.outcome, Core::Outcome::kAccepted);
+  EXPECT_EQ(healthy.outcome, Core::Outcome::kAccepted);
+  EXPECT_TRUE(healthy.healthy);
+  EXPECT_LT(healthy.registration.z_translation, TestConfig().max_step_z_m);
+  EXPECT_LT(healthy.registration.roll_pitch,
+            TestConfig().max_step_roll_pitch_rad);
+  EXPECT_NEAR(healthy.pose.translation().norm(), 0.0, 1e-3);
 }
 TEST(LidarOdometryCore, MetreScaleMismatchIsRejectedAndPoseIsHeld) {
   Core core(TestConfig()); const auto scene = MakeScene(); core.Process(scene, 1.0); const auto before = core.pose();
@@ -118,6 +157,72 @@ TEST(LidarOdometryCore, ImuStationaryHoldAcceptsGeometryWithoutIntegratingMotion
   EXPECT_EQ(result.outcome, Core::Outcome::kAccepted);
   EXPECT_FALSE(core.pending_motion());
   EXPECT_NEAR(result.pose.translation().norm(), 0.0, 1e-6);
+}
+TEST(LidarOdometryCore, ImuStationaryConflictHoldBypassesOnlyDynamicMotionGate) {
+  auto config = TestConfig();
+  config.max_linear_speed_mps = 0.30;
+  config.translation_margin_m = 0.01;
+  config.max_gate_dt_s = 0.10;
+  Core core(config);
+  const auto scene = MakeScene();
+  core.Process(scene, 1.0);
+  const auto apparent_motion = TransformCloud(scene, -0.20);
+  const auto recovering = core.Process(apparent_motion, 1.1, true);
+  const auto healthy = core.Process(apparent_motion, 1.2, true);
+
+  EXPECT_EQ(recovering.outcome, Core::Outcome::kAccepted);
+  EXPECT_FALSE(recovering.healthy);
+  EXPECT_EQ(healthy.outcome, Core::Outcome::kAccepted);
+  EXPECT_TRUE(healthy.healthy);
+  EXPECT_EQ(healthy.reason, "ACCEPTED_IMU_STATIONARY_CONFLICT_HOLD");
+  EXPECT_EQ(core.consecutive_failures(), 0);
+  EXPECT_EQ(core.history_size(), 1U);
+  EXPECT_NEAR(healthy.pose.translation().norm(), 0.0, 1e-6);
+}
+TEST(LidarOdometryCore, ImuStationaryCannotBypassHardStepLimit) {
+  Core core(TestConfig());
+  const auto scene = MakeScene();
+  core.Process(scene, 1.0);
+
+  const auto result = core.Process(TransformCloud(scene, -1.0), 1.1, true);
+
+  EXPECT_EQ(result.outcome, Core::Outcome::kRejected);
+  EXPECT_FALSE(result.healthy);
+  EXPECT_EQ(core.consecutive_failures(), 1);
+  EXPECT_NEAR(result.pose.translation().norm(), 0.0, 1e-6);
+}
+
+TEST(LidarOdometryCore, ImuHeadingRejectsInconsistentScanYaw) {
+  auto config = TestConfig();
+  config.imu_yaw_tolerance_rad = 0.05;
+  Core core(config);
+  const auto scene = MakeScene();
+  core.Process(scene, 1.0, false, true, 0.0);
+
+  const auto rotated = TransformCloud2d(scene, 0.0, 0.0, -0.15);
+  const auto result = core.Process(rotated, 1.1, false, true, 0.0);
+
+  EXPECT_EQ(result.outcome, Core::Outcome::kRejected);
+  EXPECT_EQ(result.reason, "IMU_YAW_CONSISTENCY_LIMIT");
+  EXPECT_NEAR(result.pose.translation().norm(), 0.0, 1e-6);
+}
+
+TEST(LidarOdometryCore, ImuHeadingConstrainsAcceptedScanYaw) {
+  auto config = TestConfig();
+  config.imu_yaw_tolerance_rad = 0.08;
+  Core core(config);
+  const auto scene = MakeScene();
+  core.Process(scene, 1.0, false, true, 0.0);
+
+  const auto moved = TransformCloud2d(scene, -0.04, 0.0, -0.10);
+  EXPECT_EQ(core.Process(moved, 1.1, false, true, 0.10).outcome,
+            Core::Outcome::kPendingMotion);
+  const auto accepted = core.Process(moved, 1.2, false, true, 0.10);
+
+  EXPECT_EQ(accepted.outcome, Core::Outcome::kAccepted);
+  EXPECT_NEAR(std::atan2(accepted.pose.rotation()(1, 0),
+                         accepted.pose.rotation()(0, 0)),
+              0.10, 0.02);
 }
 }  // namespace
 

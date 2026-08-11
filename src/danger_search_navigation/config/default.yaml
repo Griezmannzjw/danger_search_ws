@@ -21,6 +21,8 @@ robot_radius: 0.30
 inflation_padding: 0.10
 allow_diagonal: true
 max_planner_expansions: 75000
+# 严格已知区规划失败后，Action 可高代价进入 unknown；真实/动态障碍仍阻断。
+action_unknown_penalty: 3.0
 
 # 消息合法性和新鲜度门。pose/map 的源时间由 /mapping/status 统一判定；
 # 这两个值保留用于参数兼容，导航不再用它们淘汰合法的缓存地图/位姿。
@@ -70,5 +72,7 @@ replan_period: 1.00
 replan_min_interval: 0.25
 replan_deviation_distance: 0.50
 stuck_timeout: 5.00
+# 活动 Action 的数据短时退化先零速等待，超时后才结束同一目标。
+readiness_recovery_timeout: 3.00
 progress_distance: 0.10
 stuck_command_speed: 0.05

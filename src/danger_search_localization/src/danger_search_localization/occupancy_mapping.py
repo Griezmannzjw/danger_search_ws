@@ -45,12 +45,15 @@ class OccupancyMapperCore:
         shape = (self.config.size, self.config.size)
         self.scores = np.zeros(shape, dtype=np.int16)
         self.observed = np.zeros(shape, dtype=bool)
-        self.origin_x = -self.config.start_x * (
-            self.config.size * self.config.resolution
-        )
-        self.origin_y = -self.config.start_y * (
-            self.config.size * self.config.resolution
-        )
+        # Put the task origin at a cell center. OccupancyGrid.resolution is
+        # serialized as float32; placing (0, 0) exactly on a cell boundary can
+        # otherwise make the mapper and a consumer choose adjacent cells.
+        self.origin_x = -(
+            self.config.start_x * self.config.size + 0.5
+        ) * self.config.resolution
+        self.origin_y = -(
+            self.config.start_y * self.config.size + 0.5
+        ) * self.config.resolution
         self.update_count = 0
 
     def update(self, pose, scan):

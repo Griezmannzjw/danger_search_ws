@@ -103,6 +103,16 @@ class MissionManager:
         self.return_timeout_s = self._positive_param("~return_timeout_s", 120.0)
         self.entry_timeout_s = self._positive_param("~entry_timeout_s", 90.0)
         self.entry_distance_m = self._positive_param("~entry_distance_m", 4.2)
+        self.entry_approach_distance_m = self._positive_param(
+            "~entry_approach_distance_m", 2.4
+        )
+        self.entry_heading_rad = float(rospy.get_param("~entry_heading_rad", 0.0))
+        if not math.isfinite(self.entry_heading_rad):
+            raise rospy.ROSInitException("~entry_heading_rad must be finite")
+        if self.entry_approach_distance_m >= self.entry_distance_m:
+            raise rospy.ROSInitException(
+                "~entry_approach_distance_m must be shorter than entry_distance_m"
+            )
         self.mission_timeout_s = self._nonnegative_param("~mission_timeout_s", 0.0)
         self.input_timeout_s = self._positive_param("~input_timeout_s", 2.0)
         self.entry_enabled = bool(rospy.get_param("~entry_enabled", True))
@@ -132,6 +142,7 @@ class MissionManager:
         self.map_coverage_summary = ""
         self.return_goal_active = False
         self.entry_goal_active = False
+        self.entry_approach_complete = False
         self.entrance_ready = not self.require_entrance_ready
         self.exploration_completion_armed = False
         self.finalized = False
@@ -414,6 +425,7 @@ class MissionManager:
             self.tracker.reset()
             self.return_goal_active = False
             self.entry_goal_active = False
+            self.entry_approach_complete = False
             self.exploration_completion_armed = False
             self.finalized = False
             self.remaining_frontier_count = 0
@@ -421,13 +433,15 @@ class MissionManager:
         self.active_pub.publish(Bool(data=True))
         self._publish_status()
         if self.entry_enabled:
-            success, message = self._send_entry_goal(home_pose)
+            success, message = self._send_entry_goal(
+                home_pose, self.entry_approach_distance_m
+            )
             if not success:
                 self._finalize("entry_start_failed:" + message, error=True)
                 return TriggerResponse(False, message)
             rospy.loginfo(
-                "[mission] ENTERING; home captured, target %.2f m ahead",
-                self.entry_distance_m,
+                "[mission] ENTERING; home captured, approach %.2f m then cross %.2f m",
+                self.entry_approach_distance_m, self.entry_distance_m,
             )
             return TriggerResponse(True, "Mission started; entering building")
 
@@ -437,20 +451,26 @@ class MissionManager:
             return TriggerResponse(False, message)
         return TriggerResponse(True, "Mission started")
 
-    def _send_entry_goal(self, home_pose):
+    def _send_entry_goal(self, home_pose, distance_m):
         if not self.move_base_client.wait_for_server(rospy.Duration(1.0)):
             return False, "move_base unavailable for entry"
-        orientation = home_pose.pose.pose.orientation
-        yaw = math.atan2(
-            2.0 * (orientation.w * orientation.z + orientation.x * orientation.y),
-            1.0 - 2.0 * (orientation.y ** 2 + orientation.z ** 2),
-        )
         goal = MoveBaseGoal()
         goal.target_pose.header.stamp = rospy.Time.now()
         goal.target_pose.header.frame_id = self.map_frame
         goal.target_pose.pose = copy.deepcopy(home_pose.pose.pose)
-        goal.target_pose.pose.position.x += self.entry_distance_m * math.cos(yaw)
-        goal.target_pose.pose.position.y += self.entry_distance_m * math.sin(yaw)
+        # The first GICP pose defines map heading 0.  The standing controller
+        # may rotate the body before /danger_search/start; using that transient
+        # body yaw would send the entrance goal away from the known entry axis.
+        goal.target_pose.pose.position.x += distance_m * math.cos(
+            self.entry_heading_rad
+        )
+        goal.target_pose.pose.position.y += distance_m * math.sin(
+            self.entry_heading_rad
+        )
+        goal.target_pose.pose.orientation.x = 0.0
+        goal.target_pose.pose.orientation.y = 0.0
+        goal.target_pose.pose.orientation.z = math.sin(self.entry_heading_rad / 2.0)
+        goal.target_pose.pose.orientation.w = math.cos(self.entry_heading_rad / 2.0)
         self.move_base_client.send_goal(goal, done_cb=self._entry_done_callback)
         with self.lock:
             self.entry_goal_active = True
@@ -464,9 +484,34 @@ class MissionManager:
         if state != GoalStatus.SUCCEEDED:
             self._finalize("entry_failed_action_state_%d" % state, error=True)
             return
+        with self.lock:
+            if not self.entry_approach_complete:
+                self.entry_approach_complete = True
+                continue_entry = True
+            else:
+                continue_entry = False
+        if continue_entry:
+            # SimpleActionClient is still completing its state transition while
+            # the done callback runs.  Sending the next goal from this stack can
+            # drop its DONE transition, so schedule it after the callback returns.
+            rospy.Timer(
+                rospy.Duration(0.01), self._continue_entry_callback, oneshot=True
+            )
+            return
         success, message = self._start_exploration()
         if not success:
             self._finalize("start_exploration_error:" + message, error=True)
+
+    def _continue_entry_callback(self, _event):
+        with self.lock:
+            if self.mission_state != MissionLifecycle.ENTERING or self.finalized:
+                return
+            home_pose = copy.deepcopy(self.home_pose)
+        success, message = self._send_entry_goal(home_pose, self.entry_distance_m)
+        if not success:
+            self._finalize("entry_crossing_start_failed:" + message, error=True)
+            return
+        rospy.loginfo("[mission] entrance approach complete; crossing open entry")
 
     def _start_exploration(self):
         try:

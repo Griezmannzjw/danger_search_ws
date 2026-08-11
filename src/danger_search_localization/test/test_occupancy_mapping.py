@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import math
+import struct
 import unittest
 from types import SimpleNamespace
 
@@ -56,3 +57,16 @@ class TestOccupancyMapping(unittest.TestCase):
     def test_empty_scan_does_not_create_map_update(self):
         self.assertFalse(self.core.update((0.0, 0.0, 0.0), self.scan([math.inf])))
         self.assertEqual(self.core.update_count, 0)
+
+    def test_origin_cell_survives_occupancy_grid_float32_resolution(self):
+        internal = self.core.world_to_cell(0.0, 0.0)
+        wire_resolution = struct.unpack(
+            "f", struct.pack("f", self.core.config.resolution)
+        )[0]
+        external = (
+            int(math.floor((0.0 - self.core.origin_x) / wire_resolution)),
+            int(math.floor((0.0 - self.core.origin_y) / wire_resolution)),
+        )
+
+        self.assertEqual(internal, external)
+        self.assertEqual(internal, (50, 50))
