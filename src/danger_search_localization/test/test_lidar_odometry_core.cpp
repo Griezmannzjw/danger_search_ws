@@ -34,17 +34,25 @@ Core::Config TestConfig() {
   config.max_linear_speed_mps = 2.0; config.max_angular_speed_rps = 3.0;
   config.translation_margin_m = 0.02; config.rotation_margin_rad = 0.02;
   config.translation_deadband_m = 0.0; config.rotation_deadband_rad = 0.0;
-  config.min_points = 100; config.rebaseline_after_failures = 3; config.recovery_consecutive_accepts = 2;
+  config.min_points = 100; config.registration_max_points = 120;
+  config.rebaseline_after_failures = 3; config.recovery_consecutive_accepts = 2;
   return config;
 }
 
 TEST(LidarOdometryCore, IdenticalCloudIsAcceptedWithoutDrift) {
   Core core(TestConfig()); const auto scene = MakeScene(); core.Process(scene, 1.0);
-  const auto result = core.Process(scene, 1.1); EXPECT_EQ(result.outcome, Core::Outcome::kAccepted); EXPECT_TRUE(result.healthy); EXPECT_NEAR(result.pose.translation().norm(), 0.0, 1e-3);
+  const auto recovering = core.Process(scene, 1.1);
+  EXPECT_EQ(recovering.outcome, Core::Outcome::kAccepted);
+  EXPECT_FALSE(recovering.healthy);
+  const auto result = core.Process(scene, 1.2); EXPECT_EQ(result.outcome, Core::Outcome::kAccepted); EXPECT_TRUE(result.healthy); EXPECT_NEAR(result.pose.translation().norm(), 0.0, 1e-3);
 }
 TEST(LidarOdometryCore, LegalTranslationIsAcceptedContinuously) {
   Core core(TestConfig()); const auto scene = MakeScene(); core.Process(scene, 1.0);
-  const auto result = core.Process(TransformCloud(scene, -0.10), 1.1); ASSERT_EQ(result.outcome, Core::Outcome::kAccepted); EXPECT_NEAR(result.pose.translation().x(), 0.10, 0.02);
+  const auto moved = TransformCloud(scene, -0.10);
+  const auto pending = core.Process(moved, 1.1);
+  ASSERT_EQ(pending.outcome, Core::Outcome::kPendingMotion);
+  EXPECT_NEAR(pending.pose.translation().x(), 0.0, 1e-6);
+  const auto result = core.Process(moved, 1.2); ASSERT_EQ(result.outcome, Core::Outcome::kAccepted); EXPECT_NEAR(result.pose.translation().x(), 0.10, 0.02);
 }
 TEST(LidarOdometryCore, MetreScaleMismatchIsRejectedAndPoseIsHeld) {
   Core core(TestConfig()); const auto scene = MakeScene(); core.Process(scene, 1.0); const auto before = core.pose();
@@ -81,6 +89,35 @@ TEST(LidarOdometryCore, RegistrationCloudNeverExceedsConfiguredPointLimit) {
 }
 TEST(LidarOdometryCore, RejectsNonFiniteCloudWithoutPollutingState) {
   Core core(TestConfig()); const auto scene = MakeScene(); core.Process(scene, 1.0); const auto trusted = core.history_size(); auto invalid = MakeScene(); invalid->points[0].x = std::numeric_limits<float>::infinity(); EXPECT_EQ(core.Process(invalid, 1.1).outcome, Core::Outcome::kInvalidInput); EXPECT_EQ(core.history_size(), trusted);
+}
+TEST(LidarOdometryCore, RejectionDoesNotExpandNextFrameSpeedGate) {
+  auto config = TestConfig();
+  config.max_linear_speed_mps = 0.30;
+  config.translation_margin_m = 0.01;
+  config.max_gate_dt_s = 0.10;
+  Core core(config); const auto scene = MakeScene(); core.Process(scene, 1.0);
+  const auto mismatch = TransformCloud(scene, -0.20);
+  const auto first = core.Process(mismatch, 1.1);
+  const auto second = core.Process(mismatch, 1.5);
+  EXPECT_EQ(first.outcome, Core::Outcome::kRejected);
+  EXPECT_EQ(second.outcome, Core::Outcome::kRejected);
+  EXPECT_NEAR(first.translation_limit, second.translation_limit, 1e-9);
+}
+TEST(LidarOdometryCore, InconsistentMotionNeverChangesPublishedPose) {
+  Core core(TestConfig()); const auto scene = MakeScene(); core.Process(scene, 1.0);
+  EXPECT_EQ(core.Process(TransformCloud(scene, -0.10), 1.1).outcome,
+            Core::Outcome::kPendingMotion);
+  const auto inconsistent = core.Process(TransformCloud(scene, 0.10), 1.2);
+  EXPECT_EQ(inconsistent.outcome, Core::Outcome::kPendingMotion);
+  EXPECT_NEAR(inconsistent.pose.translation().norm(), 0.0, 1e-6);
+}
+TEST(LidarOdometryCore, ImuStationaryHoldAcceptsGeometryWithoutIntegratingMotion) {
+  Core core(TestConfig()); const auto scene = MakeScene(); core.Process(scene, 1.0);
+  const auto moved = TransformCloud(scene, -0.10);
+  const auto result = core.Process(moved, 1.1, true);
+  EXPECT_EQ(result.outcome, Core::Outcome::kAccepted);
+  EXPECT_FALSE(core.pending_motion());
+  EXPECT_NEAR(result.pose.translation().norm(), 0.0, 1e-6);
 }
 }  // namespace
 

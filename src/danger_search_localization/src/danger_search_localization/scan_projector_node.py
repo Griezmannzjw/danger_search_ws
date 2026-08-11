@@ -7,17 +7,18 @@ import threading
 import numpy as np
 import rospy
 import tf2_ros
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from sensor_msgs.msg import Imu, LaserScan, PointCloud
 
 from .config import ScanProjectionConfig
 from .scan_projection import (
     estimate_ground_clearance,
     gravity_level_points,
-    merge_scan_history,
+    interpolate_planar_pose,
+    PoseCompensatedPointAccumulator,
     project_planar_scan,
     quaternion_inverse,
     quaternion_multiply,
-    TimedScanAccumulator,
     transform_points,
 )
 
@@ -33,12 +34,23 @@ class ScanProjectorNode:
         self.config = self._load_config()
         self.imu_lock = threading.RLock()
         self.imu_samples = deque(maxlen=500)
-        self.scan_accumulator = TimedScanAccumulator(
+        self.point_accumulator = PoseCompensatedPointAccumulator(
             self.config.scan_accumulation_frames,
             self.config.scan_accumulation_max_age_s,
         )
         self.last_published_stamp_s = None
-        self.last_published_stamp_s = None
+        self.gicp_pose_topic = rospy.get_param(
+            "~gicp_pose_topic", "/localization/raw_pose"
+        )
+        self.odom_frame = rospy.get_param("~odom_frame", "odom")
+        self.gicp_unhealthy_variance_threshold = float(
+            rospy.get_param("~gicp_unhealthy_variance_threshold", 1.0)
+        )
+        self.sync_lock = threading.RLock()
+        self.pending_point_frames = []
+        self.pending_poses = []
+        self.last_healthy_pose = None
+        self.last_consumed_point_stamp_s = None
 
         self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
@@ -50,6 +62,12 @@ class ScanProjectorNode:
         )
         self.subscriber = rospy.Subscriber(
             self.input_topic, PointCloud, self._cloud_callback, queue_size=2
+        )
+        self.gicp_subscriber = rospy.Subscriber(
+            self.gicp_pose_topic,
+            PoseWithCovarianceStamped,
+            self._gicp_pose_callback,
+            queue_size=20,
         )
         rospy.loginfo(
             "[localization] projecting official %s to %s in frame %s",
@@ -163,10 +181,7 @@ class ScanProjectorNode:
                         )
                         roll = pitch = None
                     if roll is None:
-                        frame_ranges = project_planar_scan(
-                            points_base, self.config
-                        )
-                        self._accumulate_and_publish(message, frame_ranges)
+                        self._queue_points(message, points_base)
                         return
                     angular_speed = math.sqrt(
                         sum(float(value) ** 2 for value in angular_velocity)
@@ -201,28 +216,138 @@ class ScanProjectorNode:
                             )
                             if self.config.drop_unstable_scans:
                                 return
-        frame_ranges = project_planar_scan(points_base, self.config)
-        self._accumulate_and_publish(message, frame_ranges)
+        self._queue_points(message, points_base)
 
-    def _accumulate_and_publish(self, message, frame_ranges):
-        try:
-            reset = self.scan_accumulator.add(
-                message.header.stamp.to_sec(), frame_ranges
-            )
-        except ValueError as exc:
-            rospy.logwarn_throttle(
-                1.0, "[localization] invalid projected scan: %s", str(exc)
-            )
+    def _queue_points(self, message, points_base):
+        stamp_s = message.header.stamp.to_sec()
+        if not math.isfinite(stamp_s) or not np.isfinite(points_base).all():
             return
-        if reset:
-            rospy.logwarn_throttle(
-                2.0,
-                "[localization] scan history reset after time discontinuity",
+        with self.sync_lock:
+            self.pending_point_frames.append(
+                (stamp_s, message.header, np.asarray(points_base).copy())
             )
-        ranges = merge_scan_history(
-            self.scan_accumulator.scans,
-            self.config.scan_accumulation_min_samples_per_bin,
+            self.pending_point_frames.sort(key=lambda value: value[0])
+            newest = self.pending_point_frames[-1][0]
+            self.pending_point_frames = [
+                frame
+                for frame in self.pending_point_frames[-50:]
+                if newest - frame[0]
+                <= max(2.0, 3.0 * self.config.scan_accumulation_max_age_s)
+            ]
+            self._drain_synchronized_observations()
+
+    def _gicp_pose_callback(self, message):
+        if message.header.frame_id != self.odom_frame:
+            return
+        covariance = message.pose.covariance
+        if not all(
+            math.isfinite(covariance[index])
+            and covariance[index] < self.gicp_unhealthy_variance_threshold
+            for index in (0, 7, 35)
+        ):
+            return
+        orientation = message.pose.pose.orientation
+        norm = math.sqrt(
+            orientation.x * orientation.x
+            + orientation.y * orientation.y
+            + orientation.z * orientation.z
+            + orientation.w * orientation.w
         )
+        if not math.isfinite(norm) or norm < 1e-9:
+            return
+        yaw = math.atan2(
+            2.0
+            * (
+                orientation.w * orientation.z
+                + orientation.x * orientation.y
+            ),
+            1.0
+            - 2.0
+            * (
+                orientation.y * orientation.y
+                + orientation.z * orientation.z
+            ),
+        )
+        position = message.pose.pose.position
+        values = (
+            message.header.stamp.to_sec(),
+            (float(position.x), float(position.y), float(yaw)),
+        )
+        if not all(math.isfinite(value) for value in (values[0], *values[1])):
+            return
+        with self.sync_lock:
+            self.pending_poses.append(values)
+            self.pending_poses.sort(key=lambda value: value[0])
+            self.pending_poses = self.pending_poses[-20:]
+            self._drain_synchronized_observations()
+
+    def _drain_synchronized_observations(self):
+        while self.pending_poses and self.pending_point_frames:
+            pose_stamp_s, current_pose = self.pending_poses[0]
+            has_current_cloud = any(
+                abs(frame[0] - pose_stamp_s) <= 1e-6
+                for frame in self.pending_point_frames
+            )
+            if not has_current_cloud:
+                if self.pending_point_frames[-1][0] > pose_stamp_s + 1e-6:
+                    self.pending_poses.pop(0)
+                    continue
+                break
+
+            self.pending_poses.pop(0)
+            usable_frames = [
+                frame
+                for frame in self.pending_point_frames
+                if frame[0] <= pose_stamp_s + 1e-6
+                and (
+                    self.last_consumed_point_stamp_s is None
+                    or frame[0] > self.last_consumed_point_stamp_s + 1e-9
+                )
+            ]
+            if not usable_frames:
+                continue
+            previous = self.last_healthy_pose
+            for stamp_s, _, points in usable_frames:
+                if previous is None or pose_stamp_s <= previous[0]:
+                    frame_pose = current_pose
+                else:
+                    ratio = (stamp_s - previous[0]) / (
+                        pose_stamp_s - previous[0]
+                    )
+                    frame_pose = interpolate_planar_pose(
+                        previous[1], current_pose, ratio
+                    )
+                try:
+                    reset = self.point_accumulator.add(
+                        stamp_s, frame_pose, points
+                    )
+                except ValueError as exc:
+                    rospy.logwarn_throttle(
+                        1.0,
+                        "[localization] invalid compensated scan input: %s",
+                        str(exc),
+                    )
+                    continue
+                if reset:
+                    rospy.logwarn_throttle(
+                        2.0,
+                        "[localization] compensated scan history reset",
+                    )
+                self.last_consumed_point_stamp_s = stamp_s
+
+            self.last_healthy_pose = (pose_stamp_s, current_pose)
+            self.pending_point_frames = [
+                frame
+                for frame in self.pending_point_frames
+                if frame[0] > pose_stamp_s + 1e-6
+            ]
+            header = usable_frames[-1][1]
+            header.stamp = rospy.Time.from_sec(pose_stamp_s)
+            self._publish_compensated_scan(header)
+
+    def _publish_compensated_scan(self, header):
+        points = self.point_accumulator.points_in_latest_frame()
+        ranges = project_planar_scan(points, self.config)
 
         finite_mask = np.isfinite(ranges)
         valid_bins = int(np.sum(finite_mask))
@@ -245,12 +370,12 @@ class ScanProjectorNode:
             return
 
         output = LaserScan()
-        output.header.stamp = message.header.stamp
+        output.header.stamp = header.stamp
         output.header.frame_id = self.base_frame
         output.angle_min = self.config.angle_min
         output.angle_max = self.config.angle_max
         output.angle_increment = self.config.angle_increment
-        stamp_s = message.header.stamp.to_sec()
+        stamp_s = header.stamp.to_sec()
         output.scan_time = self._published_scan_interval(stamp_s)
         output.time_increment = 0.0
         output.range_min = self.config.range_min

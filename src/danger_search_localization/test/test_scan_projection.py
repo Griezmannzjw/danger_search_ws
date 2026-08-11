@@ -11,9 +11,11 @@ from danger_search_localization.scan_projection import (
     estimate_ground_clearance,
     gravity_level_points,
     merge_scan_history,
+    PoseCompensatedPointAccumulator,
     project_planar_scan,
     quaternion_multiply,
     TimedScanAccumulator,
+    transform_points_between_planar_poses,
     transform_points,
 )
 
@@ -232,6 +234,27 @@ class TestScanProjection(unittest.TestCase):
 
         self.assertTrue(accumulator.add(1.0, [1.0]))
         self.assertEqual(len(accumulator), 1)
+
+    def test_pose_compensation_aligns_a_stationary_wall_while_robot_moves(self):
+        point_in_first_base = np.array([[2.0, 0.0, 0.5]])
+        point_in_second_base = np.array([[1.0, 0.0, 0.5]])
+        accumulator = PoseCompensatedPointAccumulator(3, 1.0)
+        accumulator.add(1.0, (0.0, 0.0, 0.0), point_in_first_base)
+        accumulator.add(2.0, (1.0, 0.0, 0.0), point_in_second_base)
+
+        compensated = accumulator.points_in_latest_frame()
+
+        np.testing.assert_allclose(
+            compensated, [[1.0, 0.0, 0.5], [1.0, 0.0, 0.5]], atol=1e-7
+        )
+
+    def test_planar_pose_transform_handles_yaw(self):
+        result = transform_points_between_planar_poses(
+            [[1.0, 0.0, 0.0]],
+            (0.0, 0.0, math.pi / 2.0),
+            (0.0, 0.0, 0.0),
+        )
+        np.testing.assert_allclose(result, [[0.0, 1.0, 0.0]], atol=1e-7)
 
     @staticmethod
     def _quaternion_from_rpy(roll, pitch, yaw):

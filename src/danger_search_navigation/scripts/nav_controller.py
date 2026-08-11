@@ -41,6 +41,62 @@ from navigation_core import (
 )
 
 
+class LatestMapWorker:
+    """Build only the newest planner snapshot without blocking ROS callbacks."""
+
+    def __init__(self, build, install, on_error=None):
+        self._build = build
+        self._install = install
+        self._on_error = on_error
+        self._condition = threading.Condition()
+        self._latest_sequence = 0
+        self._pending = None
+        self._stopping = False
+        self._thread = threading.Thread(target=self._run, name="navigation-map-worker")
+        self._thread.daemon = True
+        self._thread.start()
+
+    def submit(self, payload):
+        with self._condition:
+            self._latest_sequence += 1
+            self._pending = (self._latest_sequence, payload)
+            self._condition.notify()
+
+    def invalidate(self):
+        """Ensure an older in-flight build cannot replace an invalid newest map."""
+        with self._condition:
+            self._latest_sequence += 1
+            self._pending = None
+
+    def stop(self):
+        with self._condition:
+            self._stopping = True
+            self._condition.notify_all()
+
+    def _run(self):
+        while True:
+            with self._condition:
+                while self._pending is None and not self._stopping:
+                    self._condition.wait()
+                if self._stopping:
+                    return
+                sequence, payload = self._pending
+                self._pending = None
+            try:
+                result = self._build(payload)
+            except Exception as exc:  # Keep the worker alive after malformed input.
+                if self._on_error is not None:
+                    self._on_error(exc)
+                continue
+            with self._condition:
+                if self._stopping:
+                    return
+                if sequence != self._latest_sequence:
+                    continue
+                # Keep the freshness check and pointer swap atomic with submit().
+                self._install(result)
+
+
 class NavController:
     """共享全局规划器和固定路径跟踪器的 ROS 适配层。"""
 
@@ -89,6 +145,15 @@ class NavController:
         self.obstacle_range_min = float(rospy.get_param("~obstacle_range_min", 0.15))
         self.obstacle_range_max = float(rospy.get_param("~obstacle_range_max", 8.00))
         self.zero_point_radius = float(rospy.get_param("~zero_point_radius", 0.05))
+        self.obstacle_self_exclusion_min_x = float(
+            rospy.get_param("~obstacle_self_exclusion_min_x", -0.55)
+        )
+        self.obstacle_self_exclusion_max_x = float(
+            rospy.get_param("~obstacle_self_exclusion_max_x", 0.55)
+        )
+        self.obstacle_self_exclusion_half_width_y = float(
+            rospy.get_param("~obstacle_self_exclusion_half_width_y", 0.40)
+        )
         self.obstacle_max_points = int(rospy.get_param("~obstacle_max_points", 2000))
         self.dynamic_stop_distance = float(rospy.get_param("~dynamic_stop_distance", 0.60))
         self.dynamic_front_half_angle = float(rospy.get_param("~dynamic_front_half_angle", 0.52))
@@ -147,21 +212,29 @@ class NavController:
         self.controller_active = False
         self.last_cmd_time = rospy.Time(0)
 
+        self.map_worker = LatestMapWorker(
+            self._build_planner_snapshot,
+            self._install_planner_snapshot,
+            self._map_build_failed,
+        )
+
         self.cmd_pub = rospy.Publisher(self.nav_cmd_topic, Twist, queue_size=10)
         self.health_pub = rospy.Publisher(self.health_topic, NavigationHealth, queue_size=10)
 
         self.pose_sub = rospy.Subscriber(
-            self.pose_topic, PoseWithCovarianceStamped, self.pose_callback
+            self.pose_topic, PoseWithCovarianceStamped, self.pose_callback, queue_size=10
         )
-        self.map_sub = rospy.Subscriber(self.map_topic, OccupancyGrid, self.map_callback)
+        self.map_sub = rospy.Subscriber(
+            self.map_topic, OccupancyGrid, self.map_callback, queue_size=1
+        )
         self.mapping_status_sub = rospy.Subscriber(
-            self.mapping_status_topic, MappingStatus, self.mapping_status_callback
+            self.mapping_status_topic, MappingStatus, self.mapping_status_callback, queue_size=10
         )
         self.obstacle_sub = rospy.Subscriber(
-            self.obstacle_cloud_topic, PointCloud, self.obstacle_callback
+            self.obstacle_cloud_topic, PointCloud, self.obstacle_callback, queue_size=1
         )
         self.safety_stop_sub = rospy.Subscriber(
-            self.safety_stop_topic, Bool, self.safety_stop_callback
+            self.safety_stop_topic, Bool, self.safety_stop_callback, queue_size=2
         )
 
         self.action_server = actionlib.SimpleActionServer(
@@ -183,7 +256,7 @@ class NavController:
         self.health_timer = rospy.Timer(
             rospy.Duration(1.0 / self.health_rate), self.publish_health
         )
-        rospy.on_shutdown(self._stop_robot)
+        rospy.on_shutdown(self._shutdown)
 
         rospy.loginfo(
             "[navigation] 已启动共享 A* 导航节点，action: %s", self.move_base_action_name
@@ -215,6 +288,12 @@ class NavController:
             raise rospy.ROSInitException("点云高度范围无效")
         if self.obstacle_range_min < 0.0 or self.obstacle_range_min >= self.obstacle_range_max:
             raise rospy.ROSInitException("点云距离范围无效")
+        if (
+            self.obstacle_self_exclusion_min_x
+            >= self.obstacle_self_exclusion_max_x
+            or self.obstacle_self_exclusion_half_width_y < 0.0
+        ):
+            raise rospy.ROSInitException("机器人自身点云排除范围无效")
         if not 1 <= self.occupied_threshold <= 100:
             raise rospy.ROSInitException("占据阈值必须位于 1..100")
 
@@ -230,38 +309,60 @@ class NavController:
             self._stop_robot()
 
     def map_callback(self, msg):
-        """原子替换经合法性检查的规划器快照。"""
-        planner = None
+        """Validate cheaply and leave million-cell planner construction to a worker."""
         valid = False
+        yaw = None
         if msg.header.frame_id == self.map_frame and not msg.header.stamp.is_zero():
             origin = msg.info.origin
             yaw = self._quaternion_yaw(origin.orientation)
-            if yaw is not None and self._finite(origin.position.x, origin.position.y):
-                try:
-                    planner = InflatedOccupancyGrid(
-                        msg.info.width, msg.info.height, msg.info.resolution,
-                        origin.position.x, origin.position.y, yaw, msg.data,
-                        occupied_threshold=self.occupied_threshold,
-                        robot_radius=self.robot_radius,
-                        inflation_padding=self.inflation_padding,
-                        allow_diagonal=self.allow_diagonal,
-                        max_expansions=self.max_expansions,
-                    )
-                    valid = True
-                except (TypeError, ValueError) as exc:
-                    rospy.logwarn_throttle(5.0, "[navigation] 地图无效，拒绝规划: %s", exc)
+            valid = (
+                yaw is not None
+                and self._finite(origin.position.x, origin.position.y, msg.info.resolution)
+                and msg.info.width > 0
+                and msg.info.height > 0
+                and msg.info.resolution > 0.0
+                and len(msg.data) == msg.info.width * msg.info.height
+            )
         if not valid:
             rospy.logwarn_throttle(5.0, "[navigation] 地图帧、时间戳、原点或几何无效")
+            self.map_worker.invalidate()
+            with self.lock:
+                self.map_data = None
+                self.planner = None
+                self.map_stamp = msg.header.stamp
+                self.map_valid = False
+                active = self.goal_state.active
+            if active:
+                self._stop_robot()
+            return
+        self.map_worker.submit((msg, yaw))
+
+    def _build_planner_snapshot(self, payload):
+        msg, yaw = payload
+        origin = msg.info.origin
+        planner = InflatedOccupancyGrid(
+            msg.info.width, msg.info.height, msg.info.resolution,
+            origin.position.x, origin.position.y, yaw, msg.data,
+            occupied_threshold=self.occupied_threshold,
+            robot_radius=self.robot_radius,
+            inflation_padding=self.inflation_padding,
+            allow_diagonal=self.allow_diagonal,
+            max_expansions=self.max_expansions,
+        )
+        return msg.header.stamp, planner
+
+    def _install_planner_snapshot(self, snapshot):
+        stamp, planner = snapshot
         with self.lock:
-            self.map_data = tuple(msg.data) if valid else None
+            self.map_data = None
             self.planner = planner
-            self.map_stamp = msg.header.stamp
-            self.map_valid = valid
-            if valid:
-                self.map_generation += 1
-            active = self.goal_state.active
-        if not valid and active:
-            self._stop_robot()
+            self.map_stamp = stamp
+            self.map_valid = True
+            self.map_generation += 1
+
+    @staticmethod
+    def _map_build_failed(exc):
+        rospy.logwarn_throttle(5.0, "[navigation] 地图无效，拒绝规划: %s", exc)
 
     def mapping_status_callback(self, msg):
         """保存定位/建图模块明确声明的 ready、stable、lost 状态。"""
@@ -285,6 +386,13 @@ class NavController:
                 if point.x * point.x + point.y * point.y + point.z * point.z < self.zero_point_radius ** 2:
                     continue
                 base_x, base_y, base_z = self._lidar_to_base(point.x, point.y, point.z)
+                if (
+                    self.obstacle_self_exclusion_min_x
+                    <= base_x
+                    <= self.obstacle_self_exclusion_max_x
+                    and abs(base_y) <= self.obstacle_self_exclusion_half_width_y
+                ):
+                    continue
                 distance = math.hypot(base_x, base_y)
                 if not self.obstacle_min_z <= base_z <= self.obstacle_max_z:
                     continue
@@ -764,6 +872,10 @@ class NavController:
             self.last_cmd_time = stamp
             self.goal_state.record_command(stamp)
         self.cmd_pub.publish(command)
+
+    def _shutdown(self):
+        self.map_worker.stop()
+        self._stop_robot()
 
     def _publish_feedback(self, current):
         """根据真正已走过的累计路径长度发布反馈和 health 进度。"""

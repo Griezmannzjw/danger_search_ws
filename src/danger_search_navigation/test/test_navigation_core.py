@@ -5,6 +5,7 @@ import math
 import os
 import sys
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -22,7 +23,7 @@ from navigation_core import (
     path_lengths,
     path_progress,
 )
-from nav_controller import NavController
+from nav_controller import LatestMapWorker, NavController
 
 
 def make_grid(width, height, occupied=(), unknown=(), **kwargs):
@@ -145,6 +146,53 @@ class NavigationStateTest(unittest.TestCase):
         state.finish("SUCCEEDED", "完成")
         self.assertEqual(state.progress, 1.0)
         self.assertEqual(state.failure_code, "SUCCEEDED")
+
+
+class LatestMapWorkerTest(unittest.TestCase):
+    def test_inflight_old_map_cannot_replace_newest_pending_map(self):
+        first_build_started = threading.Event()
+        release_first_build = threading.Event()
+        installed = []
+
+        def build(value):
+            if value == "old":
+                first_build_started.set()
+                release_first_build.wait(1.0)
+            return value
+
+        worker = LatestMapWorker(build, installed.append)
+        try:
+            worker.submit("old")
+            self.assertTrue(first_build_started.wait(1.0))
+            worker.submit("new")
+            release_first_build.set()
+            deadline = time.monotonic() + 1.0
+            while installed != ["new"] and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(installed, ["new"])
+        finally:
+            worker.stop()
+
+    def test_invalidation_discards_inflight_map(self):
+        build_started = threading.Event()
+        release_build = threading.Event()
+        installed = []
+
+        def build(value):
+            build_started.set()
+            release_build.wait(1.0)
+            return value
+
+        worker = LatestMapWorker(build, installed.append)
+        try:
+            worker.submit("map")
+            self.assertTrue(build_started.wait(1.0))
+            worker.invalidate()
+            release_build.set()
+            time.sleep(0.05)
+            self.assertEqual(installed, [])
+        finally:
+            worker.stop()
 
 
 class NavigationReadinessTest(unittest.TestCase):

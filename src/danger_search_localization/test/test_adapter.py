@@ -23,6 +23,7 @@ class TestLocalizationAdapter(unittest.TestCase):
         )
         self.adapter.config = AdapterConfig()
         self.adapter.map_frame = "map"
+        self.adapter.use_hector_correction = True
 
     def test_empty_covariance_receives_conservative_fallback(self):
         pose = PoseWithCovarianceStamped()
@@ -69,6 +70,19 @@ class TestLocalizationAdapter(unittest.TestCase):
         with mock.patch.object(rospy, "logwarn_throttle"):
             self.adapter._publish_cached_map_if_safe(rospy.Time.from_sec(10.0))
         self.assertEqual(self.adapter.map_version, 0)
+
+    def test_map_callback_keeps_received_grid_without_deep_copy(self):
+        self.adapter.lock = threading.RLock()
+        self.adapter.latest_raw_map = None
+        self.adapter.last_map_received = rospy.Time(0)
+        message = OccupancyGrid()
+        message.header.frame_id = "map"
+
+        with mock.patch.object(rospy.Time, "now", return_value=rospy.Time.from_sec(1.0)), \
+                mock.patch.object(self.adapter, "_publish_cached_map_if_safe"):
+            self.adapter._map_callback(message)
+
+        self.assertIs(self.adapter.latest_raw_map, message)
 
     def test_tracking_state_reflects_freshness(self):
         pose = PoseWithCovarianceStamped()
@@ -156,6 +170,19 @@ class TestLocalizationAdapter(unittest.TestCase):
                 pose, True, True, degraded=True, lost=True
             ),
             LocalizationStatus.STATE_LOST,
+        )
+
+    def test_non_hector_tracking_reason_describes_local_map(self):
+        pose = PoseWithCovarianceStamped()
+        reason = self.adapter._status_reason(
+            pose,
+            pose_fresh=True,
+            map_fresh=True,
+            stable=True,
+            use_hector_correction=False,
+        )
+        self.assertEqual(
+            reason, "TRACKING_GICP_ODOMETRY_WITH_LOCAL_OCCUPANCY_MAP"
         )
 
     def test_vertical_state_adds_z_and_tilt_without_replacing_slam_yaw(self):

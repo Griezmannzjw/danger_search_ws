@@ -30,6 +30,8 @@ class TestLocalizationConfig(unittest.TestCase):
         self.assertGreater(config["lidar_odom_max_reference_age_s"], 0.5)
         self.assertEqual(config["lidar_odom_submap_scans"], 5)
         self.assertEqual(config["lidar_odom_submap_max_points"], 1200)
+        self.assertEqual(config["lidar_odom_registration_max_points"], 120)
+        self.assertEqual(config["lidar_odom_observation_scans"], 5)
         self.assertEqual(config["gicp_recovery_consecutive_accepts"], 2)
         self.assertAlmostEqual(config["lidar_odom_min_correspondence_ratio"], 0.35)
 
@@ -78,8 +80,9 @@ class TestLocalizationConfig(unittest.TestCase):
 
         launch_path = self.package_dir / "launch" / "localization.launch"
         root = ElementTree.parse(launch_path).getroot()
+        nodes = root.findall(".//node")
         hector_node = next(
-            node for node in root.findall("node") if node.attrib["name"] == "hector_mapping"
+            node for node in nodes if node.attrib["name"] == "hector_mapping"
         )
         remaps = {
             remap.attrib["from"]: remap.attrib["to"]
@@ -91,3 +94,8 @@ class TestLocalizationConfig(unittest.TestCase):
             for parameter in hector_node.findall("param")
         }
         self.assertEqual(parameters["use_tf_pose_start_estimate"], "false")
+        mapper_node = next(
+            node for node in nodes if node.attrib["name"] == "local_occupancy_mapper"
+        )
+        self.assertEqual(mapper_node.attrib["type"], "occupancy_mapper.py")
+        self.assertFalse(config["use_hector_correction"])

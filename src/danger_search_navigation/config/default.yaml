@@ -27,7 +27,7 @@ max_planner_expansions: 75000
 pose_timeout: 2.00
 map_timeout: 5.00
 mapping_status_timeout: 1.50
-obstacle_cloud_timeout: 0.50
+obstacle_cloud_timeout: 1.50
 goal_stamp_timeout: 2.00
 max_future_stamp_skew: 0.05
 quaternion_norm_tolerance: 0.05
@@ -46,6 +46,9 @@ obstacle_max_z: 0.80
 obstacle_range_min: 0.15
 obstacle_range_max: 8.00
 zero_point_radius: 0.05
+obstacle_self_exclusion_min_x: -0.55
+obstacle_self_exclusion_max_x: 0.55
+obstacle_self_exclusion_half_width_y: 0.40
 obstacle_max_points: 2000
 dynamic_stop_distance: 0.60
 dynamic_front_half_angle: 0.52

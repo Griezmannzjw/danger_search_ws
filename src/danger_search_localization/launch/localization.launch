@@ -1,5 +1,6 @@
 <launch>
   <arg name="config_file" default="$(find danger_search_localization)/config/default.yaml" />
+  <arg name="use_hector_correction" default="false" />
 
   <!-- 只读取官方原始 /scan；不读取 /Odometry_gazebo 或真值变换后的点云。 -->
   <node name="local_scan_projector"
@@ -17,26 +18,36 @@
     <rosparam command="load" file="$(arg config_file)" />
   </node>
 
-  <!-- Hector 提供地图和受限全局修正，公共话题和 TF 由 adapter 统一发布。 -->
-  <node name="hector_mapping"
-        pkg="hector_mapping"
-        type="hector_mapping"
-        output="screen">
-    <rosparam command="load" file="$(arg config_file)" />
-    <remap from="scan" to="/localization/scan" />
-    <remap from="poseupdate" to="/localization/hector_pose" />
-    <remap from="map" to="/localization/raw_map" />
-    <param name="pub_map_odom_transform" value="false" />
-    <param name="use_tf_scan_transformation" value="true" />
-    <!-- Hector keeps its own previous scan-match estimate. Feeding the live
-         GICP TF back as a per-frame seed can move the matcher outside its map. -->
-    <param name="use_tf_pose_start_estimate" value="false" />
-  </node>
+  <group unless="$(arg use_hector_correction)">
+    <node name="local_occupancy_mapper"
+          pkg="danger_search_localization"
+          type="occupancy_mapper.py"
+          output="screen">
+      <rosparam command="load" file="$(arg config_file)" />
+    </node>
+  </group>
+
+  <!-- Optional compatibility backend. P0 defaults to the odometry-driven map. -->
+  <group if="$(arg use_hector_correction)">
+    <node name="hector_mapping"
+          pkg="hector_mapping"
+          type="hector_mapping"
+          output="screen">
+      <rosparam command="load" file="$(arg config_file)" />
+      <remap from="scan" to="/localization/scan" />
+      <remap from="poseupdate" to="/localization/hector_pose" />
+      <remap from="map" to="/localization/raw_map" />
+      <param name="pub_map_odom_transform" value="false" />
+      <param name="use_tf_scan_transformation" value="true" />
+      <param name="use_tf_pose_start_estimate" value="false" />
+    </node>
+  </group>
 
   <node name="localization_adapter"
         pkg="danger_search_localization"
         type="pose_estimator.py"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
+    <param name="use_hector_correction" value="$(arg use_hector_correction)" />
   </node>
 </launch>
