@@ -428,9 +428,11 @@ class LidarOdometryCore {
   static Cloud::Ptr Se2RegistrationCloud(const Cloud::Ptr& cloud) {
     if (!cloud) return Cloud::Ptr();
     Cloud::Ptr weighted(new Cloud(*cloud));
-    // P0 odometry is planar. Consecutive Livox frames sample different height
-    // layers, so retained Z weight can be explained by a false XY shift.
-    for (auto& point : weighted->points) point.z = 0.0F;
+    // Keep a small vertical component for correspondence disambiguation.  A
+    // fully flattened downward-looking Livox cloud is dominated by repeated
+    // ground geometry and can converge to metre-scale planar aliases.  The
+    // reported transform remains SE(2) below; Z cannot enter odometry state.
+    for (auto& point : weighted->points) point.z *= 0.02F;
     return weighted;
   }
 

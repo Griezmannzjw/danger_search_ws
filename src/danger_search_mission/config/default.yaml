@@ -39,6 +39,9 @@ entry_enabled: true
 entry_heading_rad: 0.0
 entry_approach_distance_m: 2.4
 entry_distance_m: 4.2
+# Sparse local odometry is checked after each short entry segment.  The
+# accumulated target remains entry_distance_m.
+entry_step_distance_m: 0.5
 entry_timeout_s: 90.0
 require_entrance_ready: true
 return_timeout_s: 120.0

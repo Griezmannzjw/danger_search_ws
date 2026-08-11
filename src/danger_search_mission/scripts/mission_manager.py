@@ -106,12 +106,19 @@ class MissionManager:
         self.entry_approach_distance_m = self._positive_param(
             "~entry_approach_distance_m", 2.4
         )
+        self.entry_step_distance_m = self._positive_param(
+            "~entry_step_distance_m", 0.5
+        )
         self.entry_heading_rad = float(rospy.get_param("~entry_heading_rad", 0.0))
         if not math.isfinite(self.entry_heading_rad):
             raise rospy.ROSInitException("~entry_heading_rad must be finite")
         if self.entry_approach_distance_m >= self.entry_distance_m:
             raise rospy.ROSInitException(
                 "~entry_approach_distance_m must be shorter than entry_distance_m"
+            )
+        if self.entry_step_distance_m > self.entry_distance_m:
+            raise rospy.ROSInitException(
+                "~entry_step_distance_m cannot exceed ~entry_distance_m"
             )
         self.mission_timeout_s = self._nonnegative_param("~mission_timeout_s", 0.0)
         self.input_timeout_s = self._positive_param("~input_timeout_s", 2.0)
@@ -143,6 +150,7 @@ class MissionManager:
         self.return_goal_active = False
         self.entry_goal_active = False
         self.entry_approach_complete = False
+        self.entry_next_distance_m = 0.0
         self.entrance_ready = not self.require_entrance_ready
         self.exploration_completion_armed = False
         self.finalized = False
@@ -426,6 +434,9 @@ class MissionManager:
             self.return_goal_active = False
             self.entry_goal_active = False
             self.entry_approach_complete = False
+            self.entry_next_distance_m = min(
+                self.entry_step_distance_m, self.entry_distance_m
+            )
             self.exploration_completion_armed = False
             self.finalized = False
             self.remaining_frontier_count = 0
@@ -434,14 +445,14 @@ class MissionManager:
         self._publish_status()
         if self.entry_enabled:
             success, message = self._send_entry_goal(
-                home_pose, self.entry_approach_distance_m
+                home_pose, self.entry_next_distance_m
             )
             if not success:
                 self._finalize("entry_start_failed:" + message, error=True)
                 return TriggerResponse(False, message)
             rospy.loginfo(
-                "[mission] ENTERING; home captured, approach %.2f m then cross %.2f m",
-                self.entry_approach_distance_m, self.entry_distance_m,
+                "[mission] ENTERING; home captured, %.2f m safety steps to %.2f m",
+                self.entry_step_distance_m, self.entry_distance_m,
             )
             return TriggerResponse(True, "Mission started; entering building")
 
@@ -485,8 +496,12 @@ class MissionManager:
             self._finalize("entry_failed_action_state_%d" % state, error=True)
             return
         with self.lock:
-            if not self.entry_approach_complete:
-                self.entry_approach_complete = True
+            self.entry_approach_complete = True
+            if self.entry_next_distance_m + 1e-6 < self.entry_distance_m:
+                self.entry_next_distance_m = min(
+                    self.entry_distance_m,
+                    self.entry_next_distance_m + self.entry_step_distance_m,
+                )
                 continue_entry = True
             else:
                 continue_entry = False
@@ -507,11 +522,12 @@ class MissionManager:
             if self.mission_state != MissionLifecycle.ENTERING or self.finalized:
                 return
             home_pose = copy.deepcopy(self.home_pose)
-        success, message = self._send_entry_goal(home_pose, self.entry_distance_m)
+            distance_m = self.entry_next_distance_m
+        success, message = self._send_entry_goal(home_pose, distance_m)
         if not success:
             self._finalize("entry_crossing_start_failed:" + message, error=True)
             return
-        rospy.loginfo("[mission] entrance approach complete; crossing open entry")
+        rospy.loginfo("[mission] entrance step accepted; advancing to %.2f m", distance_m)
 
     def _start_exploration(self):
         try:

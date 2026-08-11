@@ -30,7 +30,7 @@ class TestLocalizationConfig(unittest.TestCase):
         self.assertGreater(config["lidar_odom_max_reference_age_s"], 0.5)
         self.assertEqual(config["lidar_odom_submap_scans"], 5)
         self.assertEqual(config["lidar_odom_submap_max_points"], 1200)
-        self.assertEqual(config["lidar_odom_registration_max_points"], 120)
+        self.assertEqual(config["lidar_odom_registration_max_points"], 100)
         self.assertEqual(config["lidar_odom_observation_scans"], 1)
         self.assertEqual(config["gicp_recovery_consecutive_accepts"], 2)
         self.assertAlmostEqual(config["lidar_odom_min_correspondence_ratio"], 0.35)

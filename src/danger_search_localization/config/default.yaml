@@ -30,7 +30,7 @@ lidar_odom_max_step_translation_m: 0.90
 lidar_odom_max_step_rotation_rad: 0.90
 lidar_odom_max_step_z_m: 0.12
 lidar_odom_max_step_roll_pitch_rad: 0.20
-lidar_odom_max_linear_speed_mps: 0.30
+lidar_odom_max_linear_speed_mps: 0.40
 lidar_odom_max_angular_speed_rps: 0.80
 lidar_odom_max_gate_dt_s: 0.75
 lidar_odom_translation_margin_m: 0.04
@@ -51,7 +51,10 @@ lidar_odom_observation_scans: 1
 lidar_odom_observation_max_points: 1000
 lidar_odom_submap_scans: 5
 lidar_odom_submap_max_points: 1200
-lidar_odom_registration_max_points: 120
+# The live GICP worker must keep up with the 10 Hz official scan stream.
+# A deterministic 100-point subset preserves the configured minimum geometry
+# while preventing stale scans from becoming a single over-limit motion step.
+lidar_odom_registration_max_points: 100
 lidar_odom_rebaseline_after_failures: 3
 gicp_recovery_consecutive_accepts: 2
 lidar_odom_max_absolute_translation_m: 100.0

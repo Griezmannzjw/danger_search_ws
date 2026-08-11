@@ -188,12 +188,14 @@ class MissionSmokeTest(unittest.TestCase):
             5.0,
         ))
         self.assertTrue(self.stop_called)
-        self.assertEqual(len(self.move_base_goals), 3)
-        approach_goal, entry_goal, return_goal = self.move_base_goals
-        self.assertAlmostEqual(approach_goal.target_pose.pose.position.x, 3.4)
-        self.assertAlmostEqual(approach_goal.target_pose.pose.position.y, 2.0)
-        self.assertAlmostEqual(entry_goal.target_pose.pose.position.x, 5.2)
-        self.assertAlmostEqual(entry_goal.target_pose.pose.position.y, 2.0)
+        self.assertEqual(len(self.move_base_goals), 10)
+        entry_goals = self.move_base_goals[:-1]
+        return_goal = self.move_base_goals[-1]
+        self.assertAlmostEqual(entry_goals[0].target_pose.pose.position.x, 1.5)
+        self.assertAlmostEqual(entry_goals[-1].target_pose.pose.position.x, 5.2)
+        self.assertTrue(all(
+            goal.target_pose.pose.position.y == 2.0 for goal in entry_goals
+        ))
         self.assertAlmostEqual(return_goal.target_pose.pose.position.x, 1.0)
         self.assertAlmostEqual(return_goal.target_pose.pose.position.y, 2.0)
         self.assertTrue(os.path.isfile(RESULT_FILE))

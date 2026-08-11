@@ -64,8 +64,8 @@ goal_timeout: 60.0
 goal_tolerance_xy: 0.30
 goal_tolerance_yaw: 0.20
 lookahead_distance: 0.60
-cruise_speed: 0.20
-max_linear_speed: 0.30
+cruise_speed: 0.40
+max_linear_speed: 0.40
 max_angular_speed: 0.80
 rotate_in_place_angle: 0.45
 rotate_in_place_gain: 1.50
@@ -75,6 +75,8 @@ replan_min_interval: 0.25
 replan_deviation_distance: 0.50
 stuck_timeout: 5.00
 # 活动 Action 的数据短时退化先零速等待，超时后才结束同一目标。
-readiness_recovery_timeout: 3.00
+# Sparse Livox map updates can pause briefly while trotting. The controller
+# remains stopped until trusted mapping recovers during this window.
+readiness_recovery_timeout: 10.00
 progress_distance: 0.10
 stuck_command_speed: 0.05
