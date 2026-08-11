@@ -152,6 +152,7 @@ class InflatedOccupancyGrid:
         self.inflation_radius = float(robot_radius) + float(inflation_padding)
 
         values = tuple(int(value) for value in data)
+        self.unknown = tuple(value == -1 for value in values)
         # -1、100 以及任何非 0 单元都保守地不可通行。
         self.base_blocked = tuple(value != 0 for value in values)
         inflated = list(self.base_blocked)
@@ -224,6 +225,13 @@ class InflatedOccupancyGrid:
             return False
         return dynamic_blocked is None or cell not in dynamic_blocked
 
+    def unknown_at_world(self, point):
+        cell = self.world_to_cell(point[0], point[1])
+        return (
+            cell is not None
+            and self.unknown[self.index(cell[0], cell[1])]
+        )
+
     def path_is_traversable(self, path, dynamic_cells=()):
         dynamic_blocked = self.expanded_cells(dynamic_cells)
         return all(
@@ -264,6 +272,31 @@ class InflatedOccupancyGrid:
                     frontier,
                     (tentative_cost + self._heuristic(neighbor, goal), tentative_cost, neighbor),
                 )
+        return None
+
+    def plan_toward_unknown(self, start_world, goal_world, dynamic_cells=()):
+        """Plan to the furthest known-free point toward an unknown goal."""
+        if not self.unknown_at_world(goal_world):
+            return None
+        distance = math.hypot(
+            goal_world[0] - start_world[0], goal_world[1] - start_world[1]
+        )
+        if distance <= self.resolution:
+            return None
+        sample_step = max(0.20, self.resolution)
+        sample_count = int(math.ceil(distance / sample_step))
+        for index in range(sample_count - 1, 0, -1):
+            ratio = float(index) / float(sample_count)
+            candidate = (
+                start_world[0] + ratio * (goal_world[0] - start_world[0]),
+                start_world[1] + ratio * (goal_world[1] - start_world[1]),
+            )
+            route = self.plan(start_world, candidate, dynamic_cells)
+            if route is not None and math.hypot(
+                route[-1][0] - start_world[0],
+                route[-1][1] - start_world[1],
+            ) >= sample_step:
+                return route
         return None
 
     def _neighbors(self, current, dynamic_blocked):

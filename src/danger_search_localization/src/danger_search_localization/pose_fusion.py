@@ -75,6 +75,10 @@ class HectorGicpFusion:
 
     def update_local(self, stamp_s, x, y, yaw):
         sample = self._sample(stamp_s, x, y, yaw)
+        if math.hypot(sample[1].x, sample[1].y) > (
+            self.config.fusion_max_absolute_pose_translation_m
+        ):
+            raise ValueError("local pose exceeds configured translation limit")
         if self.latest_local is not None and sample[0] <= self.latest_local[0]:
             return self.snapshot(False, "NON_INCREASING_LOCAL_POSE_STAMP")
         self.latest_local = sample
@@ -86,6 +90,10 @@ class HectorGicpFusion:
 
     def update_global(self, stamp_s, x, y, yaw):
         global_pose = self._sample(stamp_s, x, y, yaw)
+        if math.hypot(global_pose[1].x, global_pose[1].y) > (
+            self.config.fusion_max_absolute_pose_translation_m
+        ):
+            raise ValueError("global pose exceeds configured translation limit")
         if (
             self.last_global_stamp_s is not None
             and global_pose[0] <= self.last_global_stamp_s

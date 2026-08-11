@@ -22,9 +22,10 @@ inflation_padding: 0.10
 allow_diagonal: true
 max_planner_expansions: 75000
 
-# 消息合法性和新鲜度门
-pose_timeout: 1.00
-map_timeout: 2.00
+# 消息合法性和新鲜度门。pose/map 的源时间由 /mapping/status 统一判定；
+# 这两个值保留用于参数兼容，导航不再用它们淘汰合法的缓存地图/位姿。
+pose_timeout: 2.00
+map_timeout: 5.00
 mapping_status_timeout: 1.50
 obstacle_cloud_timeout: 0.50
 goal_stamp_timeout: 2.00

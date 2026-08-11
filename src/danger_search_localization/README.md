@@ -43,9 +43,9 @@ POINTCLOUD_USE_GROUND_TRUTH_ODOM=0 \
 `max_intra_bin_range_gap` 或 `max_neighbor_range_jump`，也可以临时关闭
 `enable_isolated_hit_filter`。
 
-默认不跨帧叠加 Livox 扫描，因为未做运动补偿的历史帧会在行走时制造重影和假墙。
-单帧必须至少包含 40 个有效 0.5 度 bin，并有至少 0.35 rad（约 20 度）的连续覆盖；
-机器人倾斜、旋转过快或雷达离地异常时直接丢弃该帧，避免污染 Hector 地图。运行时
+投影使用短窗口叠加 Livox 扫描补足单帧的稀疏角度覆盖；窗口较短以限制未做运动补偿
+造成的重影。累计扫描至少包含 8 个有效 0.5 度 bin，并有至少 0.05 rad（约 3 度）的
+连续覆盖；机器人倾斜、旋转过快或雷达离地异常时直接丢弃该帧，避免污染 Hector 地图。运行时
 可用以下命令确认数据链：
 
 ```bash
@@ -68,8 +68,10 @@ rostopic echo -n 1 /mapping/status
 | `/localization/status` | `danger_search_common/LocalizationStatus` | 定位跟踪和协方差状态 |
 
 `/localization/pose` 第一帧定义为比赛出发点附近 `(0,0,0)`。GICP 对静止微动使用
-死区，并按时间间隔限制物理可达位移；一次异常配准会保持上一位姿、提高协方差并
-重建参考帧，成功帧到来后自动恢复。Hector 只允许小幅、同步的全局修正；GICP 判定
+死区，并按时间间隔限制物理可达位移；GICP 使用最近 5 个可信扫描构造有限局部子地图，
+以匹配质量、有效对应比例和物理速度门共同拒绝错误局部最优。连续拒绝前两帧会保持
+可信参考；达到阈值后才用当前帧重建参考，且必须连续 2 帧成功才恢复健康。异常配准
+会保持上一位姿并提高协方差。Hector 只允许小幅、同步的全局修正；GICP 判定
 静止时出现的 Hector 漂移和米级跳变不会传给 navigation。
 
 ### 探索模块实际收到的地图

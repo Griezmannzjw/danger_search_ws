@@ -317,6 +317,17 @@ class NavController:
             planner = self.planner
         return None if planner is None else planner.plan(start_xy, goal_xy, dynamic_cells)
 
+    def _plan_action_path(self, start_xy, goal_xy, dynamic_cells=()):
+        """Keep an Action on known free cells while approaching an unknown goal."""
+        with self.lock:
+            planner = self.planner
+        if planner is None:
+            return None
+        route = planner.plan(start_xy, goal_xy, dynamic_cells)
+        if route is not None:
+            return route
+        return planner.plan_toward_unknown(start_xy, goal_xy, dynamic_cells)
+
     def _pose_from_message(self, msg):
         if msg.header.frame_id != self.map_frame or msg.header.stamp.is_zero():
             return None, False
@@ -360,12 +371,13 @@ class NavController:
     def _navigation_readiness(self, now, require_obstacles):
         """统一给 Action、make_plan 和 health 使用的数据安全门。"""
         with self.lock:
-            pose_ready = self.pose_valid and self._is_stamp_fresh(
-                self.pose_stamp, self.pose_timeout, now
-            )
-            map_ready = self.map_valid and self.planner is not None and self._is_stamp_fresh(
-                self.map_stamp, self.map_timeout, now
-            )
+            # Pose/map callbacks already reject zero stamps, wrong frames and
+            # invalid geometry. Their source stamps describe the underlying
+            # estimate/map content and need not advance on every adapter
+            # publication. Localization owns source freshness and exposes it
+            # through MappingStatus, whose own publication is checked below.
+            pose_ready = self.pose_valid
+            map_ready = self.map_valid and self.planner is not None
             mapping = self.mapping_status
             mapping_ready = mapping is not None and self._is_stamp_fresh(
                 self.mapping_status_stamp, self.mapping_status_timeout, now
@@ -537,7 +549,9 @@ class NavController:
             self._finish_goal("LOCALIZATION_LOST", "读取规划起点时定位位姿已失效")
             return
         dynamic_cells, _, obstacle_fresh = self._dynamic_obstacle_snapshot(now)
-        route = self._plan_path(current[:2], target[:2], dynamic_cells if obstacle_fresh else ())
+        route = self._plan_action_path(
+            current[:2], target[:2], dynamic_cells if obstacle_fresh else ()
+        )
         if not route:
             self._finish_goal("UNREACHABLE", "起点或目标位于不可通行栅格，或当前地图中无路径")
             return
@@ -577,18 +591,25 @@ class NavController:
             route, route_generation, last_replan = self._route_snapshot()
             route_blocked = self._path_is_blocked(route, dynamic_cells if obstacle_fresh else ())
             deviation = self._path_deviation(current[:2], route)
+            route_endpoint_reached = (
+                bool(route)
+                and math.hypot(
+                    current[0] - route[-1][0], current[1] - route[-1][1]
+                ) <= self.goal_tolerance_xy
+            )
             with self.lock:
                 requested = self.clear_costmaps_requested
                 self.clear_costmaps_requested = False
             replan_due = (
                 route_generation != self._map_generation_snapshot()
                 or route_blocked
+                or route_endpoint_reached
                 or requested
                 or deviation > self.replan_deviation_distance
                 or (now - last_replan).to_sec() >= self.replan_period
             )
             if replan_due and (now - last_replan).to_sec() >= self.replan_min_interval:
-                route = self._plan_path(
+                route = self._plan_action_path(
                     current[:2], target[:2], dynamic_cells if obstacle_fresh else ()
                 )
                 if not route:

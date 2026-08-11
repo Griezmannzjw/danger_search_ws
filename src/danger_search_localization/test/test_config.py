@@ -17,10 +17,37 @@ class TestLocalizationConfig(unittest.TestCase):
 
     def test_defaults_are_valid(self):
         scan_config = ScanProjectionConfig()
-        self.assertEqual(scan_config.scan_accumulation_frames, 1)
-        self.assertEqual(scan_config.min_valid_scan_bins, 40)
-        self.assertEqual(scan_config.min_angular_coverage_rad, 0.35)
+        self.assertEqual(scan_config.scan_accumulation_frames, 3)
+        self.assertEqual(scan_config.min_valid_scan_bins, 8)
+        self.assertEqual(scan_config.min_angular_coverage_rad, 0.05)
         AdapterConfig()
+
+    def test_gicp_rebaseline_threshold_is_positive(self):
+        config_path = self.package_dir / "config" / "default.yaml"
+        config = yaml.safe_load(config_path.read_text())
+
+        self.assertGreaterEqual(config["lidar_odom_rebaseline_after_failures"], 1)
+        self.assertGreater(config["lidar_odom_max_reference_age_s"], 0.5)
+        self.assertEqual(config["lidar_odom_submap_scans"], 5)
+        self.assertEqual(config["lidar_odom_submap_max_points"], 1200)
+        self.assertEqual(config["gicp_recovery_consecutive_accepts"], 2)
+        self.assertAlmostEqual(config["lidar_odom_min_correspondence_ratio"], 0.35)
+
+    def test_gicp_health_timeouts_are_ordered(self):
+        with self.assertRaises(ValueError):
+            AdapterConfig(
+                gicp_healthy_fresh_timeout_s=2.0,
+                gicp_healthy_lost_timeout_s=1.0,
+            )
+
+        config = AdapterConfig()
+        self.assertLess(
+            config.gicp_healthy_fresh_timeout_s,
+            config.gicp_healthy_lost_timeout_s,
+        )
+        self.assertEqual(config.fusion_max_pose_pair_age_s, 0.80)
+        self.assertEqual(config.pose_fresh_timeout_s, 2.0)
+        self.assertEqual(config.tf_publish_future_tolerance_s, 0.5)
 
     def test_invalid_height_range_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -63,4 +90,4 @@ class TestLocalizationConfig(unittest.TestCase):
             parameter.attrib["name"]: parameter.attrib["value"]
             for parameter in hector_node.findall("param")
         }
-        self.assertEqual(parameters["use_tf_pose_start_estimate"], "true")
+        self.assertEqual(parameters["use_tf_pose_start_estimate"], "false")

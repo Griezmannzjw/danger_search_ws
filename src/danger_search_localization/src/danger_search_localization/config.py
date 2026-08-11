@@ -40,11 +40,11 @@ class ScanProjectionConfig:
     ground_candidate_max_range: float = 3.00
     min_ground_candidate_points: int = 30
     min_ground_clearance_m: float = 0.18
-    scan_accumulation_frames: int = 1
+    scan_accumulation_frames: int = 3
     scan_accumulation_min_samples_per_bin: int = 1
     scan_accumulation_max_age_s: float = 0.6
-    min_valid_scan_bins: int = 40
-    min_angular_coverage_rad: float = 0.35
+    min_valid_scan_bins: int = 8
+    min_angular_coverage_rad: float = 0.05
     drop_unstable_scans: bool = True
 
     def __post_init__(self):
@@ -126,10 +126,11 @@ class ScanProjectionConfig:
 
 @dataclass(frozen=True)
 class AdapterConfig:
-    pose_fresh_timeout_s: float = 1.0
-    map_fresh_timeout_s: float = 3.0
+    pose_fresh_timeout_s: float = 2.0
+    map_fresh_timeout_s: float = 5.0
     min_map_updates_for_stable: int = 2
     pose_publish_rate_hz: float = 20.0
+    tf_publish_future_tolerance_s: float = 0.5
     status_publish_rate_hz: float = 2.0
     fallback_xy_variance: float = 0.10
     fallback_yaw_variance: float = 0.15
@@ -148,7 +149,7 @@ class AdapterConfig:
     pose_rejections_before_lost: int = 3
     pose_recovery_timeout_s: float = 3.0
     fusion_local_history_size: int = 30
-    fusion_max_pose_pair_age_s: float = 0.20
+    fusion_max_pose_pair_age_s: float = 0.80
     fusion_initial_correction_translation_m: float = 0.30
     fusion_initial_correction_yaw_rad: float = 0.35
     fusion_max_correction_translation_m: float = 0.30
@@ -159,8 +160,9 @@ class AdapterConfig:
     fusion_stationary_correction_deadband_m: float = 0.025
     fusion_stationary_correction_deadband_yaw_rad: float = 0.020
     gicp_unhealthy_variance_threshold: float = 1.0
-    gicp_failures_before_degraded: int = 3
-    gicp_failures_before_lost: int = 20
+    fusion_max_absolute_pose_translation_m: float = 100.0
+    gicp_healthy_fresh_timeout_s: float = 1.0
+    gicp_healthy_lost_timeout_s: float = 3.0
     hector_rejections_before_degraded: int = 3
     hector_pose_fresh_timeout_s: float = 2.0
     vertical_estimation_enabled: bool = False
@@ -187,6 +189,10 @@ class AdapterConfig:
         _require(self.map_fresh_timeout_s > 0.0, "map timeout must be positive")
         _require(self.min_map_updates_for_stable >= 1, "min_map_updates_for_stable must be positive")
         _require(self.pose_publish_rate_hz >= 10.0, "pose publish rate must be at least 10 Hz")
+        _require(
+            0.0 <= self.tf_publish_future_tolerance_s <= 1.0,
+            "TF publish future tolerance must be within [0, 1] seconds",
+        )
         _require(self.status_publish_rate_hz > 0.0, "status publish rate must be positive")
         _require(self.fallback_xy_variance > 0.0, "fallback_xy_variance must be positive")
         _require(self.fallback_yaw_variance > 0.0, "fallback_yaw_variance must be positive")
@@ -237,9 +243,13 @@ class AdapterConfig:
             "GICP unhealthy variance threshold must be positive",
         )
         _require(
-            1 <= self.gicp_failures_before_degraded
-            < self.gicp_failures_before_lost,
-            "GICP failure thresholds are invalid",
+            self.fusion_max_absolute_pose_translation_m > 0.0,
+            "fusion absolute pose limit must be positive",
+        )
+        _require(
+            0.0 < self.gicp_healthy_fresh_timeout_s
+            < self.gicp_healthy_lost_timeout_s,
+            "GICP healthy-pose timeouts are invalid",
         )
         _require(
             self.hector_rejections_before_degraded >= 1,

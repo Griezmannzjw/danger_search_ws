@@ -31,6 +31,7 @@ catkin_package(
 )
 
 include_directories(
+  include
   ${catkin_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
 )
@@ -52,6 +53,10 @@ catkin_install_python(PROGRAMS
 )
 
 if(CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(test_lidar_odometry_core test/test_lidar_odometry_core.cpp)
+  if(TARGET test_lidar_odometry_core)
+    target_link_libraries(test_lidar_odometry_core ${catkin_LIBRARIES} ${PCL_LIBRARIES})
+  endif()
   catkin_add_nosetests(test/test_adapter.py)
   catkin_add_nosetests(test/test_config.py)
   catkin_add_nosetests(test/test_pose_filter.py)

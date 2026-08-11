@@ -4,7 +4,11 @@
 import math
 import os
 import sys
+import threading
 import unittest
+from types import SimpleNamespace
+
+import rospy
 
 
 SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
@@ -18,6 +22,7 @@ from navigation_core import (
     path_lengths,
     path_progress,
 )
+from nav_controller import NavController
 
 
 def make_grid(width, height, occupied=(), unknown=(), **kwargs):
@@ -81,6 +86,23 @@ class InflatedOccupancyGridTest(unittest.TestCase):
         self.assertFalse(grid.traversable((2, 1)))
         self.assertTrue(grid.traversable((3, 1)))
 
+    def test_action_can_approach_unknown_goal_without_entering_unknown(self):
+        unknown = [(cell_x, 1) for cell_x in range(4, 8)]
+        grid = make_grid(8, 3, unknown=unknown)
+
+        route = grid.plan_toward_unknown((0.5, 1.5), (7.5, 1.5))
+
+        self.assertIsNotNone(route)
+        self.assertLess(route[-1][0], 4.0)
+        self.assertTrue(grid.path_is_traversable(route))
+
+    def test_action_does_not_approach_occupied_goal_as_unknown(self):
+        grid = make_grid(8, 3, occupied=[(7, 1)])
+
+        self.assertIsNone(
+            grid.plan_toward_unknown((0.5, 1.5), (7.5, 1.5))
+        )
+
     def test_rotated_origin_and_negative_coordinates_use_floor(self):
         grid = make_grid(2, 2, origin_x=-1.0, origin_y=-1.0, origin_yaw=math.pi / 2.0)
         center = grid.cell_to_world(0, 0)
@@ -123,6 +145,55 @@ class NavigationStateTest(unittest.TestCase):
         state.finish("SUCCEEDED", "完成")
         self.assertEqual(state.progress, 1.0)
         self.assertEqual(state.failure_code, "SUCCEEDED")
+
+
+class NavigationReadinessTest(unittest.TestCase):
+    def setUp(self):
+        self.controller = NavController.__new__(NavController)
+        self.controller.lock = threading.RLock()
+        self.controller.pose_valid = True
+        self.controller.pose_stamp = rospy.Time.from_sec(1.0)
+        self.controller.pose_timeout = 1.0
+        self.controller.map_valid = True
+        self.controller.planner = object()
+        self.controller.map_stamp = rospy.Time.from_sec(1.0)
+        self.controller.map_timeout = 2.0
+        self.controller.mapping_status = SimpleNamespace(
+            ready=True,
+            stable=True,
+            lost=False,
+            status_reason="TRACKING",
+        )
+        self.controller.mapping_status_stamp = rospy.Time.from_sec(99.5)
+        self.controller.mapping_status_timeout = 1.5
+        self.controller.obstacle_frame_valid = False
+        self.controller.obstacle_stamp = rospy.Time(0)
+        self.controller.obstacle_cloud_timeout = 0.5
+        self.controller.safety_stop = False
+        self.controller.max_future_stamp_skew = 0.05
+
+    def test_healthy_mapping_status_owns_source_freshness(self):
+        ready, code, detail = self.controller._navigation_readiness(
+            rospy.Time.from_sec(100.0), require_obstacles=False
+        )
+
+        self.assertTrue(ready)
+        self.assertEqual(code, "NONE")
+        self.assertEqual(detail, "")
+
+    def test_unstable_mapping_status_still_blocks_navigation(self):
+        self.controller.mapping_status.stable = False
+        self.controller.mapping_status.status_reason = (
+            "GICP_ODOMETRY_DEGRADED_HOLDING_LAST_POSE"
+        )
+
+        ready, code, detail = self.controller._navigation_readiness(
+            rospy.Time.from_sec(100.0), require_obstacles=False
+        )
+
+        self.assertFalse(ready)
+        self.assertEqual(code, "LOCALIZATION_LOST")
+        self.assertEqual(detail, "GICP_ODOMETRY_DEGRADED_HOLDING_LAST_POSE")
 
 
 if __name__ == "__main__":

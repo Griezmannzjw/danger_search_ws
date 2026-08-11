@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
 import math
+import threading
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
+import rospy
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 
@@ -19,6 +22,7 @@ class TestLocalizationAdapter(unittest.TestCase):
             LocalizationAdapterNode
         )
         self.adapter.config = AdapterConfig()
+        self.adapter.map_frame = "map"
 
     def test_empty_covariance_receives_conservative_fallback(self):
         pose = PoseWithCovarianceStamped()
@@ -54,17 +58,17 @@ class TestLocalizationAdapter(unittest.TestCase):
         self.assertEqual(pose.pose.covariance[7], 0.02)
         self.assertEqual(pose.pose.covariance[35], 0.03)
 
-    def test_map_checksum_changes_with_grid_content(self):
-        grid = OccupancyGrid()
-        grid.info.width = 2
-        grid.info.height = 2
-        grid.info.resolution = 0.05
-        grid.data = [-1, 0, 0, 100]
-        first = self.adapter._map_checksum(grid)
-
-        grid.data[1] = 100
-
-        self.assertNotEqual(first, self.adapter._map_checksum(grid))
+    def test_public_map_requires_fresh_gicp_and_hector(self):
+        self.adapter.lock = threading.RLock()
+        self.adapter.pose_fusion = SimpleNamespace(initialized=True)
+        self.adapter.last_hector_update_accepted = True
+        self.adapter.latest_raw_map = OccupancyGrid()
+        self.adapter.last_gicp_pose_accepted = rospy.Time(0)
+        self.adapter.map_version = 0
+        self.adapter.last_map_stamp = rospy.Time(0)
+        with mock.patch.object(rospy, "logwarn_throttle"):
+            self.adapter._publish_cached_map_if_safe(rospy.Time.from_sec(10.0))
+        self.assertEqual(self.adapter.map_version, 0)
 
     def test_tracking_state_reflects_freshness(self):
         pose = PoseWithCovarianceStamped()
@@ -112,6 +116,46 @@ class TestLocalizationAdapter(unittest.TestCase):
         self.assertEqual(
             self.adapter._tracking_state(pose, True, True),
             LocalizationStatus.STATE_TRACKING,
+        )
+
+    def test_status_reason_preserves_hector_rejection_reason(self):
+        pose = PoseWithCovarianceStamped()
+
+        reason = self.adapter._status_reason(
+            pose,
+            pose_fresh=True,
+            map_fresh=True,
+            stable=False,
+            hector_degraded=True,
+            gicp_fusion_reason="TRACKING_FUSED_POSE",
+            hector_fusion_reason="HECTOR_CORRECTION_TRANSLATION_JUMP",
+        )
+
+        self.assertEqual(
+            reason,
+            "HECTOR_CORRECTION_DEGRADED:HECTOR_CORRECTION_TRANSLATION_JUMP",
+        )
+
+    def test_gicp_lost_reason_takes_priority(self):
+        pose = PoseWithCovarianceStamped()
+        reason = self.adapter._status_reason(
+            pose,
+            pose_fresh=True,
+            map_fresh=True,
+            stable=False,
+            gicp_degraded=True,
+            gicp_lost=True,
+            gicp_fusion_reason="GICP_TRACKING_LOST",
+        )
+        self.assertEqual(reason, "GICP_ODOMETRY_LOST:GICP_TRACKING_LOST")
+
+    def test_gicp_lost_tracking_state_is_lost(self):
+        pose = PoseWithCovarianceStamped()
+        self.assertEqual(
+            self.adapter._tracking_state(
+                pose, True, True, degraded=True, lost=True
+            ),
+            LocalizationStatus.STATE_LOST,
         )
 
     def test_vertical_state_adds_z_and_tilt_without_replacing_slam_yaw(self):
