@@ -109,6 +109,12 @@ class MissionManager:
         self.entry_retry_delay_s = self._positive_param(
             "~entry_retry_delay_s", 1.0
         )
+        self.entry_map_retry_delay_s = self._positive_param(
+            "~entry_map_retry_delay_s", 2.0
+        )
+        self.entry_health_settle_s = self._positive_param(
+            "~entry_health_settle_s", 0.3
+        )
         self.entry_completion_tolerance_m = self._nonnegative_param(
             "~entry_completion_tolerance_m", 0.25
         )
@@ -156,6 +162,7 @@ class MissionManager:
         self.entry_attempt_start_progress_m = 0.0
         self.entry_retry_count = 0
         self.entry_retry_at = rospy.Time(0)
+        self.entry_waiting_for_localization = False
         self.entrance_ready = not self.require_entrance_ready
         self.exploration_completion_armed = False
         self.finalized = False
@@ -443,6 +450,7 @@ class MissionManager:
             self.entry_attempt_start_progress_m = 0.0
             self.entry_retry_count = 0
             self.entry_retry_at = rospy.Time(0)
+            self.entry_waiting_for_localization = False
             self.exploration_completion_armed = False
             self.finalized = False
             self.remaining_frontier_count = 0
@@ -556,38 +564,83 @@ class MissionManager:
             ):
                 return
             self.entry_goal_active = False
-            home_pose = copy.deepcopy(self.home_pose)
-            current_pose = copy.deepcopy(self.latest_pose)
-            attempt_start = self.entry_attempt_start_progress_m
         if state == GoalStatus.SUCCEEDED:
             with self.lock:
                 self.entry_retry_count = 0
+                self.entry_waiting_for_localization = False
                 # Do not send a new goal from inside SimpleActionClient's done
                 # callback.  Let the mission timer advance after actionlib has
                 # fully returned to its idle state.
                 self.entry_retry_at = rospy.Time.now()
             return
 
+        # Navigation publishes its terminal health immediately before setting
+        # the Action result, but those messages use separate ROS connections.
+        # Classify after a short settling interval instead of racing a stale
+        # failure_code from the previous goal.
+        rospy.Timer(
+            rospy.Duration(self.entry_health_settle_s),
+            lambda _event: self._classify_entry_failure(sequence, state),
+            oneshot=True,
+        )
+
+    def _classify_entry_failure(self, sequence, state):
+        with self.lock:
+            if (
+                self.mission_state != MissionLifecycle.ENTERING
+                or self.finalized
+                or sequence != self.entry_goal_sequence
+            ):
+                return
+            home_pose = copy.deepcopy(self.home_pose)
+            current_pose = copy.deepcopy(self.latest_pose)
+            attempt_start = self.entry_attempt_start_progress_m
+
         forward = attempt_start
         if home_pose is not None and current_pose is not None:
             forward, _ = self._entry_progress(current_pose, home_pose)
         made_progress = forward >= attempt_start + self.entry_min_progress_m
         with self.lock:
-            self.entry_retry_count = 0 if made_progress else self.entry_retry_count + 1
+            navigation_failure = (
+                self.navigation_health.failure_code
+                if self.navigation_health is not None
+                else ""
+            )
+            localization_lost = navigation_failure == "LOCALIZATION_LOST"
+            transient_failure = navigation_failure in (
+                "",
+                "NONE",
+                "LOCALIZATION_LOST",
+                "UNREACHABLE",
+            )
+            self.entry_waiting_for_localization = localization_lost
+            if transient_failure:
+                # Localization outages and rolling-map reachability misses are
+                # readiness conditions, not failed robot motion attempts. The
+                # complete entrance remains bounded by entry_timeout_s.
+                self.entry_retry_count = 0 if made_progress else self.entry_retry_count
+            else:
+                self.entry_retry_count = 0 if made_progress else self.entry_retry_count + 1
             retries = self.entry_retry_count
-            if retries <= self.entry_max_retries:
-                self.entry_retry_at = rospy.Time.now() + rospy.Duration(
-                    self.entry_retry_delay_s
+            if transient_failure or retries <= self.entry_max_retries:
+                retry_delay = (
+                    self.entry_map_retry_delay_s
+                    if navigation_failure == "UNREACHABLE"
+                    else self.entry_retry_delay_s
                 )
-        if retries > self.entry_max_retries:
+                self.entry_retry_at = rospy.Time.now() + rospy.Duration(
+                    retry_delay
+                )
+        if not transient_failure and retries > self.entry_max_retries:
             self._finalize(
                 "entry_failed_action_state_%d_retries_exhausted" % state,
                 error=True,
             )
             return
         rospy.logwarn(
-            "[mission] entry segment failed state=%d progress=%.2f m; retry %d/%d",
+            "[mission] entry segment failed state=%d code=%s progress=%.2f m; retry %d/%d",
             state,
+            navigation_failure or "UNKNOWN",
             forward,
             retries,
             self.entry_max_retries,
@@ -605,6 +658,7 @@ class MissionManager:
                 return False, "Mission is not entering"
             self.entry_start_time = None
             self.entry_retry_at = rospy.Time(0)
+            self.entry_waiting_for_localization = False
             # A successful start service response establishes a new exploration
             # session even when its latched false marker arrives asynchronously.
             self.exploration_completion_armed = True
@@ -664,6 +718,7 @@ class MissionManager:
             self.entry_goal_active = False
             self.entry_goal_sequence += 1
             self.entry_retry_at = rospy.Time(0)
+            self.entry_waiting_for_localization = False
             self.exploration_completion_armed = False
         try:
             self.stop_explore_client()
@@ -707,6 +762,7 @@ class MissionManager:
             entry_start_time = self.entry_start_time
             entry_retry_at = self.entry_retry_at
             entry_goal_active = self.entry_goal_active
+            entry_waiting_for_localization = self.entry_waiting_for_localization
             should_autostart = (
                 self.autostart
                 and not self.autostart_attempted
@@ -720,22 +776,31 @@ class MissionManager:
                 rospy.logerr("[mission] autostart failed: %s", response.message)
         elif (
             state == MissionLifecycle.ENTERING
+            and entry_start_time is not None
+            and (now - entry_start_time).to_sec() >= self.entry_timeout_s
+        ):
+            if entry_goal_active:
+                self.move_base_client.cancel_goal()
+            self._finalize("entry_timeout", error=True)
+        elif (
+            state == MissionLifecycle.ENTERING
             and not entry_goal_active
             and not entry_retry_at.is_zero()
             and now >= entry_retry_at
         ):
-            with self.lock:
-                self.entry_retry_at = rospy.Time(0)
-            success, message = self._advance_entry()
-            if not success:
-                self._finalize("entry_retry_failed:" + message, error=True)
-        elif (
-            state == MissionLifecycle.ENTERING
-            and entry_start_time is not None
-            and (now - entry_start_time).to_sec() >= self.entry_timeout_s
-        ):
-            self.move_base_client.cancel_goal()
-            self._finalize("entry_timeout", error=True)
+            if entry_waiting_for_localization and not self._entry_localization_ready(now):
+                with self.lock:
+                    self.entry_retry_at = now + rospy.Duration(self.entry_retry_delay_s)
+                rospy.logwarn_throttle(
+                    2.0, "[mission] entry paused until localization/map recover"
+                )
+            else:
+                with self.lock:
+                    self.entry_retry_at = rospy.Time(0)
+                    self.entry_waiting_for_localization = False
+                success, message = self._advance_entry()
+                if not success:
+                    self._finalize("entry_retry_failed:" + message, error=True)
         elif (
             state == MissionLifecycle.EXPLORING
             and self.mission_timeout_s > 0.0
@@ -751,6 +816,30 @@ class MissionManager:
             self.move_base_client.cancel_goal()
             self._finalize("return_timeout", error=True)
         self._publish_status()
+
+    def _entry_localization_ready(self, now):
+        with self.lock:
+            pose = self.latest_pose
+            pose_time = self.last_pose_time
+            mapping = self.mapping_status
+            mapping_time = self.last_mapping_status_time
+            navigation = self.navigation_health
+            navigation_time = self.last_navigation_health_time
+        inputs = (
+            (pose, pose_time),
+            (mapping, mapping_time),
+            (navigation, navigation_time),
+        )
+        if any(value is None for value, _stamp in inputs):
+            return False
+        if any((now - stamp).to_sec() > self.input_timeout_s for _value, stamp in inputs):
+            return False
+        return (
+            mapping.ready
+            and mapping.stable
+            and not mapping.lost
+            and navigation.ready
+        )
 
     def _finalize(self, reason, error):
         with self.lock:

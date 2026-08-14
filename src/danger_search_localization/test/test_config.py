@@ -125,3 +125,6 @@ class TestLocalizationConfig(unittest.TestCase):
                              config["pose_fresh_timeout_s"])
         self.assertIn("[mapping] rejected LIO jump", mapper_source)
         self.assertIn("!pose_valid_", mapper_source)
+        self.assertGreater(config["map_robot_free_radius_m"], 0.0)
+        self.assertIn("clearRobotFootprint", mapper_source)
+        self.assertIn("map_origin_", mapper_source)

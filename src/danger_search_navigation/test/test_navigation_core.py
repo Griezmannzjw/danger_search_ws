@@ -112,6 +112,23 @@ class InflatedOccupancyGridTest(unittest.TestCase):
         self.assertIsNone(unrotated.world_to_cell(-1.1, -0.5))
         self.assertEqual(unrotated.world_to_cell(-0.1, -0.1), (0, 0))
 
+    def test_even_sized_mapper_places_world_zero_inside_center_cell(self):
+        # OccupancyGrid serializes resolution as float32. Keeping zero half a
+        # cell away from a boundary prevents rounding from selecting UNKNOWN.
+        size = 1024
+        resolution = 0.05000000074505806
+        center = size // 2
+        origin = -(center + 0.5) * 0.05
+        data = [-1] * (size * size)
+        data[center * size + center] = 0
+        grid = InflatedOccupancyGrid(
+            size, size, resolution, origin, origin, 0.0, data,
+            robot_radius=0.0,
+        )
+
+        self.assertEqual(grid.world_to_cell(0.0, 0.0), (center, center))
+        self.assertTrue(grid.traversable((center, center)))
+
     def test_diagonal_does_not_cut_blocked_corner(self):
         grid = make_grid(3, 3, occupied=[(1, 0), (0, 1)])
         self.assertIsNone(grid.plan((0.5, 0.5), (1.5, 1.5)))
@@ -145,6 +162,15 @@ class NavigationStateTest(unittest.TestCase):
         state.finish("SUCCEEDED", "完成")
         self.assertEqual(state.progress, 1.0)
         self.assertEqual(state.failure_code, "SUCCEEDED")
+
+    def test_navigation_publishes_terminal_health_before_action_result(self):
+        source = os.path.join(SCRIPTS_DIR, "nav_controller.py")
+        with open(source, encoding="utf-8") as stream:
+            text = stream.read()
+        finish = text.index("    def _finish_goal")
+        preempt = text.index("    def preempt_cb", finish)
+        body = text[finish:preempt]
+        self.assertLess(body.index("self.publish_health()"), body.index("set_aborted"))
 
 
 class NavigationReadinessTest(unittest.TestCase):

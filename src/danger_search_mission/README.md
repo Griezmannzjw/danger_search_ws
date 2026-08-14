@@ -66,6 +66,8 @@ mission 在 `ENTERING` 和 `RETURNING` 阶段作为 `/move_base` Action 客户�
 | `entry_step_m` | `0.6` | 滚动短目标增量 |
 | `entry_completion_tolerance_m` | `0.25` | 入口完成距离容差 |
 | `entry_retry_delay_s` | `1.0` | 失败后等待地图刷新的时间 |
+| `entry_map_retry_delay_s` | `2.0` | 地图暂不可达时的低频重试间隔 |
+| `entry_health_settle_s` | `0.3` | Action 完成后等待导航失败码到达的时间 |
 | `entry_max_retries` | `8` | 连续无进展失败上限 |
 | `entry_min_progress_m` | `0.10` | 重置失败计数所需的最小进展 |
 | `entry_timeout_s` | `90.0` | 整个入口阶段总超时 |
@@ -74,6 +76,9 @@ mission 在 `ENTERING` 和 `RETURNING` 阶段作为 `/move_base` Action 客户�
 单段 Action 成功后不会在 actionlib 完成回调里直接发送下一目标，而是交给 mission 定时器
 继续推进，避免连续目标触发 `SimpleActionClient` 状态竞争。单段失败不会立即终止任务；
 mission 等待地图清除动态门残影后重试。
+如果导航明确报告 `LOCALIZATION_LOST`，该次失败不计入运动重试次数；mission 会暂停入口
+目标，等待位姿、地图和导航状态恢复。滚动建图阶段的 `UNREACHABLE` 同样视为地图尚未
+展开，而不是机器人控制失败。两者仍受 `entry_timeout_s` 总时限约束。
 
 ## 结果路径
 

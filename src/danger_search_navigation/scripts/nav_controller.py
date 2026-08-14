@@ -659,6 +659,10 @@ class NavController:
             self.failure_detail = detail
             self.is_stuck = bool(stuck)
         self._stop_robot()
+        # Publish the semantic terminal code before completing the Action.
+        # Mission's done callback otherwise races the 5 Hz health timer and can
+        # observe the previous goal's NONE code.
+        self.publish_health()
         result = MoveBaseResult()
         if code == "SUCCEEDED":
             self.action_server.set_succeeded(result, text=detail)

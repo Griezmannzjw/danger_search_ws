@@ -29,12 +29,14 @@ class LioOccupancyMapper {
     private_nh_.param("map_ground_min_height_m", ground_min_height_, -0.55);
     private_nh_.param("map_ground_max_height_m", ground_max_height_, -0.12);
     private_nh_.param("map_voxel_size_m", voxel_size_, 0.12);
+    private_nh_.param("map_robot_free_radius_m", robot_free_radius_, 0.40);
     private_nh_.param("lio_guard_max_linear_speed_mps", max_speed_, 2.0);
     private_nh_.param("lio_guard_translation_margin_m", translation_margin_, 0.15);
     private_nh_.param("lio_guard_max_yaw_rate_rps", max_yaw_rate_, 3.0);
     private_nh_.param("lio_guard_yaw_margin_rad", yaw_margin_, 0.20);
     private_nh_.param("map_pose_cloud_max_age_s", pose_cloud_max_age_, 0.20);
     private_nh_.param<std::string>("map_frame", map_frame_, "map");
+    map_origin_ = -(static_cast<double>(size_ / 2) + 0.5) * resolution_;
     log_odds_.assign(static_cast<std::size_t>(size_) * size_, 0);
     publisher_ = nh_.advertise<nav_msgs::OccupancyGrid>("/map", 1, true);
     odom_subscriber_ = nh_.subscribe("/localization/lio/odometry", 20,
@@ -90,8 +92,8 @@ class LioOccupancyMapper {
   }
 
   bool cell(double x, double y, int& cx, int& cy) const {
-    cx = static_cast<int>(std::floor(x / resolution_ + size_ * 0.5));
-    cy = static_cast<int>(std::floor(y / resolution_ + size_ * 0.5));
+    cx = static_cast<int>(std::floor((x - map_origin_) / resolution_));
+    cy = static_cast<int>(std::floor((y - map_origin_) / resolution_));
     return cx >= 0 && cy >= 0 && cx < size_ && cy < size_;
   }
 
@@ -99,6 +101,28 @@ class LioOccupancyMapper {
     if (x < 0 || y < 0 || x >= size_ || y >= size_) return;
     auto& value = log_odds_[static_cast<std::size_t>(y) * size_ + x];
     value = static_cast<int8_t>(std::max(-20, std::min(20, static_cast<int>(value) + delta)));
+  }
+
+  void clearRobotFootprint(double x, double y) {
+    int center_x, center_y;
+    if (!cell(x, y, center_x, center_y)) return;
+    const int cell_radius =
+        static_cast<int>(std::ceil(robot_free_radius_ / resolution_));
+    const double radius_squared = robot_free_radius_ * robot_free_radius_;
+    for (int offset_y = -cell_radius; offset_y <= cell_radius; ++offset_y) {
+      for (int offset_x = -cell_radius; offset_x <= cell_radius; ++offset_x) {
+        const int grid_x = center_x + offset_x;
+        const int grid_y = center_y + offset_y;
+        if (grid_x < 0 || grid_y < 0 || grid_x >= size_ || grid_y >= size_) continue;
+        const double world_x = map_origin_ + (grid_x + 0.5) * resolution_;
+        const double world_y = map_origin_ + (grid_y + 0.5) * resolution_;
+        const double dx = world_x - x;
+        const double dy = world_y - y;
+        if (dx * dx + dy * dy <= radius_squared) {
+          log_odds_[static_cast<std::size_t>(grid_y) * size_ + grid_x] = -20;
+        }
+      }
+    }
   }
 
   void trace(int x0, int y0, int x1, int y1, bool occupied) {
@@ -148,6 +172,9 @@ class LioOccupancyMapper {
       if (cell(mapped.x(), mapped.y(), endpoint_x, endpoint_y))
         trace(origin_x, origin_y, endpoint_x, endpoint_y, obstacle);
     }
+    // The lidar has a blind area around the robot, so ray tracing alone cannot
+    // make the planning start cell traversable on the first map update.
+    clearRobotFootprint(sensor_position_.x(), sensor_position_.y());
     last_cloud_stamp_ = message->header.stamp;
     dirty_ = true;
   }
@@ -162,8 +189,8 @@ class LioOccupancyMapper {
       map.info.map_load_time = map.header.stamp;
       map.info.resolution = resolution_;
       map.info.width = map.info.height = size_;
-      map.info.origin.position.x = -size_ * resolution_ * 0.5;
-      map.info.origin.position.y = -size_ * resolution_ * 0.5;
+      map.info.origin.position.x = map_origin_;
+      map.info.origin.position.y = map_origin_;
       map.info.origin.orientation.w = 1.0;
       map.data.resize(log_odds_.size());
       for (std::size_t i = 0; i < log_odds_.size(); ++i) {
@@ -185,6 +212,7 @@ class LioOccupancyMapper {
   int size_;
   double resolution_, publish_rate_, max_range_, obstacle_min_height_;
   double obstacle_max_height_, ground_min_height_, ground_max_height_, voxel_size_;
+  double robot_free_radius_, map_origin_;
   double max_speed_, translation_margin_, max_yaw_rate_, yaw_margin_;
   double pose_cloud_max_age_;
   std::string map_frame_;

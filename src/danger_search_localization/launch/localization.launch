@@ -1,38 +1,62 @@
 <launch>
   <arg name="config_file" default="$(find danger_search_localization)/config/default.yaml" />
+  <!-- gicp is retained only as a dependency-free fallback.  The preferred
+       source is FAST-LIO fed by the simulator's raw /scan and /livox/imu. -->
+  <arg name="local_odometry_source" default="gicp" />
+  <arg name="lio_odom_topic" default="/nav/lio_odom" />
+  <arg name="lio_tracking_frame" default="livox_imu_link" />
 
-  <!-- SimEnv remains untouched. This adapter converts its PointCloud into a
-       filtered PointCloud2 expressed in the robot IMU/base frame. -->
-  <node name="sim_sensor_adapter"
+  <!-- 只读取官方原始 /scan；不读取 /Odometry_gazebo 或真值变换后的点云。 -->
+  <node name="local_scan_projector"
         pkg="danger_search_localization"
-        type="sim_sensor_adapter_node"
+        type="scan_projector.py"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
   </node>
 
-  <!-- FAST-LIO2 in instantaneous-simulation (MARSIM) mode: tightly coupled
-       IMU prediction plus scan-to-map correction replaces GICP and Hector. -->
-  <node name="fast_lio_mapping"
-        pkg="danger_search_localization"
-        type="fast_lio_mapping"
-        output="screen">
-    <rosparam command="load" file="$(arg config_file)" />
-    <remap from="/Odometry" to="/localization/lio/odometry" />
-    <remap from="/cloud_registered" to="/localization/lio/cloud_registered" />
-    <remap from="/cloud_registered_body" to="/localization/lio/cloud_body" />
-    <remap from="/path" to="/localization/lio/path" />
-  </node>
+  <!-- The old scan-to-scan GICP odometry is only a fallback.  Do not run it
+       together with LIO: both publish the same internal local-pose topic. -->
+  <group if="$(eval arg('local_odometry_source') == 'gicp')">
+    <node name="lidar_odometry"
+          pkg="danger_search_localization"
+          type="lidar_odometry_node"
+          output="screen">
+      <rosparam command="load" file="$(arg config_file)" />
+    </node>
+  </group>
 
-  <node name="lio_occupancy_mapper"
-        pkg="danger_search_localization"
-        type="lio_occupancy_mapper_node"
+  <group if="$(eval arg('local_odometry_source') == 'lio')">
+    <node name="lio_odometry_bridge"
+          pkg="danger_search_localization"
+          type="lio_odometry_bridge.py"
+          output="screen">
+      <rosparam command="load" file="$(arg config_file)" />
+      <param name="lio_odom_topic" value="$(arg lio_odom_topic)" />
+      <param name="lio_tracking_frame" value="$(arg lio_tracking_frame)" />
+    </node>
+  </group>
+
+  <!-- Hector 是 P0 位姿与地图后端，公共话题和 TF 由 adapter 统一发布。 -->
+  <node name="hector_mapping"
+        pkg="hector_mapping"
+        type="hector_mapping"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
+    <remap from="scan" to="/localization/scan" />
+    <remap from="poseupdate" to="/localization/hector_pose" />
+    <remap from="map" to="/localization/raw_map" />
+    <param name="pub_map_odom_transform" value="false" />
+    <param name="use_tf_scan_transformation" value="true" />
+    <!-- Seed each scan match from the bounded GICP-backed map->odom->base TF.
+         Without this prior, sparse Mid-360 projections can make Hector feed a
+         bad previous match back into the next frame and drift metres while the
+         robot is stationary. -->
+    <param name="use_tf_pose_start_estimate" value="true" />
   </node>
 
   <node name="localization_adapter"
         pkg="danger_search_localization"
-        type="lio_interface.py"
+        type="pose_estimator.py"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
   </node>

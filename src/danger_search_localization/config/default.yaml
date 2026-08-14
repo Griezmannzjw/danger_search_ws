@@ -82,6 +82,7 @@ drop_unstable_scans: true            # 摔倒、剧烈转动或过低时不污�
 # Hector 2D 扫描匹配与地图
 map_resolution: 0.05
 map_size: 1024                    # 51.2 m x 51.2 m
+map_robot_free_radius_m: 0.40     # 主动清空雷达盲区内的机器人脚印，确保规划起点可通行
 map_start_x: 0.5
 map_start_y: 0.5
 map_multi_res_levels: 2

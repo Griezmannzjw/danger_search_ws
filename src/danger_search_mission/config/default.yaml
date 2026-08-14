@@ -42,6 +42,10 @@ entry_step_m: 0.6
 entry_completion_tolerance_m: 0.25
 # Action 单段失败时先等待新地图，再从当前实际位姿生成下一短目标。
 entry_retry_delay_s: 1.0
+# 地图暂不可达时降低 Action 重发频率，等待更多注册点云进入占据地图。
+entry_map_retry_delay_s: 2.0
+# Action 终态与 NavigationHealth 走不同 ROS 连接，留出语义状态到达时间。
+entry_health_settle_s: 0.3
 # 只累计“没有 entry_min_progress_m 进展”的连续失败；有进展后重新计数。
 entry_max_retries: 8
 entry_min_progress_m: 0.10
