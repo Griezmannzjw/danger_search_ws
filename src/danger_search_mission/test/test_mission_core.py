@@ -9,7 +9,9 @@ from danger_search_mission.mission_core import (
     build_result_document,
     DangerTrack,
     DangerTrackStore,
+    entry_progress,
     MissionLifecycle,
+    next_entry_target,
     normalize_result_file,
     task_relative_position,
 )
@@ -109,6 +111,37 @@ class ResultContractTest(unittest.TestCase):
     def test_relative_result_path_is_rejected(self):
         with self.assertRaises(ValueError):
             normalize_result_file("results/detected_danger.json")
+
+
+class EntryStrategyTest(unittest.TestCase):
+    def test_progress_uses_captured_heading(self):
+        forward, lateral = entry_progress(
+            current_x=9.0,
+            current_y=7.0,
+            home_x=10.0,
+            home_y=5.0,
+            home_yaw=math.pi / 2.0,
+        )
+        self.assertAlmostEqual(forward, 2.0)
+        self.assertAlmostEqual(lateral, 1.0)
+
+    def test_next_target_advances_in_bounded_segments(self):
+        target = next_entry_target(
+            home_x=1.0,
+            home_y=2.0,
+            home_yaw=0.0,
+            current_progress=1.1,
+            distance=4.2,
+            step=0.6,
+        )
+        self.assertAlmostEqual(target[0], 2.7)
+        self.assertAlmostEqual(target[1], 2.0)
+        self.assertAlmostEqual(target[2], 1.7)
+
+    def test_final_segment_is_clamped_to_entry_distance(self):
+        target = next_entry_target(1.0, 2.0, 0.0, 4.0, 4.2, 0.6)
+        self.assertAlmostEqual(target[0], 5.2)
+        self.assertAlmostEqual(target[2], 4.2)
 
 
 if __name__ == "__main__":

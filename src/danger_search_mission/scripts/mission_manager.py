@@ -21,7 +21,9 @@ from danger_search_common.msg import (
 from danger_search_mission.mission_core import (
     build_result_document,
     DangerTrackStore,
+    entry_progress,
     MissionLifecycle,
+    next_entry_target,
     normalize_result_file,
 )
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -103,22 +105,28 @@ class MissionManager:
         self.return_timeout_s = self._positive_param("~return_timeout_s", 120.0)
         self.entry_timeout_s = self._positive_param("~entry_timeout_s", 90.0)
         self.entry_distance_m = self._positive_param("~entry_distance_m", 4.2)
-        self.entry_approach_distance_m = self._positive_param(
-            "~entry_approach_distance_m", 2.4
+        self.entry_step_m = self._positive_param("~entry_step_m", 0.6)
+        self.entry_retry_delay_s = self._positive_param(
+            "~entry_retry_delay_s", 1.0
         )
-        self.entry_step_distance_m = self._positive_param(
-            "~entry_step_distance_m", 0.5
+        self.entry_map_retry_delay_s = self._positive_param(
+            "~entry_map_retry_delay_s", 2.0
         )
-        self.entry_heading_rad = float(rospy.get_param("~entry_heading_rad", 0.0))
-        if not math.isfinite(self.entry_heading_rad):
-            raise rospy.ROSInitException("~entry_heading_rad must be finite")
-        if self.entry_approach_distance_m >= self.entry_distance_m:
+        self.entry_health_settle_s = self._positive_param(
+            "~entry_health_settle_s", 0.3
+        )
+        self.entry_completion_tolerance_m = self._nonnegative_param(
+            "~entry_completion_tolerance_m", 0.25
+        )
+        self.entry_min_progress_m = self._nonnegative_param(
+            "~entry_min_progress_m", 0.10
+        )
+        self.entry_max_retries = int(rospy.get_param("~entry_max_retries", 8))
+        if self.entry_max_retries < 0:
+            raise rospy.ROSInitException("~entry_max_retries must be non-negative")
+        if self.entry_completion_tolerance_m >= self.entry_distance_m:
             raise rospy.ROSInitException(
-                "~entry_approach_distance_m must be shorter than entry_distance_m"
-            )
-        if self.entry_step_distance_m > self.entry_distance_m:
-            raise rospy.ROSInitException(
-                "~entry_step_distance_m cannot exceed ~entry_distance_m"
+                "~entry_completion_tolerance_m must be smaller than entry distance"
             )
         self.mission_timeout_s = self._nonnegative_param("~mission_timeout_s", 0.0)
         self.input_timeout_s = self._positive_param("~input_timeout_s", 2.0)
@@ -149,8 +157,12 @@ class MissionManager:
         self.map_coverage_summary = ""
         self.return_goal_active = False
         self.entry_goal_active = False
-        self.entry_approach_complete = False
-        self.entry_next_distance_m = 0.0
+        self.entry_goal_sequence = 0
+        self.entry_goal_progress_m = 0.0
+        self.entry_attempt_start_progress_m = 0.0
+        self.entry_retry_count = 0
+        self.entry_retry_at = rospy.Time(0)
+        self.entry_waiting_for_localization = False
         self.entrance_ready = not self.require_entrance_ready
         self.exploration_completion_armed = False
         self.finalized = False
@@ -433,10 +445,12 @@ class MissionManager:
             self.tracker.reset()
             self.return_goal_active = False
             self.entry_goal_active = False
-            self.entry_approach_complete = False
-            self.entry_next_distance_m = min(
-                self.entry_step_distance_m, self.entry_distance_m
-            )
+            self.entry_goal_sequence += 1
+            self.entry_goal_progress_m = 0.0
+            self.entry_attempt_start_progress_m = 0.0
+            self.entry_retry_count = 0
+            self.entry_retry_at = rospy.Time(0)
+            self.entry_waiting_for_localization = False
             self.exploration_completion_armed = False
             self.finalized = False
             self.remaining_frontier_count = 0
@@ -444,15 +458,13 @@ class MissionManager:
         self.active_pub.publish(Bool(data=True))
         self._publish_status()
         if self.entry_enabled:
-            success, message = self._send_entry_goal(
-                home_pose, self.entry_next_distance_m
-            )
+            success, message = self._advance_entry()
             if not success:
                 self._finalize("entry_start_failed:" + message, error=True)
                 return TriggerResponse(False, message)
             rospy.loginfo(
-                "[mission] ENTERING; home captured, %.2f m safety steps to %.2f m",
-                self.entry_step_distance_m, self.entry_distance_m,
+                "[mission] ENTERING; home captured, rolling target %.2f m ahead",
+                self.entry_distance_m,
             )
             return TriggerResponse(True, "Mission started; entering building")
 
@@ -462,72 +474,177 @@ class MissionManager:
             return TriggerResponse(False, message)
         return TriggerResponse(True, "Mission started")
 
-    def _send_entry_goal(self, home_pose, distance_m):
+    @staticmethod
+    def _pose_yaw(pose):
+        orientation = pose.pose.pose.orientation
+        return math.atan2(
+            2.0 * (orientation.w * orientation.z + orientation.x * orientation.y),
+            1.0 - 2.0 * (orientation.y ** 2 + orientation.z ** 2),
+        )
+
+    def _entry_progress(self, pose, home_pose):
+        current = pose.pose.pose.position
+        home = home_pose.pose.pose.position
+        return entry_progress(
+            current.x, current.y, home.x, home.y, self._pose_yaw(home_pose)
+        )
+
+    def _advance_entry(self):
+        with self.lock:
+            if self.mission_state != MissionLifecycle.ENTERING or self.finalized:
+                return False, "Mission is not entering"
+            if self.entry_goal_active:
+                return True, "Entry goal already active"
+            home_pose = copy.deepcopy(self.home_pose)
+            current_pose = copy.deepcopy(self.latest_pose)
+        if home_pose is None or current_pose is None:
+            return False, "Entry pose unavailable"
+
+        forward, lateral = self._entry_progress(current_pose, home_pose)
+        completion = self.entry_distance_m - self.entry_completion_tolerance_m
+        if forward >= completion:
+            rospy.loginfo(
+                "[mission] entrance crossed: forward=%.2f m lateral=%.2f m",
+                forward,
+                lateral,
+            )
+            return self._start_exploration()
+
+        home = home_pose.pose.pose.position
+        target_x, target_y, target_progress = next_entry_target(
+            home.x,
+            home.y,
+            self._pose_yaw(home_pose),
+            forward,
+            self.entry_distance_m,
+            self.entry_step_m,
+        )
+        return self._send_entry_goal(
+            home_pose, target_x, target_y, target_progress, forward
+        )
+
+    def _send_entry_goal(
+        self, home_pose, target_x, target_y, target_progress, start_progress
+    ):
         if not self.move_base_client.wait_for_server(rospy.Duration(1.0)):
             return False, "move_base unavailable for entry"
         goal = MoveBaseGoal()
         goal.target_pose.header.stamp = rospy.Time.now()
         goal.target_pose.header.frame_id = self.map_frame
         goal.target_pose.pose = copy.deepcopy(home_pose.pose.pose)
-        # The first GICP pose defines map heading 0.  The standing controller
-        # may rotate the body before /danger_search/start; using that transient
-        # body yaw would send the entrance goal away from the known entry axis.
-        goal.target_pose.pose.position.x += distance_m * math.cos(
-            self.entry_heading_rad
-        )
-        goal.target_pose.pose.position.y += distance_m * math.sin(
-            self.entry_heading_rad
-        )
-        goal.target_pose.pose.orientation.x = 0.0
-        goal.target_pose.pose.orientation.y = 0.0
-        goal.target_pose.pose.orientation.z = math.sin(self.entry_heading_rad / 2.0)
-        goal.target_pose.pose.orientation.w = math.cos(self.entry_heading_rad / 2.0)
-        self.move_base_client.send_goal(goal, done_cb=self._entry_done_callback)
+        goal.target_pose.pose.position.x = target_x
+        goal.target_pose.pose.position.y = target_y
         with self.lock:
+            self.entry_goal_sequence += 1
+            sequence = self.entry_goal_sequence
             self.entry_goal_active = True
+            self.entry_goal_progress_m = target_progress
+            self.entry_attempt_start_progress_m = start_progress
+            self.entry_retry_at = rospy.Time(0)
+        self.move_base_client.send_goal(
+            goal,
+            done_cb=lambda state, result: self._entry_done_callback(
+                sequence, state, result
+            ),
+        )
+        rospy.loginfo(
+            "[mission] entry segment %d sent: %.2f -> %.2f m",
+            sequence,
+            start_progress,
+            target_progress,
+        )
         return True, "Entry goal sent"
 
-    def _entry_done_callback(self, state, _result):
+    def _entry_done_callback(self, sequence, state, _result):
         with self.lock:
-            if self.mission_state != MissionLifecycle.ENTERING or self.finalized:
+            if (
+                self.mission_state != MissionLifecycle.ENTERING
+                or self.finalized
+                or sequence != self.entry_goal_sequence
+            ):
                 return
             self.entry_goal_active = False
-        if state != GoalStatus.SUCCEEDED:
-            self._finalize("entry_failed_action_state_%d" % state, error=True)
+        if state == GoalStatus.SUCCEEDED:
+            with self.lock:
+                self.entry_retry_count = 0
+                self.entry_waiting_for_localization = False
+                # Do not send a new goal from inside SimpleActionClient's done
+                # callback.  Let the mission timer advance after actionlib has
+                # fully returned to its idle state.
+                self.entry_retry_at = rospy.Time.now()
             return
-        with self.lock:
-            self.entry_approach_complete = True
-            if self.entry_next_distance_m + 1e-6 < self.entry_distance_m:
-                self.entry_next_distance_m = min(
-                    self.entry_distance_m,
-                    self.entry_next_distance_m + self.entry_step_distance_m,
-                )
-                continue_entry = True
-            else:
-                continue_entry = False
-        if continue_entry:
-            # SimpleActionClient is still completing its state transition while
-            # the done callback runs.  Sending the next goal from this stack can
-            # drop its DONE transition, so schedule it after the callback returns.
-            rospy.Timer(
-                rospy.Duration(0.01), self._continue_entry_callback, oneshot=True
-            )
-            return
-        success, message = self._start_exploration()
-        if not success:
-            self._finalize("start_exploration_error:" + message, error=True)
 
-    def _continue_entry_callback(self, _event):
+        # Navigation publishes its terminal health immediately before setting
+        # the Action result, but those messages use separate ROS connections.
+        # Classify after a short settling interval instead of racing a stale
+        # failure_code from the previous goal.
+        rospy.Timer(
+            rospy.Duration(self.entry_health_settle_s),
+            lambda _event: self._classify_entry_failure(sequence, state),
+            oneshot=True,
+        )
+
+    def _classify_entry_failure(self, sequence, state):
         with self.lock:
-            if self.mission_state != MissionLifecycle.ENTERING or self.finalized:
+            if (
+                self.mission_state != MissionLifecycle.ENTERING
+                or self.finalized
+                or sequence != self.entry_goal_sequence
+            ):
                 return
             home_pose = copy.deepcopy(self.home_pose)
-            distance_m = self.entry_next_distance_m
-        success, message = self._send_entry_goal(home_pose, distance_m)
-        if not success:
-            self._finalize("entry_crossing_start_failed:" + message, error=True)
+            current_pose = copy.deepcopy(self.latest_pose)
+            attempt_start = self.entry_attempt_start_progress_m
+
+        forward = attempt_start
+        if home_pose is not None and current_pose is not None:
+            forward, _ = self._entry_progress(current_pose, home_pose)
+        made_progress = forward >= attempt_start + self.entry_min_progress_m
+        with self.lock:
+            navigation_failure = (
+                self.navigation_health.failure_code
+                if self.navigation_health is not None
+                else ""
+            )
+            localization_lost = navigation_failure == "LOCALIZATION_LOST"
+            transient_failure = navigation_failure in (
+                "",
+                "NONE",
+                "LOCALIZATION_LOST",
+                "UNREACHABLE",
+            )
+            self.entry_waiting_for_localization = localization_lost
+            if transient_failure:
+                # Localization outages and rolling-map reachability misses are
+                # readiness conditions, not failed robot motion attempts. The
+                # complete entrance remains bounded by entry_timeout_s.
+                self.entry_retry_count = 0 if made_progress else self.entry_retry_count
+            else:
+                self.entry_retry_count = 0 if made_progress else self.entry_retry_count + 1
+            retries = self.entry_retry_count
+            if transient_failure or retries <= self.entry_max_retries:
+                retry_delay = (
+                    self.entry_map_retry_delay_s
+                    if navigation_failure == "UNREACHABLE"
+                    else self.entry_retry_delay_s
+                )
+                self.entry_retry_at = rospy.Time.now() + rospy.Duration(
+                    retry_delay
+                )
+        if not transient_failure and retries > self.entry_max_retries:
+            self._finalize(
+                "entry_failed_action_state_%d_retries_exhausted" % state,
+                error=True,
+            )
             return
-        rospy.loginfo("[mission] entrance step accepted; advancing to %.2f m", distance_m)
+        rospy.logwarn(
+            "[mission] entry segment failed state=%d code=%s progress=%.2f m; retry %d/%d",
+            state,
+            navigation_failure or "UNKNOWN",
+            forward,
+            retries,
+            self.entry_max_retries,
+        )
 
     def _start_exploration(self):
         try:
@@ -540,6 +657,8 @@ class MissionManager:
             if not self.lifecycle.begin_exploration():
                 return False, "Mission is not entering"
             self.entry_start_time = None
+            self.entry_retry_at = rospy.Time(0)
+            self.entry_waiting_for_localization = False
             # A successful start service response establishes a new exploration
             # session even when its latched false marker arrives asynchronously.
             self.exploration_completion_armed = True
@@ -597,6 +716,9 @@ class MissionManager:
             self.finish_reason = reason
             self.return_goal_active = False
             self.entry_goal_active = False
+            self.entry_goal_sequence += 1
+            self.entry_retry_at = rospy.Time(0)
+            self.entry_waiting_for_localization = False
             self.exploration_completion_armed = False
         try:
             self.stop_explore_client()
@@ -638,6 +760,9 @@ class MissionManager:
             start_time = self.start_time
             return_start_time = self.return_start_time
             entry_start_time = self.entry_start_time
+            entry_retry_at = self.entry_retry_at
+            entry_goal_active = self.entry_goal_active
+            entry_waiting_for_localization = self.entry_waiting_for_localization
             should_autostart = (
                 self.autostart
                 and not self.autostart_attempted
@@ -654,8 +779,28 @@ class MissionManager:
             and entry_start_time is not None
             and (now - entry_start_time).to_sec() >= self.entry_timeout_s
         ):
-            self.move_base_client.cancel_goal()
+            if entry_goal_active:
+                self.move_base_client.cancel_goal()
             self._finalize("entry_timeout", error=True)
+        elif (
+            state == MissionLifecycle.ENTERING
+            and not entry_goal_active
+            and not entry_retry_at.is_zero()
+            and now >= entry_retry_at
+        ):
+            if entry_waiting_for_localization and not self._entry_localization_ready(now):
+                with self.lock:
+                    self.entry_retry_at = now + rospy.Duration(self.entry_retry_delay_s)
+                rospy.logwarn_throttle(
+                    2.0, "[mission] entry paused until localization/map recover"
+                )
+            else:
+                with self.lock:
+                    self.entry_retry_at = rospy.Time(0)
+                    self.entry_waiting_for_localization = False
+                success, message = self._advance_entry()
+                if not success:
+                    self._finalize("entry_retry_failed:" + message, error=True)
         elif (
             state == MissionLifecycle.EXPLORING
             and self.mission_timeout_s > 0.0
@@ -671,6 +816,30 @@ class MissionManager:
             self.move_base_client.cancel_goal()
             self._finalize("return_timeout", error=True)
         self._publish_status()
+
+    def _entry_localization_ready(self, now):
+        with self.lock:
+            pose = self.latest_pose
+            pose_time = self.last_pose_time
+            mapping = self.mapping_status
+            mapping_time = self.last_mapping_status_time
+            navigation = self.navigation_health
+            navigation_time = self.last_navigation_health_time
+        inputs = (
+            (pose, pose_time),
+            (mapping, mapping_time),
+            (navigation, navigation_time),
+        )
+        if any(value is None for value, _stamp in inputs):
+            return False
+        if any((now - stamp).to_sec() > self.input_timeout_s for _value, stamp in inputs):
+            return False
+        return (
+            mapping.ready
+            and mapping.stable
+            and not mapping.lost
+            and navigation.ready
+        )
 
     def _finalize(self, reason, error):
         with self.lock:

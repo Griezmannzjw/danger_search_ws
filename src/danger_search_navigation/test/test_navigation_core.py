@@ -5,7 +5,6 @@ import math
 import os
 import sys
 import threading
-import time
 import unittest
 from types import SimpleNamespace
 
@@ -19,12 +18,11 @@ if SCRIPTS_DIR not in sys.path:
 from navigation_core import (
     GoalState,
     InflatedOccupancyGrid,
-    ReadinessRecovery,
     goal_reached,
     path_lengths,
     path_progress,
 )
-from nav_controller import LatestMapWorker, NavController
+from nav_controller import NavController
 
 
 def make_grid(width, height, occupied=(), unknown=(), **kwargs):
@@ -66,31 +64,6 @@ class InflatedOccupancyGridTest(unittest.TestCase):
         self.assertFalse(grid.traversable(grid.world_to_cell(-0.1, 0.5)))
         self.assertIsNone(grid.plan((0.5, 0.5), (1.5, 1.5)))
         self.assertIsNone(grid.plan((1.5, 1.5), (2.5, 2.5)))
-
-    def test_action_fallback_can_cross_unknown_to_known_free_goal(self):
-        grid = make_grid(7, 3, unknown=[(3, cell_y) for cell_y in range(3)])
-
-        route = grid.plan_allow_unknown((0.5, 1.5), (6.5, 1.5))
-
-        self.assertIsNotNone(route)
-        self.assertTrue(grid.path_is_action_traversable(route))
-        self.assertFalse(grid.path_is_traversable(route))
-
-    def test_action_fallback_never_crosses_occupied_wall(self):
-        grid = make_grid(7, 3, occupied=[(3, cell_y) for cell_y in range(3)])
-
-        self.assertIsNone(
-            grid.plan_allow_unknown((0.5, 1.5), (6.5, 1.5))
-        )
-
-    def test_dynamic_obstacle_blocks_action_unknown_fallback(self):
-        grid = make_grid(7, 1, unknown=[(3, 0)])
-
-        self.assertIsNone(
-            grid.plan_allow_unknown(
-                (0.5, 0.5), (6.5, 0.5), dynamic_cells=[(3, 0)]
-            )
-        )
 
     def test_inflation_blocks_narrow_corridor(self):
         occupied = [(cell_x, 0) for cell_x in range(7)]
@@ -139,6 +112,23 @@ class InflatedOccupancyGridTest(unittest.TestCase):
         self.assertIsNone(unrotated.world_to_cell(-1.1, -0.5))
         self.assertEqual(unrotated.world_to_cell(-0.1, -0.1), (0, 0))
 
+    def test_even_sized_mapper_places_world_zero_inside_center_cell(self):
+        # OccupancyGrid serializes resolution as float32. Keeping zero half a
+        # cell away from a boundary prevents rounding from selecting UNKNOWN.
+        size = 1024
+        resolution = 0.05000000074505806
+        center = size // 2
+        origin = -(center + 0.5) * 0.05
+        data = [-1] * (size * size)
+        data[center * size + center] = 0
+        grid = InflatedOccupancyGrid(
+            size, size, resolution, origin, origin, 0.0, data,
+            robot_radius=0.0,
+        )
+
+        self.assertEqual(grid.world_to_cell(0.0, 0.0), (center, center))
+        self.assertTrue(grid.traversable((center, center)))
+
     def test_diagonal_does_not_cut_blocked_corner(self):
         grid = make_grid(3, 3, occupied=[(1, 0), (0, 1)])
         self.assertIsNone(grid.plan((0.5, 0.5), (1.5, 1.5)))
@@ -173,95 +163,14 @@ class NavigationStateTest(unittest.TestCase):
         self.assertEqual(state.progress, 1.0)
         self.assertEqual(state.failure_code, "SUCCEEDED")
 
-
-class ReadinessRecoveryTest(unittest.TestCase):
-    def test_single_transient_failure_keeps_goal_active(self):
-        recovery = ReadinessRecovery(3.0)
-        state = GoalState()
-        state.begin("goal-during-transient")
-
-        decision, elapsed, resumed = recovery.evaluate(False, "CONTROL_FAILED", 10.0)
-
-        self.assertEqual(decision, ReadinessRecovery.WAIT)
-        self.assertEqual(elapsed, 0.0)
-        self.assertFalse(resumed)
-        self.assertTrue(recovery.waiting)
-        self.assertTrue(state.active)
-
-    def test_recovery_resumes_before_timeout(self):
-        recovery = ReadinessRecovery(3.0)
-        recovery.evaluate(False, "LOCALIZATION_LOST", 10.0)
-
-        decision, elapsed, resumed = recovery.evaluate(True, "NONE", 12.9)
-
-        self.assertEqual(decision, ReadinessRecovery.READY)
-        self.assertEqual(elapsed, 0.0)
-        self.assertTrue(resumed)
-        self.assertFalse(recovery.waiting)
-
-    def test_persistent_failure_aborts_at_timeout(self):
-        recovery = ReadinessRecovery(3.0)
-        recovery.evaluate(False, "CONTROL_FAILED", 10.0)
-
-        decision, elapsed, _ = recovery.evaluate(False, "CONTROL_FAILED", 13.0)
-
-        self.assertEqual(decision, ReadinessRecovery.ABORT)
-        self.assertAlmostEqual(elapsed, 3.0)
-
-    def test_safety_stop_aborts_immediately(self):
-        recovery = ReadinessRecovery(3.0)
-
-        decision, elapsed, _ = recovery.evaluate(False, "SAFETY_STOP", 10.0)
-
-        self.assertEqual(decision, ReadinessRecovery.ABORT)
-        self.assertEqual(elapsed, 0.0)
-
-
-class LatestMapWorkerTest(unittest.TestCase):
-    def test_inflight_old_map_cannot_replace_newest_pending_map(self):
-        first_build_started = threading.Event()
-        release_first_build = threading.Event()
-        installed = []
-
-        def build(value):
-            if value == "old":
-                first_build_started.set()
-                release_first_build.wait(1.0)
-            return value
-
-        worker = LatestMapWorker(build, installed.append)
-        try:
-            worker.submit("old")
-            self.assertTrue(first_build_started.wait(1.0))
-            worker.submit("new")
-            release_first_build.set()
-            deadline = time.monotonic() + 1.0
-            while installed != ["new"] and time.monotonic() < deadline:
-                time.sleep(0.01)
-            self.assertEqual(installed, ["new"])
-        finally:
-            worker.stop()
-
-    def test_invalidation_discards_inflight_map(self):
-        build_started = threading.Event()
-        release_build = threading.Event()
-        installed = []
-
-        def build(value):
-            build_started.set()
-            release_build.wait(1.0)
-            return value
-
-        worker = LatestMapWorker(build, installed.append)
-        try:
-            worker.submit("map")
-            self.assertTrue(build_started.wait(1.0))
-            worker.invalidate()
-            release_build.set()
-            time.sleep(0.05)
-            self.assertEqual(installed, [])
-        finally:
-            worker.stop()
+    def test_navigation_publishes_terminal_health_before_action_result(self):
+        source = os.path.join(SCRIPTS_DIR, "nav_controller.py")
+        with open(source, encoding="utf-8") as stream:
+            text = stream.read()
+        finish = text.index("    def _finish_goal")
+        preempt = text.index("    def preempt_cb", finish)
+        body = text[finish:preempt]
+        self.assertLess(body.index("self.publish_health()"), body.index("set_aborted"))
 
 
 class NavigationReadinessTest(unittest.TestCase):
@@ -311,36 +220,6 @@ class NavigationReadinessTest(unittest.TestCase):
         self.assertFalse(ready)
         self.assertEqual(code, "LOCALIZATION_LOST")
         self.assertEqual(detail, "GICP_ODOMETRY_DEGRADED_HOLDING_LAST_POSE")
-
-    def test_obstacle_failure_reports_frame_age_and_timeout(self):
-        self.controller.require_obstacle_cloud = True
-        self.controller.obstacle_frame_valid = True
-        self.controller.obstacle_stamp = rospy.Time.from_sec(98.0)
-
-        ready, code, detail = self.controller._navigation_readiness(
-            rospy.Time.from_sec(100.0), require_obstacles=True
-        )
-
-        self.assertFalse(ready)
-        self.assertEqual(code, "CONTROL_FAILED")
-        self.assertIn("frame_valid=True", detail)
-        self.assertIn("age=2.000s", detail)
-        self.assertIn("timeout=0.500s", detail)
-
-    def test_readiness_pause_resets_stuck_watchdog(self):
-        self.controller.goal_state = GoalState()
-        self.controller.goal_state.begin("paused-goal")
-        self.controller.last_position = (0.0, 0.0)
-        self.controller.last_progress_time = rospy.Time.from_sec(10.0)
-        self.controller.stuck_command_speed = 0.05
-        self.controller.progress_distance = 0.10
-        self.controller.stuck_timeout = 5.0
-
-        self.controller._reset_stuck_watchdog((0.0, 0.0, 0.0), rospy.Time.from_sec(20.0))
-
-        self.assertFalse(
-            self.controller._is_stuck((0.0, 0.0), 0.2, rospy.Time.from_sec(20.1))
-        )
 
 
 if __name__ == "__main__":

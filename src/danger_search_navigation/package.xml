@@ -33,7 +33,6 @@
   <exec_depend>actionlib_msgs</exec_depend>
   <exec_depend>move_base_msgs</exec_depend>
   <exec_depend>danger_search_common</exec_depend>
-  <exec_depend>python3-numpy</exec_depend>
 
   <test_depend>python3-nose</test_depend>
 </package>

@@ -9,8 +9,6 @@ from dataclasses import dataclass
 import heapq
 import math
 
-import numpy as np
-
 
 VALID_FAILURE_CODES = frozenset((
     "NONE",
@@ -62,48 +60,6 @@ def goal_reached(current_xy_yaw, goal_xy_yaw, xy_tolerance, yaw_tolerance):
     )
     yaw_error = abs(normalize_angle(goal_xy_yaw[2] - current_xy_yaw[2]))
     return distance <= xy_tolerance and yaw_error <= yaw_tolerance
-
-
-class ReadinessRecovery:
-    """Bound a transient execution-time readiness outage.
-
-    Goal admission remains strict. This helper is only used after an Action has
-    started so a short sensor/localization scheduling gap can stop motion
-    without destroying the goal lifecycle.
-    """
-
-    READY = "READY"
-    WAIT = "WAIT"
-    ABORT = "ABORT"
-
-    def __init__(self, timeout_s):
-        timeout_s = float(timeout_s)
-        if not math.isfinite(timeout_s) or timeout_s <= 0.0:
-            raise ValueError("就绪恢复窗口必须是正有限数")
-        self.timeout_s = timeout_s
-        self.failure_started_s = None
-
-    @property
-    def waiting(self):
-        return self.failure_started_s is not None
-
-    def evaluate(self, ready, failure_code, now_s):
-        """Return ``(decision, elapsed, resumed)`` for the current sample."""
-        now_s = float(now_s)
-        if not math.isfinite(now_s):
-            raise ValueError("就绪状态时间必须是有限数")
-        if ready:
-            resumed = self.waiting
-            self.failure_started_s = None
-            return self.READY, 0.0, resumed
-        if failure_code == "SAFETY_STOP":
-            self.failure_started_s = None
-            return self.ABORT, 0.0, False
-        if self.failure_started_s is None or now_s < self.failure_started_s:
-            self.failure_started_s = now_s
-        elapsed = now_s - self.failure_started_s
-        decision = self.ABORT if elapsed >= self.timeout_s else self.WAIT
-        return decision, elapsed, False
 
 
 @dataclass
@@ -195,18 +151,18 @@ class InflatedOccupancyGrid:
         self.max_expansions = int(max_expansions)
         self.inflation_radius = float(robot_radius) + float(inflation_padding)
 
-        values = np.asarray(data, dtype=np.int16).reshape(-1)
-        self.unknown = values == -1
+        values = tuple(int(value) for value in data)
+        self.unknown = tuple(value == -1 for value in values)
         # -1、100 以及任何非 0 单元都保守地不可通行。
-        self.base_blocked = values != 0
-        inflated = self.base_blocked.copy()
-        obstacle_inflated = (values != 0) & (values != -1)
+        self.base_blocked = tuple(value != 0 for value in values)
+        inflated = list(self.base_blocked)
         # unknown 和其他非自由格本身不可通行；只有真正占据的栅格需要
         # 做机器人半径膨胀。否则大面积 unknown 地图会在每次回调中产生
         # 数千万次重复膨胀运算，并把已知自由区边界全部吞掉。
         occupied_cells = (
-            (int(index % self.width), int(index // self.width))
-            for index in np.flatnonzero(values >= int(occupied_threshold))
+            (index % self.width, index // self.width)
+            for index, value in enumerate(values)
+            if value >= int(occupied_threshold)
         )
         offsets = self._disk_offsets(self.inflation_radius)
         for cell_x, cell_y in occupied_cells:
@@ -214,13 +170,7 @@ class InflatedOccupancyGrid:
                 nx, ny = cell_x + dx, cell_y + dy
                 if self.in_bounds(nx, ny):
                     inflated[self.index(nx, ny)] = True
-                    obstacle_inflated[self.index(nx, ny)] = True
-        inflated.flags.writeable = False
-        obstacle_inflated.flags.writeable = False
-        self.unknown.flags.writeable = False
-        self.base_blocked.flags.writeable = False
-        self.inflated_blocked = inflated
-        self.obstacle_inflated = obstacle_inflated
+        self.inflated_blocked = tuple(inflated)
 
     def index(self, cell_x, cell_y):
         return int(cell_y) * self.width + int(cell_x)
@@ -275,14 +225,6 @@ class InflatedOccupancyGrid:
             return False
         return dynamic_blocked is None or cell not in dynamic_blocked
 
-    def action_traversable(self, cell, dynamic_blocked=None):
-        """Action fallback may enter unknown, but never an inflated obstacle."""
-        if cell is None or not self.in_bounds(cell[0], cell[1]):
-            return False
-        if self.obstacle_inflated[self.index(cell[0], cell[1])]:
-            return False
-        return dynamic_blocked is None or cell not in dynamic_blocked
-
     def unknown_at_world(self, point):
         cell = self.world_to_cell(point[0], point[1])
         return (
@@ -297,43 +239,12 @@ class InflatedOccupancyGrid:
             for point in path
         )
 
-    def path_is_action_traversable(self, path, dynamic_cells=()):
-        dynamic_blocked = self.expanded_cells(dynamic_cells)
-        return all(
-            self.action_traversable(
-                self.world_to_cell(point[0], point[1]), dynamic_blocked
-            )
-            for point in path
-        )
-
     def plan(self, start_world, goal_world, dynamic_cells=()):
         """以 A* 搜索膨胀后栅格；起终点或搜索不可达时返回 None。"""
-        return self._plan(
-            start_world, goal_world, dynamic_cells,
-            allow_unknown=False, unknown_penalty=1.0,
-        )
-
-    def plan_allow_unknown(
-        self, start_world, goal_world, dynamic_cells=(), unknown_penalty=3.0
-    ):
-        """Action fallback for exploration with live local obstacle protection."""
-        unknown_penalty = float(unknown_penalty)
-        if not math.isfinite(unknown_penalty) or unknown_penalty < 1.0:
-            raise ValueError("未知区域代价必须是不小于 1 的有限数")
-        return self._plan(
-            start_world, goal_world, dynamic_cells,
-            allow_unknown=True, unknown_penalty=unknown_penalty,
-        )
-
-    def _plan(
-        self, start_world, goal_world, dynamic_cells,
-        allow_unknown, unknown_penalty,
-    ):
         start = self.world_to_cell(start_world[0], start_world[1])
         goal = self.world_to_cell(goal_world[0], goal_world[1])
         dynamic_blocked = self.expanded_cells(dynamic_cells)
-        can_traverse = self.action_traversable if allow_unknown else self.traversable
-        if not can_traverse(start, dynamic_blocked) or not can_traverse(goal, dynamic_blocked):
+        if not self.traversable(start, dynamic_blocked) or not self.traversable(goal, dynamic_blocked):
             return None
         if start == goal:
             return self._remove_duplicate_points([tuple(start_world), tuple(goal_world)])
@@ -351,15 +262,8 @@ class InflatedOccupancyGrid:
             expansions += 1
             if expansions > self.max_expansions:
                 return None
-            for neighbor, step_cost in self._neighbors(
-                current, dynamic_blocked, allow_unknown=allow_unknown
-            ):
-                penalty = (
-                    unknown_penalty
-                    if allow_unknown and self.unknown[self.index(*neighbor)]
-                    else 1.0
-                )
-                tentative_cost = current_cost + step_cost * penalty
+            for neighbor, step_cost in self._neighbors(current, dynamic_blocked):
+                tentative_cost = current_cost + step_cost
                 if tentative_cost >= g_score.get(neighbor, float("inf")):
                     continue
                 came_from[neighbor] = current
@@ -395,21 +299,20 @@ class InflatedOccupancyGrid:
                 return route
         return None
 
-    def _neighbors(self, current, dynamic_blocked, allow_unknown=False):
+    def _neighbors(self, current, dynamic_blocked):
         cell_x, cell_y = current
-        can_traverse = self.action_traversable if allow_unknown else self.traversable
         candidates = [(1, 0), (-1, 0), (0, 1), (0, -1)]
         if self.allow_diagonal:
             candidates.extend([(1, 1), (1, -1), (-1, 1), (-1, -1)])
         for dx, dy in candidates:
             neighbor = (cell_x + dx, cell_y + dy)
-            if not can_traverse(neighbor, dynamic_blocked):
+            if not self.traversable(neighbor, dynamic_blocked):
                 continue
             if dx and dy:
                 # 禁止斜向穿越两个相邻的阻塞格。
-                if not can_traverse((cell_x + dx, cell_y), dynamic_blocked):
+                if not self.traversable((cell_x + dx, cell_y), dynamic_blocked):
                     continue
-                if not can_traverse((cell_x, cell_y + dy), dynamic_blocked):
+                if not self.traversable((cell_x, cell_y + dy), dynamic_blocked):
                     continue
                 yield neighbor, math.sqrt(2.0)
             else:

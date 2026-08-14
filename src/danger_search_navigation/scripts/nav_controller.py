@@ -34,68 +34,11 @@ sys.path.insert(0, _SCRIPT_DIR)
 from navigation_core import (
     GoalState,
     InflatedOccupancyGrid,
-    ReadinessRecovery,
     goal_reached,
     normalize_angle,
     path_lengths,
     path_progress,
 )
-
-
-class LatestMapWorker:
-    """Build only the newest planner snapshot without blocking ROS callbacks."""
-
-    def __init__(self, build, install, on_error=None):
-        self._build = build
-        self._install = install
-        self._on_error = on_error
-        self._condition = threading.Condition()
-        self._latest_sequence = 0
-        self._pending = None
-        self._stopping = False
-        self._thread = threading.Thread(target=self._run, name="navigation-map-worker")
-        self._thread.daemon = True
-        self._thread.start()
-
-    def submit(self, payload):
-        with self._condition:
-            self._latest_sequence += 1
-            self._pending = (self._latest_sequence, payload)
-            self._condition.notify()
-
-    def invalidate(self):
-        """Ensure an older in-flight build cannot replace an invalid newest map."""
-        with self._condition:
-            self._latest_sequence += 1
-            self._pending = None
-
-    def stop(self):
-        with self._condition:
-            self._stopping = True
-            self._condition.notify_all()
-
-    def _run(self):
-        while True:
-            with self._condition:
-                while self._pending is None and not self._stopping:
-                    self._condition.wait()
-                if self._stopping:
-                    return
-                sequence, payload = self._pending
-                self._pending = None
-            try:
-                result = self._build(payload)
-            except Exception as exc:  # Keep the worker alive after malformed input.
-                if self._on_error is not None:
-                    self._on_error(exc)
-                continue
-            with self._condition:
-                if self._stopping:
-                    return
-                if sequence != self._latest_sequence:
-                    continue
-                # Keep the freshness check and pointer swap atomic with submit().
-                self._install(result)
 
 
 class NavController:
@@ -126,9 +69,6 @@ class NavController:
         self.inflation_padding = float(rospy.get_param("~inflation_padding", 0.10))
         self.allow_diagonal = bool(rospy.get_param("~allow_diagonal", True))
         self.max_expansions = int(rospy.get_param("~max_planner_expansions", 75000))
-        self.action_unknown_penalty = float(
-            rospy.get_param("~action_unknown_penalty", 3.0)
-        )
         self.pose_timeout = float(rospy.get_param("~pose_timeout", 0.50))
         self.map_timeout = float(rospy.get_param("~map_timeout", 2.00))
         self.mapping_status_timeout = float(rospy.get_param("~mapping_status_timeout", 1.50))
@@ -149,15 +89,6 @@ class NavController:
         self.obstacle_range_min = float(rospy.get_param("~obstacle_range_min", 0.15))
         self.obstacle_range_max = float(rospy.get_param("~obstacle_range_max", 8.00))
         self.zero_point_radius = float(rospy.get_param("~zero_point_radius", 0.05))
-        self.obstacle_self_exclusion_min_x = float(
-            rospy.get_param("~obstacle_self_exclusion_min_x", -0.55)
-        )
-        self.obstacle_self_exclusion_max_x = float(
-            rospy.get_param("~obstacle_self_exclusion_max_x", 0.55)
-        )
-        self.obstacle_self_exclusion_half_width_y = float(
-            rospy.get_param("~obstacle_self_exclusion_half_width_y", 0.40)
-        )
         self.obstacle_max_points = int(rospy.get_param("~obstacle_max_points", 2000))
         self.dynamic_stop_distance = float(rospy.get_param("~dynamic_stop_distance", 0.60))
         self.dynamic_front_half_angle = float(rospy.get_param("~dynamic_front_half_angle", 0.52))
@@ -175,9 +106,6 @@ class NavController:
         self.goal_tolerance_yaw = float(rospy.get_param("~goal_tolerance_yaw", 0.20))
         self.goal_timeout = float(rospy.get_param("~goal_timeout", 60.0))
         self.stuck_timeout = float(rospy.get_param("~stuck_timeout", 5.0))
-        self.readiness_recovery_timeout = float(
-            rospy.get_param("~readiness_recovery_timeout", 3.0)
-        )
         self.progress_distance = float(rospy.get_param("~progress_distance", 0.10))
         self.stuck_command_speed = float(rospy.get_param("~stuck_command_speed", 0.05))
         self.control_rate = float(rospy.get_param("~control_rate", 20.0))
@@ -200,12 +128,9 @@ class NavController:
         self.obstacle_frame_valid = False
         self.safety_stop = False
         self.clear_costmaps_requested = False
-        lidar_rotation = tf.transformations.euler_matrix(
+        self.lidar_rotation = tf.transformations.euler_matrix(
             self.lidar_roll, self.lidar_pitch, self.lidar_yaw
         )[:3, :3]
-        self.lidar_rotation = tuple(
-            tuple(float(value) for value in row) for row in lidar_rotation
-        )
 
         self.goal_state = GoalState()
         self.has_active_goal = False
@@ -222,29 +147,21 @@ class NavController:
         self.controller_active = False
         self.last_cmd_time = rospy.Time(0)
 
-        self.map_worker = LatestMapWorker(
-            self._build_planner_snapshot,
-            self._install_planner_snapshot,
-            self._map_build_failed,
-        )
-
         self.cmd_pub = rospy.Publisher(self.nav_cmd_topic, Twist, queue_size=10)
         self.health_pub = rospy.Publisher(self.health_topic, NavigationHealth, queue_size=10)
 
         self.pose_sub = rospy.Subscriber(
-            self.pose_topic, PoseWithCovarianceStamped, self.pose_callback, queue_size=10
+            self.pose_topic, PoseWithCovarianceStamped, self.pose_callback
         )
-        self.map_sub = rospy.Subscriber(
-            self.map_topic, OccupancyGrid, self.map_callback, queue_size=1
-        )
+        self.map_sub = rospy.Subscriber(self.map_topic, OccupancyGrid, self.map_callback)
         self.mapping_status_sub = rospy.Subscriber(
-            self.mapping_status_topic, MappingStatus, self.mapping_status_callback, queue_size=10
+            self.mapping_status_topic, MappingStatus, self.mapping_status_callback
         )
         self.obstacle_sub = rospy.Subscriber(
-            self.obstacle_cloud_topic, PointCloud, self.obstacle_callback, queue_size=1
+            self.obstacle_cloud_topic, PointCloud, self.obstacle_callback
         )
         self.safety_stop_sub = rospy.Subscriber(
-            self.safety_stop_topic, Bool, self.safety_stop_callback, queue_size=2
+            self.safety_stop_topic, Bool, self.safety_stop_callback
         )
 
         self.action_server = actionlib.SimpleActionServer(
@@ -266,7 +183,7 @@ class NavController:
         self.health_timer = rospy.Timer(
             rospy.Duration(1.0 / self.health_rate), self.publish_health
         )
-        rospy.on_shutdown(self._shutdown)
+        rospy.on_shutdown(self._stop_robot)
 
         rospy.loginfo(
             "[navigation] 已启动共享 A* 导航节点，action: %s", self.move_base_action_name
@@ -286,13 +203,9 @@ class NavController:
             self.rotate_in_place_gain, self.final_yaw_gain, self.replan_period,
             self.replan_min_interval, self.replan_deviation_distance,
             self.stuck_timeout, self.progress_distance,
-            self.readiness_recovery_timeout,
-            self.action_unknown_penalty,
         )
         if any(not math.isfinite(value) or value <= 0.0 for value in positive_values):
             raise rospy.ROSInitException("导航正数参数无效")
-        if self.action_unknown_penalty < 1.0:
-            raise rospy.ROSInitException("Action 未知区域代价不能小于 1")
         if (not math.isfinite(self.robot_radius) or not math.isfinite(self.inflation_padding)
                 or self.robot_radius < 0.0 or self.inflation_padding < 0.0):
             raise rospy.ROSInitException("导航膨胀参数不能为负")
@@ -302,12 +215,6 @@ class NavController:
             raise rospy.ROSInitException("点云高度范围无效")
         if self.obstacle_range_min < 0.0 or self.obstacle_range_min >= self.obstacle_range_max:
             raise rospy.ROSInitException("点云距离范围无效")
-        if (
-            self.obstacle_self_exclusion_min_x
-            >= self.obstacle_self_exclusion_max_x
-            or self.obstacle_self_exclusion_half_width_y < 0.0
-        ):
-            raise rospy.ROSInitException("机器人自身点云排除范围无效")
         if not 1 <= self.occupied_threshold <= 100:
             raise rospy.ROSInitException("占据阈值必须位于 1..100")
 
@@ -323,60 +230,38 @@ class NavController:
             self._stop_robot()
 
     def map_callback(self, msg):
-        """Validate cheaply and leave million-cell planner construction to a worker."""
+        """原子替换经合法性检查的规划器快照。"""
+        planner = None
         valid = False
-        yaw = None
         if msg.header.frame_id == self.map_frame and not msg.header.stamp.is_zero():
             origin = msg.info.origin
             yaw = self._quaternion_yaw(origin.orientation)
-            valid = (
-                yaw is not None
-                and self._finite(origin.position.x, origin.position.y, msg.info.resolution)
-                and msg.info.width > 0
-                and msg.info.height > 0
-                and msg.info.resolution > 0.0
-                and len(msg.data) == msg.info.width * msg.info.height
-            )
+            if yaw is not None and self._finite(origin.position.x, origin.position.y):
+                try:
+                    planner = InflatedOccupancyGrid(
+                        msg.info.width, msg.info.height, msg.info.resolution,
+                        origin.position.x, origin.position.y, yaw, msg.data,
+                        occupied_threshold=self.occupied_threshold,
+                        robot_radius=self.robot_radius,
+                        inflation_padding=self.inflation_padding,
+                        allow_diagonal=self.allow_diagonal,
+                        max_expansions=self.max_expansions,
+                    )
+                    valid = True
+                except (TypeError, ValueError) as exc:
+                    rospy.logwarn_throttle(5.0, "[navigation] 地图无效，拒绝规划: %s", exc)
         if not valid:
             rospy.logwarn_throttle(5.0, "[navigation] 地图帧、时间戳、原点或几何无效")
-            self.map_worker.invalidate()
-            with self.lock:
-                self.map_data = None
-                self.planner = None
-                self.map_stamp = msg.header.stamp
-                self.map_valid = False
-                active = self.goal_state.active
-            if active:
-                self._stop_robot()
-            return
-        self.map_worker.submit((msg, yaw))
-
-    def _build_planner_snapshot(self, payload):
-        msg, yaw = payload
-        origin = msg.info.origin
-        planner = InflatedOccupancyGrid(
-            msg.info.width, msg.info.height, msg.info.resolution,
-            origin.position.x, origin.position.y, yaw, msg.data,
-            occupied_threshold=self.occupied_threshold,
-            robot_radius=self.robot_radius,
-            inflation_padding=self.inflation_padding,
-            allow_diagonal=self.allow_diagonal,
-            max_expansions=self.max_expansions,
-        )
-        return msg.header.stamp, planner
-
-    def _install_planner_snapshot(self, snapshot):
-        stamp, planner = snapshot
         with self.lock:
-            self.map_data = None
+            self.map_data = tuple(msg.data) if valid else None
             self.planner = planner
-            self.map_stamp = stamp
-            self.map_valid = True
-            self.map_generation += 1
-
-    @staticmethod
-    def _map_build_failed(exc):
-        rospy.logwarn_throttle(5.0, "[navigation] 地图无效，拒绝规划: %s", exc)
+            self.map_stamp = msg.header.stamp
+            self.map_valid = valid
+            if valid:
+                self.map_generation += 1
+            active = self.goal_state.active
+        if not valid and active:
+            self._stop_robot()
 
     def mapping_status_callback(self, msg):
         """保存定位/建图模块明确声明的 ready、stable、lost 状态。"""
@@ -400,13 +285,6 @@ class NavController:
                 if point.x * point.x + point.y * point.y + point.z * point.z < self.zero_point_radius ** 2:
                     continue
                 base_x, base_y, base_z = self._lidar_to_base(point.x, point.y, point.z)
-                if (
-                    self.obstacle_self_exclusion_min_x
-                    <= base_x
-                    <= self.obstacle_self_exclusion_max_x
-                    and abs(base_y) <= self.obstacle_self_exclusion_half_width_y
-                ):
-                    continue
                 distance = math.hypot(base_x, base_y)
                 if not self.obstacle_min_z <= base_z <= self.obstacle_max_z:
                     continue
@@ -448,12 +326,7 @@ class NavController:
         route = planner.plan(start_xy, goal_xy, dynamic_cells)
         if route is not None:
             return route
-        # The final fallback already searches known and unknown cells in one
-        # pass. Repeated frontier probes can starve the latest /scan callback.
-        return planner.plan_allow_unknown(
-            start_xy, goal_xy, dynamic_cells,
-            unknown_penalty=self.action_unknown_penalty,
-        )
+        return planner.plan_toward_unknown(start_xy, goal_xy, dynamic_cells)
 
     def _pose_from_message(self, msg):
         if msg.header.frame_id != self.map_frame or msg.header.stamp.is_zero():
@@ -512,8 +385,6 @@ class NavController:
             obstacle_ready = self.obstacle_frame_valid and self._is_stamp_fresh(
                 self.obstacle_stamp, self.obstacle_cloud_timeout, now
             )
-            obstacle_frame_valid = self.obstacle_frame_valid
-            obstacle_stamp = self.obstacle_stamp
             safety_stop = self.safety_stop
         if safety_stop:
             return False, "SAFETY_STOP", "外部 safety_stop 信号为真"
@@ -528,13 +399,7 @@ class NavController:
         if not mapping.ready or not mapping.stable:
             return False, "LOCALIZATION_LOST", mapping.status_reason or "定位/建图尚未 ready 且 stable"
         if require_obstacles and self.require_obstacle_cloud and not obstacle_ready:
-            age = None if obstacle_stamp.is_zero() else (now - obstacle_stamp).to_sec()
-            age_text = "missing" if age is None else "%.3fs" % age
-            return False, "CONTROL_FAILED", (
-                "要求的 /scan 缺失、过期或坐标帧无效 "
-                "(frame_valid=%s, age=%s, timeout=%.3fs)"
-                % (obstacle_frame_valid, age_text, self.obstacle_cloud_timeout)
-            )
+            return False, "CONTROL_FAILED", "要求的 /scan 缺失、过期或坐标帧无效"
         return True, "NONE", ""
 
     def _dynamic_obstacle_snapshot(self, now):
@@ -587,9 +452,7 @@ class NavController:
     def _path_is_blocked(self, route, dynamic_cells):
         with self.lock:
             planner = self.planner
-        return planner is None or not planner.path_is_action_traversable(
-            route, dynamic_cells
-        )
+        return planner is None or not planner.path_is_traversable(route, dynamic_cells)
 
     def _current_goal_id(self):
         try:
@@ -601,12 +464,8 @@ class NavController:
         return "goal-%d" % rospy.Time.now().to_nsec()
 
     def _lidar_to_base(self, x, y, z):
-        rotation = self.lidar_rotation
-        return (
-            rotation[0][0] * x + rotation[0][1] * y + rotation[0][2] * z + self.lidar_x,
-            rotation[1][0] * x + rotation[1][1] * y + rotation[1][2] * z + self.lidar_y,
-            rotation[2][0] * x + rotation[2][1] * y + rotation[2][2] * z + self.lidar_z,
-        )
+        rotated = self.lidar_rotation.dot((x, y, z))
+        return rotated[0] + self.lidar_x, rotated[1] + self.lidar_y, rotated[2] + self.lidar_z
 
     def _is_stamp_fresh(self, stamp, timeout, now):
         if stamp.is_zero():
@@ -710,9 +569,6 @@ class NavController:
         terminal_code = None
         terminal_detail = ""
         terminal_stuck = False
-        readiness_recovery = ReadinessRecovery(self.readiness_recovery_timeout)
-        route_recovery = ReadinessRecovery(self.readiness_recovery_timeout)
-        last_route_attempt = rospy.Time(0)
         rate = rospy.Rate(self.control_rate)
         while not rospy.is_shutdown():
             now = rospy.Time.now()
@@ -720,28 +576,9 @@ class NavController:
                 terminal_code, terminal_detail = "CANCELED", "目标被客户端取消"
                 break
             ready, code, detail = self._navigation_readiness(now, require_obstacles=True)
-            recovery_decision, recovery_elapsed, resumed = readiness_recovery.evaluate(
-                ready, code, now.to_sec()
-            )
-            if recovery_decision == ReadinessRecovery.ABORT:
+            if not ready:
                 terminal_code, terminal_detail = code, detail
-                if code != "SAFETY_STOP":
-                    terminal_detail = "%s; 持续 %.2fs，超过 %.2fs 恢复窗口" % (
-                        detail, recovery_elapsed, self.readiness_recovery_timeout
-                    )
                 break
-            if recovery_decision == ReadinessRecovery.WAIT:
-                if recovery_elapsed <= 1.0 / self.control_rate:
-                    rospy.logwarn(
-                        "[navigation] 执行中数据暂不可用，停车等待恢复: %s", detail
-                    )
-                self._stop_robot()
-                self._reset_stuck_watchdog(self._current_pose_snapshot(), now)
-                rate.sleep()
-                continue
-            if resumed:
-                rospy.loginfo("[navigation] 执行数据已恢复，继续当前目标")
-                self._reset_stuck_watchdog(self._current_pose_snapshot(), now)
             if (now - self._goal_start_time()).to_sec() > self.goal_timeout:
                 terminal_code, terminal_detail = "TIMEOUT", "目标超过配置的执行时限"
                 break
@@ -771,43 +608,13 @@ class NavController:
                 or deviation > self.replan_deviation_distance
                 or (now - last_replan).to_sec() >= self.replan_period
             )
-            route_retry_due = (
-                last_route_attempt.is_zero()
-                or (now - last_route_attempt).to_sec() >= self.replan_min_interval
-            )
-            if (
-                replan_due
-                and (now - last_replan).to_sec() >= self.replan_min_interval
-                and route_retry_due
-            ):
-                last_route_attempt = now
+            if replan_due and (now - last_replan).to_sec() >= self.replan_min_interval:
                 route = self._plan_action_path(
                     current[:2], target[:2], dynamic_cells if obstacle_fresh else ()
                 )
                 if not route:
-                    decision, elapsed, _ = route_recovery.evaluate(
-                        False, "UNREACHABLE", now.to_sec()
-                    )
-                    if decision == ReadinessRecovery.ABORT:
-                        terminal_code = "UNREACHABLE"
-                        terminal_detail = (
-                            "最新地图或临时障碍持续 %.2fs 阻断路径，超过 %.2fs 恢复窗口"
-                            % (elapsed, self.readiness_recovery_timeout)
-                        )
-                        break
-                    if elapsed <= 1.0 / self.control_rate:
-                        rospy.logwarn(
-                            "[navigation] 当前路径暂时被阻断，停车等待重规划"
-                        )
-                    self._stop_robot()
-                    self._reset_stuck_watchdog(current, now)
-                    rate.sleep()
-                    continue
-                _, _, route_resumed = route_recovery.evaluate(
-                    True, "NONE", now.to_sec()
-                )
-                if route_resumed:
-                    rospy.loginfo("[navigation] 可执行路径已恢复，继续当前目标")
+                    terminal_code, terminal_detail = "UNREACHABLE", "最新地图或临时障碍已阻断路径"
+                    break
                 with self.lock:
                     self._apply_route_locked(route, now)
 
@@ -822,8 +629,8 @@ class NavController:
                 linear_x, angular_z = self._path_tracking_command(current, self._route_snapshot()[0])
                 if (route_blocked or front_clearance <= self.dynamic_stop_distance) and linear_x > 0.0:
                     linear_x = 0.0
-                published_linear_x = self._publish_velocity(linear_x, angular_z)
-                if self._is_stuck(current[:2], published_linear_x, now):
+                self._publish_velocity(linear_x, angular_z)
+                if self._is_stuck(current[:2], linear_x, now):
                     terminal_code = "CONTROL_FAILED"
                     terminal_detail = "机器人在发布有效前进指令时持续无路径进展"
                     terminal_stuck = True
@@ -852,6 +659,10 @@ class NavController:
             self.failure_detail = detail
             self.is_stuck = bool(stuck)
         self._stop_robot()
+        # Publish the semantic terminal code before completing the Action.
+        # Mission's done callback otherwise races the 5 Hz health timer and can
+        # observe the previous goal's NONE code.
+        self.publish_health()
         result = MoveBaseResult()
         if code == "SUCCEEDED":
             self.action_server.set_succeeded(result, text=detail)
@@ -893,15 +704,6 @@ class NavController:
                 self.is_stuck = True
                 return True
         return False
-
-    def _reset_stuck_watchdog(self, current, now):
-        """Exclude a deliberate readiness pause from no-progress detection."""
-        if current is None:
-            return
-        current_xy = current[:2]
-        with self.lock:
-            self.last_position = current_xy
-            self.last_progress_time = now
 
     def _path_tracking_command(self, current, route):
         """跟踪路径前视点；大偏航时先原地旋转。"""
@@ -957,7 +759,6 @@ class NavController:
             self.last_cmd_time = stamp
             self.goal_state.record_command(stamp)
         self.cmd_pub.publish(command)
-        return command.linear.x
 
     def _stop_robot(self):
         """立即发送导航零速度；navigation 从不直接发布 /cmd_vel。"""
@@ -967,10 +768,6 @@ class NavController:
             self.last_cmd_time = stamp
             self.goal_state.record_command(stamp)
         self.cmd_pub.publish(command)
-
-    def _shutdown(self):
-        self.map_worker.stop()
-        self._stop_robot()
 
     def _publish_feedback(self, current):
         """根据真正已走过的累计路径长度发布反馈和 health 进度。"""

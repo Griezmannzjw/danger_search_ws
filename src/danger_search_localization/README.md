@@ -1,24 +1,26 @@
 # danger_search_localization
 
-定位与建图包。P0 使用 GICP 提供连续局部里程计 `odom -> base`，Hector 提供二维
-地图和受限的全局修正 `map -> odom`。两者融合后的 `map -> base` 作为 navigation
-位姿。后端仍可在不改变公共接口的前提下替换为 FAST-LIO 或其他 LIO。
+定位与建图包。推荐链路使用 FAST-LIO 提供连续局部里程计 `odom -> base`，Hector
+只提供二维地图和受限的全局修正 `map -> odom`。两者融合后的 `map -> base` 作为
+navigation 位姿。旧的逐帧 GICP 仅保留为不具备 LIO 依赖时的回退模式。
 
 ## 当前数据链
 
 ```text
-/scan (官方原始 PointCloud, laser_livox)
+/scan + /livox/imu (官方原始 PointCloud 和雷达 IMU)
+  +-> FAST-LIO -> /nav/lio_odom
+  |    -> lio_odometry_bridge.py（去除 livox_imu_link -> base 外参）
+  |    -> /localization/raw_pose (odom)
+  |
+  +-> /scan (官方原始 PointCloud, laser_livox)
   +-> scan_projector.py -> /localization/scan -> hector_mapping
   |    -> /localization/hector_pose（全局地图匹配）
   |    -> /localization/raw_map
-  |
-  +-> lidar_odometry_node（三维 GICP 局部里程计）
-       -> /localization/raw_pose (odom)
 
 pose_estimator.py 对 Hector 修正执行同步、静止漂移抑制、跳变拒绝和低通应用，融合
-GICP 后发布 `/localization/pose`、`/map`、状态和 `map -> odom -> base` TF。错误的
-Hector 修正不会瞬移机器人，相关地图更新也会冻结到下一次安全修正；错误的 GICP
-帧发布高协方差保持位姿，短暂失败不会造成话题断流，持续失败则安全降级/丢失。
+LIO 后发布 `/localization/pose`、`/map`、状态和 `map -> odom -> base` TF。错误的
+Hector 修正不会瞬移机器人，相关地图更新也会冻结到下一次安全修正；LIO 断流则
+安全降级/丢失。
 ```
 
 本包不订阅 `/Odometry_gazebo`，也不订阅 SimEnv 默认可能使用真值里程计转换过的
@@ -43,9 +45,9 @@ POINTCLOUD_USE_GROUND_TRUTH_ODOM=0 \
 `max_intra_bin_range_gap` 或 `max_neighbor_range_jump`，也可以临时关闭
 `enable_isolated_hit_filter`。
 
-投影使用短窗口叠加 Livox 扫描补足单帧的稀疏角度覆盖；窗口较短以限制未做运动补偿
-造成的重影。累计扫描至少包含 8 个有效 0.5 度 bin，并有至少 0.05 rad（约 3 度）的
-连续覆盖；机器人倾斜、旋转过快或雷达离地异常时直接丢弃该帧，避免污染 Hector 地图。运行时
+默认不跨帧叠加 Livox 扫描，因为未做运动补偿的历史帧会在行走时制造重影和假墙。
+单帧必须至少包含 40 个有效 0.5 度 bin，并有至少 0.35 rad（约 20 度）的连续覆盖；
+机器人倾斜、旋转过快或雷达离地异常时直接丢弃该帧，避免污染 Hector 地图。运行时
 可用以下命令确认数据链：
 
 ```bash
@@ -67,12 +69,10 @@ rostopic echo -n 1 /mapping/status
 | `/mapping/status` | `danger_search_common/MappingStatus` | 地图就绪、稳定、丢失、楼层和版本 |
 | `/localization/status` | `danger_search_common/LocalizationStatus` | 定位跟踪和协方差状态 |
 
-`/localization/pose` 第一帧定义为比赛出发点附近 `(0,0,0)`。GICP 对静止微动使用
-死区，并按时间间隔限制物理可达位移；GICP 使用最近 5 个可信扫描构造有限局部子地图，
-以匹配质量、有效对应比例和物理速度门共同拒绝错误局部最优。连续拒绝前两帧会保持
-可信参考；达到阈值后才用当前帧重建参考，且必须连续 2 帧成功才恢复健康。异常配准
-会保持上一位姿并提高协方差。Hector 只允许小幅、同步的全局修正；GICP 判定
-静止时出现的 Hector 漂移和米级跳变不会传给 navigation。
+`/localization/pose` 第一帧定义为比赛出发点附近 `(0,0,0)`。LIO 桥接节点会在
+第一帧固定局部 `odom` 原点，并使用 TF 去除雷达 IMU 与 `base` 的固定外参。Hector
+只允许小幅、同步的全局修正；静止时出现的 Hector 漂移和米级跳变不会传给
+navigation。
 
 ### 探索模块实际收到的地图
 
@@ -82,21 +82,23 @@ rostopic echo -n 1 /mapping/status
 还原成二维数组，并结合 `/localization/pose` 中的机器人坐标选择自由栅格目标；它
 还会读取 `/mapping/status`，只有地图 `ready && stable && !lost` 时才允许规划。
 
-正常状态原因为 `TRACKING_FUSED_GICP_ODOMETRY_WITH_BOUNDED_HECTOR_CORRECTION`。
-反复 GICP 失败或 Hector 修正被拒绝时状态先变为 `DEGRADED`，navigation 会安全停车；
-持续局部里程计失败才会进入 `LOST`，有效数据恢复后自动回到 `TRACKING`。
+正常状态原因为 `TRACKING_FUSED_POSE` 或
+`TRACKING_BOUNDED_HECTOR_CORRECTION`。LIO 断流或 Hector 修正被拒绝时状态先变为
+`DEGRADED`，navigation 会安全停车；持续局部里程计失败才会进入 `LOST`，有效数据
+恢复后自动回到 `TRACKING`。
 
 ## 编译与启动
 
 安装运行依赖后：
 
 ```bash
-sudo apt install -y ros-noetic-hector-mapping ros-noetic-pcl-ros
-cd ~/myProject/danger_search_ws
+cd ~/SimEnv
+bash scripts/setup_localization_dependencies.sh
 source /opt/ros/noetic/setup.bash
 catkin_make
-source devel/setup.bash
-roslaunch danger_search_localization localization.launch
+source ~/SimEnv/devel/setup.bash
+source ~/danger_search_ws/devel/setup.bash
+roslaunch danger_search_bringup competition_lio.launch
 ```
 
 查看接口：
@@ -114,9 +116,9 @@ rosrun tf tf_echo map base
   默认关闭；
 - 当前只维护 `current_floor=0`，尚未实现换层检测和分楼层地图；
 - 2D 投影不能保留楼梯、门槛和坡面的完整高度信息；
-- GICP 仍是 scan-to-scan 局部里程计，长时间弱特征运动可能降级；Hector 只以受限
-  `map -> odom` 修正长期漂移；
+- 旧 GICP 回退模式仍是 scan-to-scan 局部里程计，长时间弱特征运动可能降级；推荐
+  FAST-LIO + IMU 链路；
 - Hector 被判定为异常时会冻结公共地图，保证不会给 navigation 同时提供错误地图和
   正常状态；连续异常需要停车等待恢复，而不是冒险继续探索；
-- 下一阶段应接入 Livox + IMU 的 LIO，并增加表面点云、可通行性和楼层管理；
+- 仍可增加闭环检测、表面点云、可通行性和楼层管理；
 - 后端升级时保持本 README 中的公共输出不变，探索、导航和感知无需跟着改。

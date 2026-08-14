@@ -30,8 +30,6 @@ class TestLocalizationConfig(unittest.TestCase):
         self.assertGreater(config["lidar_odom_max_reference_age_s"], 0.5)
         self.assertEqual(config["lidar_odom_submap_scans"], 5)
         self.assertEqual(config["lidar_odom_submap_max_points"], 1200)
-        self.assertEqual(config["lidar_odom_registration_max_points"], 100)
-        self.assertEqual(config["lidar_odom_observation_scans"], 1)
         self.assertEqual(config["gicp_recovery_consecutive_accepts"], 2)
         self.assertAlmostEqual(config["lidar_odom_min_correspondence_ratio"], 0.35)
 
@@ -68,34 +66,65 @@ class TestLocalizationConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             AdapterConfig(pose_publish_rate_hz=5.0)
 
-    def test_default_pose_wiring_separates_hector_and_gicp(self):
+    def test_default_launch_uses_lio_without_legacy_backends(self):
         config_path = self.package_dir / "config" / "default.yaml"
         config = yaml.safe_load(config_path.read_text())
 
-        self.assertEqual(config["backend_pose_topic"], "/localization/hector_pose")
-        self.assertEqual(config["gicp_pose_topic"], "/localization/raw_pose")
-        self.assertNotEqual(
-            config["backend_pose_topic"], config["gicp_pose_topic"]
-        )
+        self.assertEqual(config["common"]["lid_topic"], "/localization/lio/points")
+        self.assertEqual(config["common"]["imu_topic"], "/trunk_imu")
+        self.assertEqual(config["preprocess"]["lidar_type"], 4)
+        self.assertFalse(config["mapping"]["extrinsic_est_en"])
 
         launch_path = self.package_dir / "launch" / "localization.launch"
         root = ElementTree.parse(launch_path).getroot()
-        nodes = root.findall(".//node")
-        hector_node = next(
-            node for node in nodes if node.attrib["name"] == "hector_mapping"
-        )
+        names = {node.attrib["name"] for node in root.findall("node")}
+        self.assertIn("fast_lio_mapping", names)
+        self.assertIn("sim_sensor_adapter", names)
+        self.assertIn("lio_occupancy_mapper", names)
+        self.assertIn("localization_adapter", names)
+        self.assertNotIn("hector_mapping", names)
+        self.assertNotIn("lidar_odometry", names)
+        lio_node = next(node for node in root.findall("node")
+                        if node.attrib["name"] == "fast_lio_mapping")
         remaps = {
             remap.attrib["from"]: remap.attrib["to"]
-            for remap in hector_node.findall("remap")
+            for remap in lio_node.findall("remap")
         }
-        self.assertEqual(remaps["poseupdate"], config["backend_pose_topic"])
-        parameters = {
-            parameter.attrib["name"]: parameter.attrib["value"]
-            for parameter in hector_node.findall("param")
-        }
-        self.assertEqual(parameters["use_tf_pose_start_estimate"], "false")
-        mapper_node = next(
-            node for node in nodes if node.attrib["name"] == "local_occupancy_mapper"
+        self.assertEqual(remaps["/Odometry"], "/localization/lio/odometry")
+
+    def test_simulated_lidar_time_is_initialized_and_guarded(self):
+        imu_source = (self.package_dir / "third_party" / "fast_lio" / "src" /
+                      "IMU_Processing.hpp").read_text()
+        config = yaml.safe_load(
+            (self.package_dir / "config" / "default.yaml").read_text()
         )
-        self.assertEqual(mapper_node.attrib["type"], "occupancy_mapper.py")
-        self.assertFalse(config["use_hector_correction"])
+
+        self.assertIn("last_lidar_end_time_(-1.0)", imu_source)
+        self.assertIn("last_lidar_end_time_ = meas.lidar_end_time", imu_source)
+        self.assertIn("kMaxSensorGapSeconds", imu_source)
+        self.assertIn("kMaxPredictionSubstepSeconds", imu_source)
+        self.assertIn("predict_interval", imu_source)
+        self.assertIn("change_P(covariance_before_propagation)", imu_source)
+        self.assertIn("InitializationBundleIsStationary", imu_source)
+        self.assertIn("stationary_duration >= initialization_hold_seconds_",
+                      imu_source)
+        initialization = config["imu_initialization"]
+        self.assertGreaterEqual(initialization["stationary_hold_s"], 0.5)
+        self.assertGreaterEqual(initialization["min_samples"], 50)
+        self.assertGreater(initialization["max_gyro_rps"], 0.0)
+        self.assertGreater(initialization["max_accel_spread_mps2"], 0.0)
+
+    def test_occupancy_map_rejects_unhealthy_lio_pose(self):
+        config_path = self.package_dir / "config" / "default.yaml"
+        config = yaml.safe_load(config_path.read_text())
+        mapper_source = (self.package_dir / "src" /
+                         "lio_occupancy_mapper_node.cpp").read_text()
+
+        self.assertGreater(config["map_pose_cloud_max_age_s"], 0.0)
+        self.assertLessEqual(config["map_pose_cloud_max_age_s"],
+                             config["pose_fresh_timeout_s"])
+        self.assertIn("[mapping] rejected LIO jump", mapper_source)
+        self.assertIn("!pose_valid_", mapper_source)
+        self.assertGreater(config["map_robot_free_radius_m"], 0.0)
+        self.assertIn("clearRobotFootprint", mapper_source)
+        self.assertIn("map_origin_", mapper_source)

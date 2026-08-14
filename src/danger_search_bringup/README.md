@@ -1,7 +1,8 @@
 # danger_search_bringup
 
 P0 系统集成启动包。`competition.launch` 一次装配 localization、perception、navigation、
-exploration、control 和 mission，共九个运行节点。
+exploration、control、mission 和入口门控制，共 10 个运行节点。其中 localization 内部
+包含传感器适配、FAST-LIO2、占据栅格和公共接口适配 4 个节点。
 
 ## 默认目录约定
 
@@ -43,13 +44,18 @@ roslaunch danger_search_bringup competition.launch \
 
 ## P0 推荐流程
 
-1. 以单楼层、关闭 referee odom 和真值点云变换的方式启动 SimEnv；
+1. 启动 SimEnv：为官方底层步态控制保留 ground-truth 状态话题，但关闭 referee odom
+   和真值点云变换；算法节点不得订阅 `/ground_truth/*`；
 2. 在 junior_ctrl 终端按 `2` 站立，再按 `6` 进入 `/cmd_vel` 模式；
 3. 启动 `competition.launch autostart:=true`；
 4. bringup 调用官方门服务打开 `main_entrance`；
-5. mission 在门外记录出生点并自动进入建筑，再进入 `EXPLORING`；
+5. mission 在门外记录出生点，以短目标滚动进入建筑，确认前向进度后再进入 `EXPLORING`；
 6. exploration 收敛后自动进入 `RETURNING`，返回门外出生点；
 7. 返回起点后自动写结果并进入 `FINISHED`。
+
+官方生成场景当前把主入口设为 `initial_open: true`；`entrance_door` 仍会在
+`competition.launch` 启动后调用 `/set_door_state` 再次确认打开。只有服务成功返回后才
+发布锁存的 `/entrance/ready=true`，mission 的启动预检不会在此之前放行。
 
 如果 `autostart:=false`，第 3 步后手动调用一次：
 
