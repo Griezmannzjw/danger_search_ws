@@ -134,7 +134,7 @@ def main():
     # 大速度经过限幅和加速度爬升后必须稳定在三个默认上限。
     publish_for(nav_publisher, make_twist(9.0, -9.0, 9.0), 0.70)
     limited = recorder.latest_output()
-    require(abs(limited.linear.x - 0.30) < 0.05, "linear.x 未截断到 0.30")
+    require(abs(limited.linear.x - 0.40) < 0.05, "linear.x 未截断到 0.40")
     require(abs(limited.linear.y + 0.25) < 0.05, "linear.y 未截断到 -0.25")
     require(abs(limited.angular.z - 0.80) < 0.08, "angular.z 未截断到 0.80")
 

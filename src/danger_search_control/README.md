@@ -55,7 +55,7 @@ safety_stop
 | `safety_stop_topic` | `/danger_search/safety_stop` | 外部急停输入话题 |
 | `enable_safety` | `true` | 是否启用命令超时停车 |
 | `cmd_timeout_s` | `0.5` | 有效导航命令最大允许间隔，单位秒 |
-| `max_linear_speed` | `0.30` | `linear.x` 最大绝对速度，单位米每秒 |
+| `max_linear_speed` | `0.40` | `linear.x` 最大绝对速度，单位米每秒 |
 | `max_lateral_speed` | `0.25` | `linear.y` 最大绝对速度，单位米每秒 |
 | `max_angular_speed` | `0.80` | `angular.z` 最大绝对速度，单位弧度每秒 |
 | `max_linear_accel` | `1.0` | `linear.x`、`linear.y` 每次变化的最大加速度 |

@@ -145,6 +145,8 @@ class NavigationStateTest(unittest.TestCase):
             config = yaml.safe_load(stream)
 
         self.assertEqual(config["obstacle_cloud_timeout"], 1.0)
+        self.assertEqual(config["cruise_speed"], 0.40)
+        self.assertEqual(config["max_linear_speed"], 0.40)
 
     def test_cancel_clears_goal_and_has_zero_velocity_semantics(self):
         state = GoalState()
@@ -191,6 +193,38 @@ class NavigationStateTest(unittest.TestCase):
         finish = text.index("        self.safety_stop_sub", start)
 
         self.assertIn("queue_size=1", text[start:finish])
+
+
+class NavigationPathTrackingTest(unittest.TestCase):
+    def setUp(self):
+        self.controller = NavController.__new__(NavController)
+        self.controller.lock = threading.RLock()
+        self.controller.waypoint_index = 0
+        self.controller.lookahead_distance = 0.60
+        self.controller.cruise_speed = 0.40
+        self.controller.max_linear_speed = 0.40
+        self.controller.rotate_in_place_angle = 0.45
+        self.controller.rotate_in_place_gain = 1.50
+
+    def test_straight_path_uses_full_cruise_speed(self):
+        linear_x, angular_z = self.controller._path_tracking_command(
+            (0.0, 0.0, 0.0),
+            [(0.0, 0.0), (2.0, 0.0)],
+        )
+
+        self.assertAlmostEqual(linear_x, 0.40)
+        self.assertAlmostEqual(angular_z, 0.0)
+
+    def test_heading_error_reduces_linear_speed(self):
+        heading = 0.20
+        linear_x, angular_z = self.controller._path_tracking_command(
+            (0.0, 0.0, 0.0),
+            [(0.0, 0.0), (2.0 * math.cos(heading), 2.0 * math.sin(heading))],
+        )
+
+        self.assertAlmostEqual(linear_x, 0.40 * math.cos(heading))
+        self.assertGreater(angular_z, 0.0)
+        self.assertLess(linear_x, 0.40)
 
 
 class NavigationReadinessTest(unittest.TestCase):

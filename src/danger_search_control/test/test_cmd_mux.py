@@ -171,7 +171,7 @@ class CmdMuxCoreTest(unittest.TestCase):
         )
         _normal_step(core, 0.0, target=(9.0, -9.0, 9.0))
         output = _normal_step(core, 0.1, target=(9.0, -9.0, 9.0))
-        self.assertEqual(output, (0.30, -0.25, 0.80))
+        self.assertEqual(output, (0.40, -0.25, 0.80))
 
     def test_safety_stop_is_immediate_and_resets_actual_output(self):
         core = CmdMuxCore(cmd_timeout_s=10.0)
@@ -318,7 +318,7 @@ class CmdMuxInterfaceTest(unittest.TestCase):
             cmd_mux_module.rospy = original_rospy
 
     def test_defaults_and_startup_validation(self):
-        self.assertEqual(DEFAULT_PARAMS["max_linear_speed"], 0.30)
+        self.assertEqual(DEFAULT_PARAMS["max_linear_speed"], 0.40)
         self.assertEqual(DEFAULT_PARAMS["max_lateral_speed"], 0.25)
         self.assertEqual(DEFAULT_PARAMS["max_angular_speed"], 0.80)
         self.assertEqual(DEFAULT_PARAMS["max_dt_s"], 0.10)
@@ -343,7 +343,7 @@ class CmdMuxInterfaceTest(unittest.TestCase):
         with open(os.path.join(package_dir, "config", "default.yaml"), "r") as stream:
             config = yaml.safe_load(stream)
         self.assertEqual(config["sent_cmd_topic"], "/danger_search/cmd_vel_sent")
-        self.assertEqual(config["max_linear_speed"], 0.30)
+        self.assertEqual(config["max_linear_speed"], 0.40)
         self.assertEqual(config["max_lateral_speed"], 0.25)
         self.assertEqual(config["max_angular_speed"], 0.80)
         self.assertEqual(config["max_dt_s"], 0.10)

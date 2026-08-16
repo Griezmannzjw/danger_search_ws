@@ -14,7 +14,7 @@ cmd_timeout_s: 0.5
 # 速度和加速度上限
 max_linear_accel: 1.0
 max_angular_accel: 2.0
-max_linear_speed: 0.30
+max_linear_speed: 0.40
 max_lateral_speed: 0.25
 max_angular_speed: 0.80
 max_dt_s: 0.10
