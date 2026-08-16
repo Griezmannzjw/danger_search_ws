@@ -9,9 +9,11 @@ import unittest
 from types import SimpleNamespace
 
 import rospy
+import yaml
 
 
 SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
+PACKAGE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
@@ -135,6 +137,15 @@ class InflatedOccupancyGridTest(unittest.TestCase):
 
 
 class NavigationStateTest(unittest.TestCase):
+    def test_obstacle_timeout_default_covers_map_rebuild_stall(self):
+        with open(
+            os.path.join(PACKAGE_DIR, "config", "default.yaml"),
+            encoding="utf-8",
+        ) as stream:
+            config = yaml.safe_load(stream)
+
+        self.assertEqual(config["obstacle_cloud_timeout"], 1.0)
+
     def test_cancel_clears_goal_and_has_zero_velocity_semantics(self):
         state = GoalState()
         state.begin("goal-42")
@@ -172,6 +183,15 @@ class NavigationStateTest(unittest.TestCase):
         body = text[finish:preempt]
         self.assertLess(body.index("self.publish_health()"), body.index("set_aborted"))
 
+    def test_obstacle_subscription_keeps_only_the_latest_cloud(self):
+        source = os.path.join(SCRIPTS_DIR, "nav_controller.py")
+        with open(source, encoding="utf-8") as stream:
+            text = stream.read()
+        start = text.index("        self.obstacle_sub = rospy.Subscriber(")
+        finish = text.index("        self.safety_stop_sub", start)
+
+        self.assertIn("queue_size=1", text[start:finish])
+
 
 class NavigationReadinessTest(unittest.TestCase):
     def setUp(self):
@@ -194,7 +214,8 @@ class NavigationReadinessTest(unittest.TestCase):
         self.controller.mapping_status_timeout = 1.5
         self.controller.obstacle_frame_valid = False
         self.controller.obstacle_stamp = rospy.Time(0)
-        self.controller.obstacle_cloud_timeout = 0.5
+        self.controller.obstacle_cloud_timeout = 1.0
+        self.controller.require_obstacle_cloud = True
         self.controller.safety_stop = False
         self.controller.max_future_stamp_skew = 0.05
 
@@ -220,6 +241,42 @@ class NavigationReadinessTest(unittest.TestCase):
         self.assertFalse(ready)
         self.assertEqual(code, "LOCALIZATION_LOST")
         self.assertEqual(detail, "GICP_ODOMETRY_DEGRADED_HOLDING_LAST_POSE")
+
+    def test_obstacle_cloud_is_accepted_at_nine_tenths_of_a_second(self):
+        self.controller.obstacle_frame_valid = True
+        self.controller.obstacle_stamp = rospy.Time.from_sec(99.1)
+
+        ready, code, detail = self.controller._navigation_readiness(
+            rospy.Time.from_sec(100.0), require_obstacles=True
+        )
+
+        self.assertTrue(ready)
+        self.assertEqual(code, "NONE")
+        self.assertEqual(detail, "")
+
+    def test_obstacle_cloud_older_than_one_second_is_rejected(self):
+        self.controller.obstacle_frame_valid = True
+        self.controller.obstacle_stamp = rospy.Time.from_sec(98.9)
+
+        ready, code, detail = self.controller._navigation_readiness(
+            rospy.Time.from_sec(100.0), require_obstacles=True
+        )
+
+        self.assertFalse(ready)
+        self.assertEqual(code, "CONTROL_FAILED")
+        self.assertIn("/scan", detail)
+
+    def test_invalid_obstacle_cloud_frame_is_rejected(self):
+        self.controller.obstacle_frame_valid = False
+        self.controller.obstacle_stamp = rospy.Time.from_sec(99.9)
+
+        ready, code, detail = self.controller._navigation_readiness(
+            rospy.Time.from_sec(100.0), require_obstacles=True
+        )
+
+        self.assertFalse(ready)
+        self.assertEqual(code, "CONTROL_FAILED")
+        self.assertIn("/scan", detail)
 
 
 if __name__ == "__main__":

@@ -72,7 +72,7 @@ class NavController:
         self.pose_timeout = float(rospy.get_param("~pose_timeout", 0.50))
         self.map_timeout = float(rospy.get_param("~map_timeout", 2.00))
         self.mapping_status_timeout = float(rospy.get_param("~mapping_status_timeout", 1.50))
-        self.obstacle_cloud_timeout = float(rospy.get_param("~obstacle_cloud_timeout", 0.50))
+        self.obstacle_cloud_timeout = float(rospy.get_param("~obstacle_cloud_timeout", 1.00))
         self.goal_stamp_timeout = float(rospy.get_param("~goal_stamp_timeout", 2.00))
         self.max_future_stamp_skew = float(rospy.get_param("~max_future_stamp_skew", 0.05))
         self.quaternion_norm_tolerance = float(rospy.get_param("~quaternion_norm_tolerance", 0.05))
@@ -158,7 +158,10 @@ class NavController:
             self.mapping_status_topic, MappingStatus, self.mapping_status_callback
         )
         self.obstacle_sub = rospy.Subscriber(
-            self.obstacle_cloud_topic, PointCloud, self.obstacle_callback
+            self.obstacle_cloud_topic,
+            PointCloud,
+            self.obstacle_callback,
+            queue_size=1,
         )
         self.safety_stop_sub = rospy.Subscriber(
             self.safety_stop_topic, Bool, self.safety_stop_callback
