@@ -31,7 +31,6 @@ catkin_package(
 )
 
 include_directories(
-  include
   ${catkin_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
 )
@@ -47,8 +46,10 @@ install(TARGETS lidar_odometry_node
 )
 
 catkin_install_python(PROGRAMS
+  scripts/known_pose_backend.py
   scripts/lio_odometry_bridge.py
   scripts/pose_estimator.py
+  scripts/record_lidar_stability_demo.py
   scripts/scan_projector.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

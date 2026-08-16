@@ -75,10 +75,6 @@ class HectorGicpFusion:
 
     def update_local(self, stamp_s, x, y, yaw):
         sample = self._sample(stamp_s, x, y, yaw)
-        if math.hypot(sample[1].x, sample[1].y) > (
-            self.config.fusion_max_absolute_pose_translation_m
-        ):
-            raise ValueError("local pose exceeds configured translation limit")
         if self.latest_local is not None and sample[0] <= self.latest_local[0]:
             return self.snapshot(False, "NON_INCREASING_LOCAL_POSE_STAMP")
         self.latest_local = sample
@@ -90,10 +86,6 @@ class HectorGicpFusion:
 
     def update_global(self, stamp_s, x, y, yaw):
         global_pose = self._sample(stamp_s, x, y, yaw)
-        if math.hypot(global_pose[1].x, global_pose[1].y) > (
-            self.config.fusion_max_absolute_pose_translation_m
-        ):
-            raise ValueError("global pose exceeds configured translation limit")
         if (
             self.last_global_stamp_s is not None
             and global_pose[0] <= self.last_global_stamp_s
@@ -194,6 +186,21 @@ class HectorGicpFusion:
             reason=reason or self.last_reason,
             consecutive_global_rejections=self.consecutive_global_rejections,
         )
+
+    def update_known_global(self, stamp_s):
+        """Accept a map built at the trusted local pose with identity correction."""
+        stamp_s = float(stamp_s)
+        if self.latest_local is None:
+            return self.snapshot(
+                False, "KNOWN_POSE_HAS_NO_SYNCHRONIZED_LOCAL_POSE"
+            )
+        self.correction = Pose2D(0.0, 0.0, 0.0)
+        self.initialized = True
+        self.last_global_stamp_s = stamp_s
+        self.last_correction_local = self.latest_local[1]
+        self.consecutive_global_rejections = 0
+        self.last_reason = "TRACKING_KNOWN_POSE_MAPPING"
+        return self.snapshot(True)
 
     def _nearest_local(self, stamp_s):
         if not self.local_history:

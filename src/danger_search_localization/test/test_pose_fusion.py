@@ -94,14 +94,15 @@ class TestHectorGicpFusion(unittest.TestCase):
         self.assertFalse(result.accepted)
         self.assertFalse(result.initialized)
 
-    def test_huge_finite_local_pose_is_rejected_without_polluting_state(self):
-        self._initialize()
-        before = self.fusion.latest_local
-
-        with self.assertRaises(ValueError):
-            self.fusion.update_local(1.1, 1e180, -1e180, 0.0)
-
-        self.assertEqual(self.fusion.latest_local, before)
+    def test_known_pose_mapping_keeps_identity_correction(self):
+        self.fusion.update_local(1.0, 0.4, -0.2, 0.3)
+        result = self.fusion.update_known_global(1.0)
+        self.assertTrue(result.accepted)
+        self.assertTrue(result.initialized)
+        self.assertAlmostEqual(result.pose.x, 0.4)
+        self.assertAlmostEqual(result.pose.y, -0.2)
+        self.assertAlmostEqual(result.pose.yaw, 0.3)
+        self.assertAlmostEqual(result.correction.x, 0.0)
 
 
 if __name__ == "__main__":

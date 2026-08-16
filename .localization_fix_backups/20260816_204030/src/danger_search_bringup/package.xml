@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>danger_search_bringup</name>
+  <version>0.1.0</version>
+  <description>Bringup package: unified launch files and integration config</description>
+  <maintainer email="team@example.com">Danger Search Team</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <exec_depend>danger_search_common</exec_depend>
+  <exec_depend>danger_search_perception</exec_depend>
+  <exec_depend>danger_search_localization</exec_depend>
+  <exec_depend>danger_search_navigation</exec_depend>
+  <exec_depend>danger_search_exploration</exec_depend>
+  <exec_depend>danger_search_control</exec_depend>
+  <exec_depend>danger_search_mission</exec_depend>
+  <exec_depend>autonomy_navigation</exec_depend>
+</package>

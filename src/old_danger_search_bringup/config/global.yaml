@@ -1,0 +1,49 @@
+# 全局参数配置 - P0最小可运行版本
+# 对齐接口规范 v1.1-p0
+# 所有话题、服务、Action、frame统一在这里配置
+
+# ========== 坐标系 ==========
+map_frame: map
+odom_frame: odom
+base_frame: base
+world_frame: world
+
+# ========== 统一话题名 ==========
+map_topic: /map
+pose_topic: /localization/pose
+mapping_status_topic: /mapping/status
+health_topic: /navigation/health
+navigation_health_topic: /navigation/health
+detections_topic: /danger_detector/detections
+status_topic: /danger_detector/status
+detection_status_topic: /danger_detector/status
+mission_status_topic: /mission/status
+mission_active_topic: /mission/active
+output_cmd_topic: /cmd_vel
+nav_cmd_topic: /danger_search/nav_cmd_vel
+safety_stop_topic: /danger_search/safety_stop
+
+# ========== 传感器话题（来自SimEnv） ==========
+lidar_topic: /livox/Pointcloud2
+imu_topic: /trunk_imu
+rgb_topic: /real_sense/rgb/image_raw
+depth_topic: /real_sense/depth/image_raw
+camera_info_topic: /real_sense/rgb/camera_info
+
+# ========== 统一服务/Action名 ==========
+move_base_action_name: /move_base
+make_plan_service: /move_base/make_plan
+clear_costmaps_service: /move_base/clear_costmaps
+start_service: /danger_search/start_exploration
+stop_service: /danger_search/stop_exploration
+start_exploration_service: /danger_search/start_exploration
+stop_exploration_service: /danger_search/stop_exploration
+start_mission_service: /danger_search/start
+finish_mission_service: /danger_search/finish
+return_home_service: /danger_search/return_home
+exploration_status_topic: /exploration/status
+exploration_complete_topic: /exploration/complete
+
+# ========== 任务参数 ==========
+# result_file 由 competition.launch 根据 simenv_root 生成，避免写死用户名。
+dedup_distance: 0.8

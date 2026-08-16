@@ -1,0 +1,5 @@
+<launch>
+  <!-- 仅启动感知模块（调试用） -->
+  <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
+  <include file="$(find danger_search_perception)/launch/danger_detector.launch" />
+</launch>

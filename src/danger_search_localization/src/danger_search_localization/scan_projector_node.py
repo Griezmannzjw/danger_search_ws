@@ -38,7 +38,7 @@ class ScanProjectorNode:
             self.config.scan_accumulation_max_age_s,
         )
         self.last_published_stamp_s = None
-        self.last_published_stamp_s = None
+        self.pending_output_scan = None
 
         self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
@@ -256,7 +256,14 @@ class ScanProjectorNode:
         output.range_min = self.config.range_min
         output.range_max = self.config.range_max
         output.ranges = ranges.tolist()
-        self.publisher.publish(output)
+        # Delay the projected scan by one input frame.  The local odometry
+        # callback publishes map->odom->base for the scan's exact timestamp;
+        # this small buffer guarantees that TF is already available when
+        # Hector consumes the scan in map_with_known_poses mode.
+        pending = self.pending_output_scan
+        self.pending_output_scan = output
+        if pending is not None:
+            self.publisher.publish(pending)
 
     def _published_scan_interval(self, stamp_s):
         interval = 0.0
@@ -289,22 +296,25 @@ class ScanProjectorNode:
         )
 
     def _angular_coverage_of_finite(self, ranges, finite_mask):
-        """Return the maximum angular span (radians) of consecutive finite bins."""
+        """Return the smallest circular arc containing all finite bins.
+
+        A mechanical 2-D lidar normally fills consecutive angle bins, but a
+        sparse non-repeating Mid-360 projection does not.  Measuring only the
+        longest consecutive run incorrectly labels a well-distributed 360
+        degree cloud as a 1--2 degree scan.  The complement of the largest
+        circular gap preserves the intended safety check: clustered returns
+        are still rejected while sparse full-FOV returns are accepted.
+        """
         finite = np.asarray(finite_mask, dtype=bool)
         if not np.any(finite):
             return 0.0
-        doubled = np.concatenate([finite, finite])
-        max_run = 0
-        current = 0
-        for is_finite in doubled:
-            if is_finite:
-                current += 1
-                max_run = max(max_run, current)
-            else:
-                current = 0
-            if current >= finite.size:
-                return 2.0 * math.pi
-        return float(max_run) * self.config.angle_increment
+        indices = np.flatnonzero(finite)
+        if indices.size == finite.size:
+            return float(finite.size) * self.config.angle_increment
+        circular_indices = np.append(indices, indices[0] + finite.size)
+        largest_step = int(np.max(np.diff(circular_indices)))
+        covered_bins = int(finite.size) - largest_step + 1
+        return float(covered_bins) * self.config.angle_increment
 
     @staticmethod
     def run():

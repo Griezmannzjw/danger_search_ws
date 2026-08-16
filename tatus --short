@@ -1,0 +1,20 @@
+ src/danger_search_localization/CMakeLists.txt                    |   2 [32m+[m
+ src/danger_search_localization/config/default.yaml               |  37 [32m+[m[31m-[m
+ .../include/danger_search_localization/lidar_odometry_core.hpp   | 565 [32m+++++++++++++++++++++++++[m[31m----[m
+ src/danger_search_localization/launch/localization.launch        |  41 [32m++[m[31m-[m
+ src/danger_search_localization/scripts/occupancy_mapper.py       |  13 [32m+[m
+ .../src/danger_search_localization/adapter_node.py               | 102 [32m++++[m[31m--[m
+ .../src/danger_search_localization/occupancy_mapper_node.py      | 174 [32m+++++++++[m
+ .../src/danger_search_localization/occupancy_mapping.py          | 152 [32m++++++++[m
+ .../src/danger_search_localization/scan_projection.py            |  85 [32m+++++[m
+ .../src/danger_search_localization/scan_projector_node.py        | 181 [32m+++++++[m[31m--[m
+ src/danger_search_localization/src/lidar_odometry_node.cpp       | 441 [32m+++++++++++++++++++[m[31m---[m
+ src/danger_search_localization/test/test_adapter.py              |  27 [32m++[m
+ src/danger_search_localization/test/test_config.py               |  10 [32m+[m[31m-[m
+ src/danger_search_localization/test/test_lidar_odometry_core.cpp |  43 [32m++[m[31m-[m
+ src/danger_search_localization/test/test_occupancy_mapping.py    |  58 [32m+++[m
+ src/danger_search_localization/test/test_scan_projection.py      |  23 [32m++[m
+ src/danger_search_navigation/config/default.yaml                 |   5 [32m+[m[31m-[m
+ src/danger_search_navigation/scripts/nav_controller.py           | 172 [32m+++++++[m[31m--[m
+ src/danger_search_navigation/test/test_navigation_core.py        |  50 [32m++[m[31m-[m
+ 19 files changed, 1944 insertions(+), 237 deletions(-)

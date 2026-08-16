@@ -163,6 +163,8 @@ class AdapterConfig:
     fusion_max_absolute_pose_translation_m: float = 100.0
     gicp_healthy_fresh_timeout_s: float = 1.0
     gicp_healthy_lost_timeout_s: float = 3.0
+    gicp_failures_before_degraded: int = 3
+    gicp_failures_before_lost: int = 20
     hector_rejections_before_degraded: int = 3
     hector_pose_fresh_timeout_s: float = 2.0
     vertical_estimation_enabled: bool = False
@@ -250,6 +252,15 @@ class AdapterConfig:
             0.0 < self.gicp_healthy_fresh_timeout_s
             < self.gicp_healthy_lost_timeout_s,
             "GICP healthy-pose timeouts are invalid",
+        )
+        _require(
+            self.gicp_failures_before_degraded >= 1,
+            "GICP degraded failure threshold must be positive",
+        )
+        _require(
+            self.gicp_failures_before_lost
+            >= self.gicp_failures_before_degraded,
+            "GICP lost failure threshold cannot be below degraded threshold",
         )
         _require(
             self.hector_rejections_before_degraded >= 1,

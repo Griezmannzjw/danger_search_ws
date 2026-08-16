@@ -1,0 +1,16 @@
+<launch>
+  <!-- Preferred competition entry point: raw Livox + IMU FAST-LIO feeds the
+       exploration stack, while Hector contributes only map -> odom correction. -->
+  <arg name="lio_config"
+       default="$(find autonomy_navigation)/config/fast_lio_mid360.yaml" />
+  <arg name="instantaneous_scan" default="true" />
+
+  <include file="$(find autonomy_navigation)/launch/lio_mapping.launch">
+    <arg name="config" value="$(arg lio_config)" />
+    <arg name="instantaneous_scan" value="$(arg instantaneous_scan)" />
+  </include>
+
+  <include file="$(find danger_search_bringup)/launch/competition.launch">
+    <arg name="local_odometry_source" value="lio" />
+  </include>
+</launch>

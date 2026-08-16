@@ -1,0 +1,240 @@
+# 单楼层 2D 激光 SLAM 基线参数（不使用 Gazebo 真值）
+
+# 坐标系与公共接口
+map_frame: map
+odom_frame: odom
+base_frame: base
+current_floor: 0
+pose_topic: /localization/pose
+map_topic: /map
+mapping_status_topic: /mapping/status
+localization_status_topic: /localization/status
+
+# 内部话题
+raw_scan_topic: /scan
+projected_scan_topic: /localization/scan
+backend_pose_topic: /localization/hector_pose
+gicp_pose_topic: /localization/raw_pose
+raw_map_topic: /localization/raw_map
+
+# 三维 scan-to-scan GICP 维护连续 odom->base；Hector 提供受限 map->odom 修正。
+lidar_odom_voxel_size_m: 0.25
+lidar_odom_min_range_m: 0.40
+lidar_odom_max_range_m: 12.0
+lidar_odom_max_correspondence_m: 0.60
+lidar_odom_max_iterations: 15
+lidar_odom_min_correspondence_ratio: 0.35
+lidar_odom_max_fitness: 0.40
+lidar_odom_max_step_translation_m: 0.90
+lidar_odom_max_step_rotation_rad: 0.90
+lidar_odom_max_linear_speed_mps: 1.0
+lidar_odom_max_angular_speed_rps: 2.0
+lidar_odom_translation_margin_m: 0.05
+lidar_odom_rotation_margin_rad: 0.08
+lidar_odom_translation_deadband_m: 0.015
+lidar_odom_rotation_deadband_rad: 0.008
+lidar_odom_min_points: 100
+lidar_odom_max_reference_age_s: 3.0
+lidar_odom_submap_scans: 5
+lidar_odom_submap_max_points: 1200
+lidar_odom_registration_max_points: 240
+lidar_odom_rebaseline_after_failures: 3
+gicp_recovery_consecutive_accepts: 2
+lidar_odom_max_absolute_translation_m: 100.0
+
+# 原始三维点云投影为平面 LaserScan
+angle_min: -3.141592653589793
+angle_max: 3.141592653589793
+angle_increment: 0.008726646259972  # 0.5 deg
+range_min: 0.20
+range_max: 12.0
+min_height: -0.10                # 允许 lidar 平面以下的点，避免过滤地面
+max_height: 1.50
+self_exclusion_min_x: -0.55
+self_exclusion_max_x: 0.55
+self_exclusion_half_width_y: 0.40
+min_returns_per_bin: 2
+max_intra_bin_range_gap: 0.30    # 放宽同角度聚类距离容忍
+enable_isolated_hit_filter: true
+neighbor_window_bins: 8          # 0.5 deg/bin，对应左右各 4 deg
+min_neighbor_support: 1
+max_neighbor_range_jump: 0.75
+tf_timeout_s: 0.10
+imu_topic: /trunk_imu
+enable_imu_leveling: true          # 运动时按重力方向校正俯仰/侧倾
+imu_fresh_timeout_s: 0.20
+max_abs_roll_rad: 0.90             # ~51.5 deg，四足行走体态晃动阈值
+max_abs_pitch_rad: 0.90
+max_angular_speed_rps: 5.0          # 四足瞬时角速度容忍
+enable_ground_clearance_gate: true
+ground_candidate_max_z: 0.10
+ground_candidate_min_range: 0.40
+ground_candidate_max_range: 3.00
+min_ground_candidate_points: 15
+min_ground_clearance_m: 0.04
+scan_accumulation_frames: 3          # 短窗口补足 Livox 单帧的稀疏角度覆盖
+scan_accumulation_min_samples_per_bin: 1
+scan_accumulation_max_age_s: 0.6     # 仿真时钟回退或长停顿后清空历史
+min_valid_scan_bins: 8               # Livox 单帧稀疏，短窗口至少保留 4 度有效角度
+min_angular_coverage_rad: 0.05       # 连续覆盖至少约 3 度
+drop_unstable_scans: true            # 摔倒、剧烈转动或过低时不污染 Hector 地图
+
+# Hector 2D 扫描匹配与地图
+map_resolution: 0.05
+map_size: 1024                    # 51.2 m x 51.2 m
+map_robot_free_radius_m: 0.40     # 主动清空雷达盲区内的机器人脚印，确保规划起点可通行
+map_start_x: 0.5
+map_start_y: 0.5
+map_multi_res_levels: 2
+map_update_distance_thresh: 0.10
+map_update_angle_thresh: 0.04
+map_pub_period: 1.0
+laser_min_dist: 0.20
+laser_max_dist: 12.0
+update_factor_free: 0.40
+update_factor_occupied: 0.65     # 降低单帧误命中的占用权重
+
+# 接口健康判定
+pose_fresh_timeout_s: 2.0
+map_fresh_timeout_s: 5.0
+min_map_updates_for_stable: 2
+pose_publish_rate_hz: 20.0
+tf_publish_future_tolerance_s: 0.5
+status_publish_rate_hz: 2.0
+fallback_xy_variance: 0.10
+fallback_yaw_variance: 0.15
+fallback_unobserved_variance: 0.25
+use_backend_covariance: false       # Hector 原始协方差量级不适合作为 ROS 协方差
+covariance_warning_trace: 2.0
+
+# 对 navigation 发布前的二维位姿守卫。首帧自动定义为比赛起点 (0,0,0)。
+pose_position_deadband_m: 0.015
+pose_yaw_deadband_rad: 0.010
+pose_filter_time_constant_s: 0.15
+pose_max_linear_speed_mps: 1.0
+pose_max_angular_speed_rps: 2.0
+pose_jump_translation_margin_m: 0.25
+pose_jump_yaw_margin_rad: 0.30
+pose_gate_max_dt_s: 1.00
+pose_rejections_before_lost: 10
+pose_recovery_timeout_s: 3.0          # 连续拒绝超过此时间自动重新锚定位姿
+
+# Hector + GICP 融合：GICP 维护 odom->base，Hector 只提供受限 map->odom 修正。
+fusion_local_history_size: 30
+fusion_max_pose_pair_age_s: 0.80
+fusion_initial_correction_translation_m: 0.30
+fusion_initial_correction_yaw_rad: 0.35
+fusion_max_correction_translation_m: 0.30
+fusion_max_correction_yaw_rad: 0.25
+fusion_correction_time_constant_s: 0.75
+fusion_stationary_translation_m: 0.025
+fusion_stationary_yaw_rad: 0.020
+fusion_stationary_correction_deadband_m: 0.025
+fusion_stationary_correction_deadband_yaw_rad: 0.020
+gicp_unhealthy_variance_threshold: 1.0
+fusion_max_absolute_pose_translation_m: 100.0
+gicp_healthy_fresh_timeout_s: 1.0
+gicp_healthy_lost_timeout_s: 3.0
+hector_rejections_before_degraded: 3
+hector_pose_fresh_timeout_s: 2.0
+
+# P0 垂直状态：不使用 Gazebo 真值。IMU 积分配合静止零速修正与楼层吸附；
+# 后续接入 FAST-LIO 时可保持公共接口不变并替换此估计器。
+vertical_estimation_enabled: false  # 未经验证的 IMU 双积分不得覆盖 navigation 位姿
+vertical_imu_fresh_timeout_s: 0.20
+vertical_integration_rate_hz: 200.0
+gravity_mps2: 9.80665
+stationary_accel_tolerance_mps2: 0.30
+stationary_gyro_threshold_rps: 0.08
+stationary_hold_s: 0.40
+vertical_bias_learning_rate: 0.01
+max_vertical_acceleration_mps2: 5.0
+max_vertical_speed_mps: 1.5
+vertical_max_abs_roll_rad: 0.26
+vertical_max_abs_pitch_rad: 0.26
+vertical_velocity_damping_per_s: 2.0
+vertical_acceleration_deadband_mps2: 0.15
+floor_heights: [0.0, 2.6, 5.2]
+floor_switch_hysteresis_m: 0.20
+floor_snap_tolerance_m: 0.35
+
+# P0 默认长期后端：FAST-LIO2 的 MARSIM 模式。SimEnv 每一帧 /scan 是
+# 同一仿真时刻生成的，因此按“瞬时点云”处理，不伪造逐点时间戳。
+input_topic: /scan
+output_topic: /localization/lio/points
+output_frame: base
+min_range_m: 0.35
+max_range_m: 20.0
+
+common:
+  lid_topic: /localization/lio/points
+  imu_topic: /trunk_imu
+  world_frame: map
+  body_frame: base
+  time_sync_en: false
+  time_offset_lidar_to_imu: 0.0
+preprocess:
+  lidar_type: 4
+  scan_line: 4
+  blind: 0.35
+  scan_rate: 10
+  timestamp_unit: 2
+mapping:
+  acc_cov: 0.03
+  gyr_cov: 0.01
+  b_acc_cov: 0.0001
+  b_gyr_cov: 0.0001
+  fov_degree: 179.0
+  det_range: 20.0
+  extrinsic_est_en: false
+  extrinsic_T: [0.0, 0.0, 0.0]
+  extrinsic_R: [1.0, 0.0, 0.0,
+                0.0, 1.0, 0.0,
+                0.0, 0.0, 1.0]
+publish:
+  path_en: false
+  scan_publish_en: true
+  dense_publish_en: false
+  scan_bodyframe_pub_en: false
+  tf_en: false
+pcd_save:
+  pcd_save_en: false
+  interval: -1
+feature_extract_enable: false
+point_filter_num: 3
+max_iteration: 4
+filter_size_surf: 0.18
+filter_size_map: 0.25
+cube_side_length: 80.0
+runtime_pos_log_enable: false
+# 只有连续静止的 IMU 数据才能用于估计初始重力和陀螺零偏。该门控仅在启动
+# 阶段生效，正常运行仍保留完整 6DoF，因此不限制楼梯和多楼层运动。
+imu_initialization:
+  stationary_hold_s: 1.0
+  max_gyro_rps: 0.05
+  max_accel_spread_mps2: 0.15
+  accel_norm_tolerance_mps2: 0.35
+  min_samples: 100
+stationary_constraint:
+  enable: true
+  max_gyro_rps: 0.05
+  max_accel_spread_mps2: 0.15
+  accel_norm_tolerance_mps2: 0.35
+  min_imu_samples: 20
+
+# 从校正后的三维点云增量生成 navigation 使用的 OccupancyGrid。
+map_publish_rate_hz: 2.0
+map_max_range_m: 12.0
+map_obstacle_min_height_m: -0.12
+map_obstacle_max_height_m: 1.20
+map_ground_min_height_m: -0.55
+map_ground_max_height_m: -0.12
+map_voxel_size_m: 0.12
+# 注册点云只有在同时间的原始 LIO 位姿通过物理跳变门后才允许更新地图。
+map_pose_cloud_max_age_s: 0.20
+
+# 公共接口的最后一道异常跳变保护，不参与正常 LIO 状态估计。
+lio_guard_max_linear_speed_mps: 2.0
+lio_guard_translation_margin_m: 0.15
+lio_guard_max_yaw_rate_rps: 3.0
+lio_guard_yaw_margin_rad: 0.20
