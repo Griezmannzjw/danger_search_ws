@@ -21,9 +21,9 @@ class ScanProjectionConfig:
     self_exclusion_min_x: float = -0.55
     self_exclusion_max_x: float = 0.55
     self_exclusion_half_width_y: float = 0.40
-    min_returns_per_bin: int = 2
+    min_returns_per_bin: int = 1
     max_intra_bin_range_gap: float = 0.20
-    enable_isolated_hit_filter: bool = True
+    enable_isolated_hit_filter: bool = False
     neighbor_window_bins: int = 8
     min_neighbor_support: int = 1
     max_neighbor_range_jump: float = 0.75
@@ -34,7 +34,7 @@ class ScanProjectionConfig:
     max_abs_roll_rad: float = 0.55
     max_abs_pitch_rad: float = 0.55
     max_angular_speed_rps: float = 1.50
-    enable_ground_clearance_gate: bool = True
+    enable_ground_clearance_gate: bool = False
     ground_candidate_max_z: float = 0.05
     ground_candidate_min_range: float = 0.40
     ground_candidate_max_range: float = 3.00
@@ -44,7 +44,7 @@ class ScanProjectionConfig:
     scan_accumulation_min_samples_per_bin: int = 1
     scan_accumulation_max_age_s: float = 0.6
     min_valid_scan_bins: int = 8
-    min_angular_coverage_rad: float = 0.05
+    min_angular_coverage_rad: float = 0.03
     drop_unstable_scans: bool = True
 
     def __post_init__(self):
@@ -147,7 +147,6 @@ class AdapterConfig:
     pose_jump_yaw_margin_rad: float = 0.10
     pose_gate_max_dt_s: float = 0.50
     pose_rejections_before_lost: int = 3
-    pose_recovery_timeout_s: float = 3.0
     fusion_local_history_size: int = 30
     fusion_max_pose_pair_age_s: float = 0.80
     fusion_initial_correction_translation_m: float = 0.30
@@ -163,8 +162,6 @@ class AdapterConfig:
     fusion_max_absolute_pose_translation_m: float = 100.0
     gicp_healthy_fresh_timeout_s: float = 1.0
     gicp_healthy_lost_timeout_s: float = 3.0
-    gicp_failures_before_degraded: int = 3
-    gicp_failures_before_lost: int = 20
     hector_rejections_before_degraded: int = 3
     hector_pose_fresh_timeout_s: float = 2.0
     vertical_estimation_enabled: bool = False
@@ -213,7 +210,6 @@ class AdapterConfig:
         _require(self.pose_jump_yaw_margin_rad >= 0.0, "pose yaw margin cannot be negative")
         _require(self.pose_gate_max_dt_s > 0.0, "pose gate dt must be positive")
         _require(self.pose_rejections_before_lost >= 1, "pose rejection limit must be positive")
-        _require(self.pose_recovery_timeout_s > 0.0, "pose recovery timeout must be positive")
         _require(self.fusion_local_history_size >= 2, "fusion history must contain at least two poses")
         _require(self.fusion_max_pose_pair_age_s > 0.0, "fusion pose pair timeout must be positive")
         _require(
@@ -252,15 +248,6 @@ class AdapterConfig:
             0.0 < self.gicp_healthy_fresh_timeout_s
             < self.gicp_healthy_lost_timeout_s,
             "GICP healthy-pose timeouts are invalid",
-        )
-        _require(
-            self.gicp_failures_before_degraded >= 1,
-            "GICP degraded failure threshold must be positive",
-        )
-        _require(
-            self.gicp_failures_before_lost
-            >= self.gicp_failures_before_degraded,
-            "GICP lost failure threshold cannot be below degraded threshold",
         )
         _require(
             self.hector_rejections_before_degraded >= 1,

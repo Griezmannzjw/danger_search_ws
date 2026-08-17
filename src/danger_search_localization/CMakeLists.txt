@@ -31,6 +31,7 @@ catkin_package(
 )
 
 include_directories(
+  include
   ${catkin_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
 )
@@ -46,19 +47,22 @@ install(TARGETS lidar_odometry_node
 )
 
 catkin_install_python(PROGRAMS
-  scripts/known_pose_backend.py
-  scripts/lio_odometry_bridge.py
   scripts/pose_estimator.py
-  scripts/record_lidar_stability_demo.py
   scripts/scan_projector.py
+  scripts/occupancy_mapper.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
 if(CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(test_lidar_odometry_core test/test_lidar_odometry_core.cpp)
+  if(TARGET test_lidar_odometry_core)
+    target_link_libraries(test_lidar_odometry_core ${catkin_LIBRARIES} ${PCL_LIBRARIES})
+  endif()
   catkin_add_nosetests(test/test_adapter.py)
   catkin_add_nosetests(test/test_config.py)
   catkin_add_nosetests(test/test_pose_filter.py)
   catkin_add_nosetests(test/test_pose_fusion.py)
   catkin_add_nosetests(test/test_scan_projection.py)
+  catkin_add_nosetests(test/test_occupancy_mapping.py)
   catkin_add_nosetests(test/test_vertical_estimation.py)
 endif()

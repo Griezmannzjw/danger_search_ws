@@ -49,6 +49,19 @@ class TestPoseStabilizer(unittest.TestCase):
         self.assertEqual(result.pose.x, 0.0)
         self.assertEqual(result.pose.y, 0.0)
 
+    def test_rejected_jump_cannot_teleport_later_output(self):
+        self.filter.update(1.0, 0.0, 0.0, 0.0)
+        rejected = self.filter.update(1.1, 5.0, 0.0, 0.0)
+        self.assertFalse(rejected.accepted)
+
+        recovered = self.filter.update(1.2, 0.02, 0.0, 0.0)
+        self.assertTrue(recovered.accepted)
+        self.assertLessEqual(recovered.pose.x, 0.02)
+        self.assertEqual(recovered.consecutive_rejections, 0)
+
+    def test_filter_has_no_unbounded_snap_recovery(self):
+        self.assertFalse(hasattr(self.filter, "recover"))
+
     def test_impossible_yaw_jump_is_rejected(self):
         self.filter.update(1.0, 0.0, 0.0, 0.0)
         result = self.filter.update(1.1, 0.0, 0.0, math.pi)

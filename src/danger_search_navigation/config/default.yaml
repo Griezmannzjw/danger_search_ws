@@ -57,9 +57,9 @@ goal_timeout: 60.0
 goal_tolerance_xy: 0.30
 goal_tolerance_yaw: 0.20
 lookahead_distance: 0.60
-cruise_speed: 0.40
-max_linear_speed: 0.40
-max_angular_speed: 0.80
+cruise_speed: 0.35
+max_linear_speed: 0.35
+max_angular_speed: 0.50
 rotate_in_place_angle: 0.45
 rotate_in_place_gain: 1.50
 final_yaw_gain: 1.20

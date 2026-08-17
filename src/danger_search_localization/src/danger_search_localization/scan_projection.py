@@ -58,6 +58,91 @@ class TimedScanAccumulator:
         return len(self._history)
 
 
+class PoseCompensatedPointAccumulator:
+    """Keep a short point window and express it in the newest base frame."""
+
+    def __init__(self, max_frames, max_age_s):
+        if int(max_frames) < 1:
+            raise ValueError("maximum point history length must be positive")
+        if not math.isfinite(float(max_age_s)) or float(max_age_s) <= 0.0:
+            raise ValueError("maximum point history age must be positive")
+        self.max_frames = int(max_frames)
+        self.max_age_s = float(max_age_s)
+        self._history = deque()
+        self._last_stamp_s = None
+
+    def add(self, stamp_s, pose, points):
+        stamp_s = float(stamp_s)
+        pose = tuple(float(value) for value in pose)
+        points = np.asarray(points, dtype=np.float64).reshape((-1, 3))
+        if not math.isfinite(stamp_s) or not all(math.isfinite(v) for v in pose):
+            raise ValueError("point observation timestamp and pose must be finite")
+        if len(pose) != 3 or not np.isfinite(points).all():
+            raise ValueError("point observation is invalid")
+        reset = (
+            self._last_stamp_s is not None
+            and (
+                stamp_s <= self._last_stamp_s
+                or stamp_s - self._last_stamp_s > self.max_age_s
+            )
+        )
+        if reset:
+            self._history.clear()
+        self._history.append((stamp_s, pose, points.copy()))
+        self._last_stamp_s = stamp_s
+        while len(self._history) > self.max_frames:
+            self._history.popleft()
+        while self._history and stamp_s - self._history[0][0] > self.max_age_s:
+            self._history.popleft()
+        return reset
+
+    def points_in_latest_frame(self):
+        if not self._history:
+            return np.empty((0, 3), dtype=np.float64)
+        target_pose = self._history[-1][1]
+        transformed = [
+            transform_points_between_planar_poses(points, pose, target_pose)
+            for _, pose, points in self._history
+        ]
+        return np.concatenate(transformed, axis=0)
+
+    def __len__(self):
+        return len(self._history)
+
+
+def interpolate_planar_pose(start, end, ratio):
+    """Interpolate an odometry pose while respecting yaw wrapping."""
+    ratio = min(1.0, max(0.0, float(ratio)))
+    sx, sy, syaw = (float(value) for value in start)
+    ex, ey, eyaw = (float(value) for value in end)
+    yaw_delta = math.atan2(math.sin(eyaw - syaw), math.cos(eyaw - syaw))
+    return (
+        sx + ratio * (ex - sx),
+        sy + ratio * (ey - sy),
+        math.atan2(
+            math.sin(syaw + ratio * yaw_delta),
+            math.cos(syaw + ratio * yaw_delta),
+        ),
+    )
+
+
+def transform_points_between_planar_poses(points, source_pose, target_pose):
+    """Transform source-base points into target-base coordinates via odom."""
+    points = np.asarray(points, dtype=np.float64).reshape((-1, 3))
+    sx, sy, syaw = (float(value) for value in source_pose)
+    tx, ty, tyaw = (float(value) for value in target_pose)
+    source_cosine, source_sine = math.cos(syaw), math.sin(syaw)
+    target_cosine, target_sine = math.cos(tyaw), math.sin(tyaw)
+    odom_x = sx + source_cosine * points[:, 0] - source_sine * points[:, 1]
+    odom_y = sy + source_sine * points[:, 0] + source_cosine * points[:, 1]
+    delta_x = odom_x - tx
+    delta_y = odom_y - ty
+    output = points.copy()
+    output[:, 0] = target_cosine * delta_x + target_sine * delta_y
+    output[:, 1] = -target_sine * delta_x + target_cosine * delta_y
+    return output
+
+
 def transform_points(points, translation, quaternion):
     """Apply a rigid transform to an N-by-3 array."""
     points = np.asarray(points, dtype=np.float64).reshape((-1, 3))

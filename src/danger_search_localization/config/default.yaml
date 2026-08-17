@@ -15,24 +15,50 @@ raw_scan_topic: /scan
 projected_scan_topic: /localization/scan
 backend_pose_topic: /localization/hector_pose
 gicp_pose_topic: /localization/raw_pose
+validated_gicp_pose_topic: /localization/validated_pose
 raw_map_topic: /localization/raw_map
+use_hector_correction: false
 
-# 稳定全视场雷达 GICP；平移由 cmd_vel/物理 IMU 互补约束，航向与静止状态由物理 IMU 约束。
-lidar_odom_voxel_size_m: 0.15
+# 垂直低权重 SE(2) GICP 维护连续 odom->base，避免 Livox 高度层差异主导平面里程计。
+lidar_odom_voxel_size_m: 0.25
 lidar_odom_min_range_m: 0.40
 lidar_odom_max_range_m: 12.0
-lidar_odom_max_correspondence_m: 1.20
-lidar_odom_max_iterations: 35
+lidar_odom_max_correspondence_m: 0.60
+lidar_odom_max_iterations: 15
+lidar_odom_min_correspondence_ratio: 0.35
 lidar_odom_max_fitness: 0.40
 lidar_odom_max_step_translation_m: 0.90
 lidar_odom_max_step_rotation_rad: 0.90
-lidar_odom_max_linear_speed_mps: 1.0
-lidar_odom_max_angular_speed_rps: 2.0
-lidar_odom_translation_margin_m: 0.05
-lidar_odom_rotation_margin_rad: 0.08
+lidar_odom_max_step_z_m: 0.12
+lidar_odom_max_step_roll_pitch_rad: 0.20
+lidar_odom_max_linear_speed_mps: 0.40
+lidar_odom_max_angular_speed_rps: 0.80
+lidar_odom_max_gate_dt_s: 0.75
+lidar_odom_translation_margin_m: 0.04
+lidar_odom_rotation_margin_rad: 0.06
 lidar_odom_translation_deadband_m: 0.015
 lidar_odom_rotation_deadband_rad: 0.008
+lidar_odom_candidate_fitness_slack: 0.005
+lidar_odom_imu_yaw_tolerance_rad: 0.20
+lidar_odom_imu_stationary_accel_tolerance_mps2: 0.05
+lidar_odom_imu_stationary_gyro_threshold_rps: 0.02
+lidar_odom_imu_motion_excitation_hold_s: 1.00
 lidar_odom_min_points: 100
+lidar_odom_max_reference_age_s: 3.0
+# Register each official scan against the trusted local submap. Accumulating
+# raw observations before registration smears real motion and hides 10 Hz
+# odometry increments.
+lidar_odom_observation_scans: 1
+lidar_odom_observation_max_points: 1000
+lidar_odom_submap_scans: 5
+lidar_odom_submap_max_points: 1200
+# The live GICP worker must keep up with the 10 Hz official scan stream.
+# A deterministic 100-point subset preserves the configured minimum geometry
+# while preventing stale scans from becoming a single over-limit motion step.
+lidar_odom_registration_max_points: 100
+lidar_odom_rebaseline_after_failures: 3
+gicp_recovery_consecutive_accepts: 2
+lidar_odom_max_absolute_translation_m: 100.0
 
 # 原始三维点云投影为平面 LaserScan
 angle_min: -3.141592653589793
@@ -45,31 +71,42 @@ max_height: 1.50
 self_exclusion_min_x: -0.55
 self_exclusion_max_x: 0.55
 self_exclusion_half_width_y: 0.40
-min_returns_per_bin: 1             # 1200-ray Mid-360 单帧多数角度仅一个回波
+min_returns_per_bin: 1             # 仿真稳定全视场射线通常每个角度格只有一个有效回波
 max_intra_bin_range_gap: 0.30    # 放宽同角度聚类距离容忍
-enable_isolated_hit_filter: false  # 确定性仿真回波无需用邻角密度误删稀疏有效点
+enable_isolated_hit_filter: false  # 稳定确定性射线不应因相邻角稀疏而被整片删除
 neighbor_window_bins: 8          # 0.5 deg/bin，对应左右各 4 deg
 min_neighbor_support: 1
 max_neighbor_range_jump: 0.75
 tf_timeout_s: 0.10
 imu_topic: /trunk_imu
-enable_imu_leveling: false         # 仿真 Mid-360 已在 base 外参中；重复整平会误删墙面回波
+enable_imu_leveling: true          # 运动时按重力方向校正俯仰/侧倾
 imu_fresh_timeout_s: 0.20
 max_abs_roll_rad: 0.90             # ~51.5 deg，四足行走体态晃动阈值
 max_abs_pitch_rad: 0.90
 max_angular_speed_rps: 5.0          # 四足瞬时角速度容忍
-enable_ground_clearance_gate: true
+# 水平 scan 的低点不稳定代表地面；实测直立机身也会被误判为 0.004 m。
+# 继续使用 IMU roll/pitch 和角速度门控检测倾倒或剧烈运动。
+enable_ground_clearance_gate: false
 ground_candidate_max_z: 0.10
 ground_candidate_min_range: 0.40
 ground_candidate_max_range: 3.00
 min_ground_candidate_points: 15
 min_ground_clearance_m: 0.04
-scan_accumulation_frames: 1          # 未做运动补偿时禁止跨帧叠加，避免运动重影
+scan_accumulation_frames: 3          # 短窗口补足 Livox 单帧的稀疏角度覆盖
 scan_accumulation_min_samples_per_bin: 1
 scan_accumulation_max_age_s: 0.6     # 仿真时钟回退或长停顿后清空历史
-min_valid_scan_bins: 20              # 比赛场景中 1200 条稳定全视场射线实测约 150 个有效角度格
-min_angular_coverage_rad: 0.35       # 连续覆盖至少约 20 度
+min_valid_scan_bins: 8               # Livox 单帧稀疏，短窗口至少保留 4 度有效角度
+min_angular_coverage_rad: 0.03       # 允许实测约 0.03--0.04 rad 的连续有效覆盖
 drop_unstable_scans: true            # 摔倒、剧烈转动或过低时不污染 Hector 地图
+
+# P0 默认使用可信 GICP 位姿直接构建占据栅格，避免稀疏 Livox 的第二套位姿漂移。
+occupancy_mapper_max_rays: 360
+occupancy_mapper_free_update: 1
+occupancy_mapper_occupied_update: 4
+occupancy_mapper_min_score: -20
+occupancy_mapper_max_score: 20
+occupancy_mapper_occupied_score: 2
+occupancy_mapper_clear_radius_m: 0.50
 
 # Hector 2D 扫描匹配与地图
 map_resolution: 0.05
@@ -86,12 +123,11 @@ update_factor_free: 0.40
 update_factor_occupied: 0.65     # 降低单帧误命中的占用权重
 
 # 接口健康判定
-pose_fresh_timeout_s: 1.0
-map_fresh_timeout_s: 3.0
-# One safely aligned Hector grid is sufficient to start. Later rejected
-# stationary updates keep this grid frozen instead of invalidating navigation.
-min_map_updates_for_stable: 1
+pose_fresh_timeout_s: 2.0
+map_fresh_timeout_s: 5.0
+min_map_updates_for_stable: 2
 pose_publish_rate_hz: 20.0
+tf_publish_future_tolerance_s: 0.5
 status_publish_rate_hz: 2.0
 fallback_xy_variance: 0.10
 fallback_yaw_variance: 0.15
@@ -105,16 +141,14 @@ pose_yaw_deadband_rad: 0.010
 pose_filter_time_constant_s: 0.15
 pose_max_linear_speed_mps: 1.0
 pose_max_angular_speed_rps: 2.0
-pose_jump_translation_margin_m: 0.25
-pose_jump_yaw_margin_rad: 0.30
-pose_gate_max_dt_s: 1.00
-pose_rejections_before_lost: 10
-pose_recovery_timeout_s: 3.0          # 连续拒绝超过此时间自动重新锚定位姿
+pose_jump_translation_margin_m: 0.08
+pose_jump_yaw_margin_rad: 0.10
+pose_gate_max_dt_s: 0.50
+pose_rejections_before_lost: 3
 
 # Hector + GICP 融合：GICP 维护 odom->base，Hector 只提供受限 map->odom 修正。
 fusion_local_history_size: 30
-fusion_max_pose_pair_age_s: 0.03  # 已知位姿桥接必须与同一帧本地位姿严格配对
-mapping_with_known_poses: true    # Hector 只建图；map->odom 校正恒为单位变换
+fusion_max_pose_pair_age_s: 0.80
 fusion_initial_correction_translation_m: 0.30
 fusion_initial_correction_yaw_rad: 0.35
 fusion_max_correction_translation_m: 0.30
@@ -125,37 +159,21 @@ fusion_stationary_yaw_rad: 0.020
 fusion_stationary_correction_deadband_m: 0.025
 fusion_stationary_correction_deadband_yaw_rad: 0.020
 gicp_unhealthy_variance_threshold: 1.0
-gicp_failures_before_degraded: 3
-gicp_failures_before_lost: 20
+fusion_max_absolute_pose_translation_m: 100.0
+gicp_healthy_fresh_timeout_s: 1.5
+gicp_healthy_lost_timeout_s: 4.5
 hector_rejections_before_degraded: 3
 hector_pose_fresh_timeout_s: 2.0
 
 # P0 垂直状态：不使用 Gazebo 真值。IMU 积分配合静止零速修正与楼层吸附；
-# 垂直双积分仍默认关闭，避免未经验证的 z 漂移覆盖 navigation 位姿。
+# 后续接入 FAST-LIO 时可保持公共接口不变并替换此估计器。
 vertical_estimation_enabled: false  # 未经验证的 IMU 双积分不得覆盖 navigation 位姿
 vertical_imu_fresh_timeout_s: 0.20
 vertical_integration_rate_hz: 200.0
 gravity_mps2: 9.80665
 stationary_accel_tolerance_mps2: 0.30
 stationary_gyro_threshold_rps: 0.08
-stationary_hold_s: 1.00             # 物理 IMU 连续稳定后再执行零速锚点更新
-use_imu_yaw_constraint: true
-use_imu_translation_constraint: true
-imu_translation_min_command_mps: 0.30  # 该 RL 控制器在更小命令下只踏步、不产生净位移
-imu_translation_bias_learning_rate: 0.01
-imu_translation_max_acceleration_mps2: 6.0
-imu_translation_max_velocity_mps: 1.5
-command_translation_weight: 0.75  # 与 IMU 积分互补，抑制仿真足端 KF 严重低估
-use_cmd_vel_motion_constraints: true
-cmd_vel_topic: /cmd_vel
-cmd_vel_fresh_timeout_s: 0.50
-turn_in_place_linear_threshold_mps: 0.05
-turn_in_place_angular_threshold_rps: 0.05
-use_leg_odom_translation_constraint: false  # Unitree KF 在本场景中低估真实平移，仅保留诊断话题
-leg_odom_topic: /unitree/leg_odom
-leg_odom_fresh_timeout_s: 0.15
-leg_odom_translation_weight: 1.0  # 仅在显式启用腿里程计约束时生效；默认关闭
-leg_odom_max_step_translation_m: 0.20
+stationary_hold_s: 0.40
 vertical_bias_learning_rate: 0.01
 max_vertical_acceleration_mps2: 5.0
 max_vertical_speed_mps: 1.5
