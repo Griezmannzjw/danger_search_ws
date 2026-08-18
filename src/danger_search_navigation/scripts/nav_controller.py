@@ -8,6 +8,7 @@
 import math
 import os
 import sys
+import time
 import threading
 
 import actionlib
@@ -124,6 +125,11 @@ class NavController:
         self.map_stamp = rospy.Time(0)
         self.map_valid = False
         self.map_generation = 0
+        self.map_geometry = None
+        self.map_unchanged_count = 0
+        self.map_build_count = 0
+        self.obstacle_tf_failure_count = 0
+        self.obstacle_invalid_count = 0
         self.mapping_status = None
         self.mapping_status_stamp = rospy.Time(0)
         self.latest_obstacles_base = []
@@ -156,7 +162,9 @@ class NavController:
         self.pose_sub = rospy.Subscriber(
             self.pose_topic, PoseWithCovarianceStamped, self.pose_callback
         )
-        self.map_sub = rospy.Subscriber(self.map_topic, OccupancyGrid, self.map_callback)
+        self.map_sub = rospy.Subscriber(
+            self.map_topic, OccupancyGrid, self.map_callback, queue_size=1
+        )
         self.mapping_status_sub = rospy.Subscriber(
             self.mapping_status_topic, MappingStatus, self.mapping_status_callback
         )
@@ -246,17 +254,48 @@ class NavController:
             self._stop_robot()
 
     def map_callback(self, msg):
-        """原子替换经合法性检查的规划器快照。"""
+        """校验地图并原子替换 planner，重复内容只更新时间戳。"""
         planner = None
         valid = False
+        data = None
+        geometry = None
         if msg.header.frame_id == self.map_frame and not msg.header.stamp.is_zero():
             origin = msg.info.origin
             yaw = self._quaternion_yaw(origin.orientation)
             if yaw is not None and self._finite(origin.position.x, origin.position.y):
                 try:
+                    # Keep an immutable snapshot so equality compares actual
+                    # map contents without a cryptographic hash.
+                    data = tuple(msg.data)
+                    geometry = (
+                        int(msg.info.width),
+                        int(msg.info.height),
+                        float(msg.info.resolution),
+                        float(origin.position.x),
+                        float(origin.position.y),
+                        float(yaw),
+                    )
+                    with self.lock:
+                        unchanged = (
+                            self.map_valid
+                            and self.planner is not None
+                            and self.map_geometry == geometry
+                            and self.map_data == data
+                        )
+                        if unchanged:
+                            self.map_stamp = msg.header.stamp
+                            self.map_unchanged_count += 1
+                    if unchanged:
+                        rospy.logdebug_throttle(
+                            10.0,
+                            "[navigation] 跳过未变化地图，累计 %d 帧",
+                            self.map_unchanged_count,
+                        )
+                        return
+                    build_started = time.monotonic()
                     planner = InflatedOccupancyGrid(
-                        msg.info.width, msg.info.height, msg.info.resolution,
-                        origin.position.x, origin.position.y, yaw, msg.data,
+                        geometry[0], geometry[1], geometry[2],
+                        geometry[3], geometry[4], geometry[5], data,
                         occupied_threshold=self.occupied_threshold,
                         robot_radius=self.robot_radius,
                         inflation_padding=self.inflation_padding,
@@ -264,13 +303,29 @@ class NavController:
                         max_expansions=self.max_expansions,
                     )
                     valid = True
+                    elapsed_ms = (time.monotonic() - build_started) * 1000.0
+                    with self.lock:
+                        self.map_build_count += 1
+                        build_count = self.map_build_count
+                    rospy.loginfo_throttle(
+                        10.0,
+                        "[navigation] planner 地图构建 %.1f ms，累计 %d 次",
+                        elapsed_ms,
+                        build_count,
+                    )
                 except (TypeError, ValueError) as exc:
                     rospy.logwarn_throttle(5.0, "[navigation] 地图无效，拒绝规划: %s", exc)
         if not valid:
             rospy.logwarn_throttle(5.0, "[navigation] 地图帧、时间戳、原点或几何无效")
         with self.lock:
-            self.map_data = tuple(msg.data) if valid else None
-            self.planner = planner
+            if valid:
+                self.map_data = data
+                self.map_geometry = geometry
+                self.planner = planner
+            else:
+                self.map_data = None
+                self.map_geometry = None
+                self.planner = None
             self.map_stamp = msg.header.stamp
             self.map_valid = valid
             if valid:
@@ -298,22 +353,33 @@ class NavController:
                     self.base_frame, cloud.header.frame_id, cloud.header.stamp
                 )
             except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as exc:
+                with self.lock:
+                    self.obstacle_tf_failure_count += 1
+                    tf_failures = self.obstacle_tf_failure_count
                 rospy.logwarn_throttle(
                     5.0, "[navigation] 点云 TF 不可用 %s <- %s: %s",
                     self.base_frame, cloud.header.frame_id, str(exc)
                 )
+                try:
+                    rospy.logdebug_throttle(
+                        10.0, "[navigation] 点云 TF 查询失败累计 %d 次", tf_failures
+                    )
+                except Exception:
+                    pass
                 frame_valid = False
             if frame_valid:
                 count = len(cloud.points)
                 step = max(1, int(math.ceil(float(count) / self.obstacle_max_points)))
+                source_points = []
                 for point in cloud.points[::step]:
                     if not self._finite(point.x, point.y, point.z):
                         continue
                     if point.x * point.x + point.y * point.y + point.z * point.z < self.zero_point_radius ** 2:
                         continue
-                    base_x, base_y, base_z = self._transform_point(
-                        transform, point.x, point.y, point.z
-                    )
+                    source_points.append((point.x, point.y, point.z))
+                for base_x, base_y, base_z in self._transform_points(
+                    transform, source_points
+                ):
                     distance = math.hypot(base_x, base_y)
                     if not self.obstacle_min_z <= base_z <= self.obstacle_max_z:
                         continue
@@ -321,6 +387,8 @@ class NavController:
                         continue
                     points.append((base_x, base_y, base_z))
         else:
+            with self.lock:
+                self.obstacle_invalid_count += 1
             rospy.logwarn_throttle(
                 5.0, "[navigation] 点云帧或时间戳无效"
             )
@@ -349,6 +417,26 @@ class NavController:
             rotated[0] + translation[0],
             rotated[1] + translation[1],
             rotated[2] + translation[2],
+        )
+
+    @staticmethod
+    def _transform_points(transform, points):
+        """Transform a sampled cloud with one matrix construction per frame."""
+        if not points:
+            return ()
+        translation, rotation = transform
+        matrix = tf.transformations.quaternion_matrix(rotation)
+        r00, r01, r02 = matrix[0, 0], matrix[0, 1], matrix[0, 2]
+        r10, r11, r12 = matrix[1, 0], matrix[1, 1], matrix[1, 2]
+        r20, r21, r22 = matrix[2, 0], matrix[2, 1], matrix[2, 2]
+        tx, ty, tz = translation
+        return tuple(
+            (
+                r00 * x + r01 * y + r02 * z + tx,
+                r10 * x + r11 * y + r12 * z + ty,
+                r20 * x + r21 * y + r22 * z + tz,
+            )
+            for x, y, z in points
         )
 
     def _tracking_tolerance(self, projected):
@@ -508,6 +596,26 @@ class NavController:
                 self.obstacle_stamp, self.obstacle_cloud_timeout, now
             )
             safety_stop = self.safety_stop
+            obstacle_stamp = self.obstacle_stamp
+            obstacle_frame_valid = self.obstacle_frame_valid
+            obstacle_tf_failures = getattr(self, "obstacle_tf_failure_count", 0)
+            obstacle_invalid = getattr(self, "obstacle_invalid_count", 0)
+        obstacle_age = (
+            (now - obstacle_stamp).to_sec()
+            if not obstacle_stamp.is_zero() else float("inf")
+        )
+        try:
+            rospy.logdebug_throttle(
+                10.0,
+                "[navigation] safety gate pose=%s map=%s mapping=%s scan_frame=%s "
+                "scan_age=%.3fs tf_failures=%d invalid=%d",
+                str(pose_ready), str(map_ready), str(mapping_ready),
+                str(obstacle_frame_valid), obstacle_age,
+                obstacle_tf_failures, obstacle_invalid,
+            )
+        except Exception:
+            # Keep ROS-free unit tests independent of rospy.init_node().
+            pass
         if safety_stop:
             return False, "SAFETY_STOP", "外部 safety_stop 信号为真"
         if not pose_ready:

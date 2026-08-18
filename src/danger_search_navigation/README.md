@@ -27,7 +27,8 @@ nav_controller.py 是本包唯一的 ROS 节点入口和唯一的 /move_base Act
 ## 规划、跟踪与安全行为
 
 - navigation_core.py 不依赖 ROS。make_plan、Action 启动、地图更新和动态障碍阻断后的重规划都调用同一个带膨胀的 A* 入口。
-- /map 中 -1、100、任何非 0 栅格和地图外部均不可通行；所有非自由栅格按机器人半径加安全余量膨胀。地图 origin.position 和二维 yaw 都参与 world/cell 转换，负坐标使用 floor 语义。
+- 地图内容未变化时只更新时间戳，不重复构建 planner；实际变化时使用 NumPy/OpenCV 圆形膨胀并原子替换规划器，避免 1024² 地图重建阻塞 /scan。
+- /map 中 -1、100、任何非 0 栅格和地图外部均不可通行；所有非自由栅格按机器人半径加安全余量膨胀。当前 SimEnv 联调默认 `robot_radius=0.30 m`、`inflation_padding=0.03 m`。地图 origin.position 和二维 yaw 都参与 world/cell 转换，负坐标使用 floor 语义。
 - Action 跟踪 A* 路径的前视点，不会直接追最终目标。大偏航先原地旋转；进入 XY 容差后继续独立调整最终 yaw，只有 XY 和 yaw 都达标才 SUCCEEDED。
 - /scan 根据消息 frame、时间戳和 TF 查询实际的 LiDAR-to-base 外参，再筛选和投影成临时障碍，并以和静态障碍相同的策略膨胀。SimEnv 的 `laser_livox` 实际为 `base` 下零旋转、`(0.2, 0, 0.08)` 平移；不再使用历史手工 `0.785` 弧度 pitch。require_obstacle_cloud 为 true 时，缺失、过期或 TF 无效的点云会停止并以 CONTROL_FAILED 结束活动目标。
 - 原始目标不可达时，可在 `goal_projection_max_radius` 内选择安全跟踪终点。投影终点使用 `projection_tracking_tolerance`（默认 `0.05 m`）跟踪，但 Action 只有进入原始目标的 `goal_tolerance_xy` 后才成功，避免滚动短目标零位移完成。

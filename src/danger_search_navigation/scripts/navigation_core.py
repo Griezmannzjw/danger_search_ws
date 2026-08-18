@@ -9,6 +9,9 @@ from dataclasses import dataclass
 import heapq
 import math
 
+import cv2
+import numpy as np
+
 
 VALID_FAILURE_CODES = frozenset((
     "NONE",
@@ -107,6 +110,8 @@ class GoalState:
 class InflatedOccupancyGrid:
     """不可变的保守占据栅格，静态与动态障碍共用同一膨胀半径。"""
 
+    _kernel_cache = {}
+
     def __init__(
         self,
         width,
@@ -151,26 +156,43 @@ class InflatedOccupancyGrid:
         self.max_expansions = int(max_expansions)
         self.inflation_radius = float(robot_radius) + float(inflation_padding)
 
-        values = tuple(int(value) for value in data)
-        self.unknown = tuple(value == -1 for value in values)
-        # -1、100 以及任何非 0 单元都保守地不可通行。
-        self.base_blocked = tuple(value != 0 for value in values)
-        inflated = list(self.base_blocked)
-        # unknown 和其他非自由格本身不可通行；只有真正占据的栅格需要
-        # 做机器人半径膨胀。否则大面积 unknown 地图会在每次回调中产生
-        # 数千万次重复膨胀运算，并把已知自由区边界全部吞掉。
-        occupied_cells = (
-            (index % self.width, index // self.width)
-            for index, value in enumerate(values)
-            if value >= int(occupied_threshold)
-        )
-        offsets = self._disk_offsets(self.inflation_radius)
-        for cell_x, cell_y in occupied_cells:
-            for dx, dy in offsets:
-                nx, ny = cell_x + dx, cell_y + dy
-                if self.in_bounds(nx, ny):
-                    inflated[self.index(nx, ny)] = True
-        self.inflated_blocked = tuple(inflated)
+        grid = np.asarray(data, dtype=np.int16).reshape((self.height, self.width))
+        base_blocked = grid != 0
+        occupied = (grid >= int(occupied_threshold)).astype(np.uint8)
+        inflated = cv2.dilate(
+            occupied,
+            self._disk_kernel(self.resolution, self.inflation_radius),
+            iterations=1,
+        ) != 0
+
+        # -1、100 以及任何非 0 单元都保守地不可通行。OpenCV 在 C++ 中
+        # 完成圆形膨胀，避免每次地图更新都用 Python 遍历整张栅格。
+        # Bytes keep the immutable/read-only semantics used by the planner,
+        # while avoiding millions of Python bool objects on every map update.
+        self.unknown = (grid == -1).astype(np.uint8).ravel().tobytes()
+        self.base_blocked = base_blocked.astype(np.uint8).ravel().tobytes()
+        self.inflated_blocked = np.logical_or(
+            base_blocked, inflated
+        ).astype(np.uint8).ravel().tobytes()
+
+    @classmethod
+    def _disk_kernel(cls, resolution, radius_m):
+        """缓存与现有离散圆形偏移完全一致的 OpenCV 膨胀核。"""
+        key = (float(resolution), float(radius_m))
+        kernel = cls._kernel_cache.get(key)
+        if kernel is not None:
+            return kernel
+        radius_cells = int(math.ceil(radius_m / resolution))
+        yy, xx = np.ogrid[
+            -radius_cells:radius_cells + 1,
+            -radius_cells:radius_cells + 1,
+        ]
+        kernel = (
+            (xx * xx + yy * yy) * resolution * resolution
+            <= radius_m * radius_m + 1e-9
+        ).astype(np.uint8)
+        cls._kernel_cache[key] = kernel
+        return kernel
 
     def index(self, cell_x, cell_y):
         return int(cell_y) * self.width + int(cell_x)

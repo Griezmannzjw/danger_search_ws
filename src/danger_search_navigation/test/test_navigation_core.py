@@ -7,6 +7,7 @@ import sys
 import threading
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import rospy
 import tf.transformations
@@ -46,6 +47,35 @@ def make_grid(width, height, occupied=(), unknown=(), **kwargs):
 
 
 class InflatedOccupancyGridTest(unittest.TestCase):
+    def test_cached_opencv_inflation_matches_reference_offsets(self):
+        width = height = 9
+        data = [0] * (width * height)
+        data[4 * width + 4] = 100
+        data[1 * width + 1] = 65
+        grid = InflatedOccupancyGrid(
+            width, height, 0.05, 0.0, 0.0, 0.0, data,
+            occupied_threshold=65, robot_radius=0.15, inflation_padding=0.05,
+        )
+        expected = [value != 0 for value in data]
+        offsets = [
+            (dx, dy)
+            for dy in range(-4, 5)
+            for dx in range(-4, 5)
+            if math.hypot(dx * 0.05, dy * 0.05) <= 0.20 + 1e-9
+        ]
+        for index, value in enumerate(data):
+            if value < 65:
+                continue
+            cell_x, cell_y = index % width, index // width
+            for dx, dy in offsets:
+                nx, ny = cell_x + dx, cell_y + dy
+                if 0 <= nx < width and 0 <= ny < height:
+                    expected[ny * width + nx] = True
+        self.assertEqual(
+            tuple(bool(value) for value in grid.inflated_blocked),
+            tuple(expected),
+        )
+
     def test_a_star_routes_around_static_obstacle(self):
         # 墙没有到达顶边，路径必须绕墙而不是直线穿越。
         wall = [(3, cell_y) for cell_y in range(5)]
@@ -199,6 +229,56 @@ class NavigationStateTest(unittest.TestCase):
 
         self.assertIn("queue_size=1", text[start:finish])
 
+    def test_map_content_dedup_keeps_planner_and_generation(self):
+        controller = NavController.__new__(NavController)
+        controller.lock = threading.RLock()
+        controller.map_frame = "map"
+        controller.map_valid = False
+        controller.map_data = None
+        controller.map_geometry = None
+        controller.map_stamp = rospy.Time(0)
+        controller.map_generation = 0
+        controller.map_unchanged_count = 0
+        controller.map_build_count = 0
+        controller.planner = None
+        controller.goal_state = SimpleNamespace(active=False)
+        controller.occupied_threshold = 65
+        controller.robot_radius = 0.30
+        controller.inflation_padding = 0.10
+        controller.allow_diagonal = True
+        controller.max_expansions = 100
+        controller.quaternion_norm_tolerance = 0.05
+        origin = SimpleNamespace(
+            position=SimpleNamespace(x=0.0, y=0.0),
+            orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+        )
+        info = SimpleNamespace(width=2, height=2, resolution=1.0, origin=origin)
+        make_message = lambda stamp, data: SimpleNamespace(
+            header=SimpleNamespace(frame_id="map", stamp=stamp),
+            info=info,
+            data=data,
+        )
+        with patch("nav_controller.rospy.loginfo_throttle"), patch(
+            "nav_controller.rospy.logdebug_throttle"
+        ), patch("nav_controller.rospy.logwarn_throttle"):
+            with patch("nav_controller.InflatedOccupancyGrid", return_value=object()) as build:
+                controller.map_callback(
+                    make_message(rospy.Time.from_sec(1.0), [0, 0, 0, 0])
+                )
+                first_planner = controller.planner
+                controller.map_callback(
+                    make_message(rospy.Time.from_sec(2.0), [0, 0, 0, 0])
+                )
+                self.assertEqual(build.call_count, 1)
+                self.assertIs(controller.planner, first_planner)
+                self.assertEqual(controller.map_generation, 1)
+                self.assertEqual(controller.map_unchanged_count, 1)
+                controller.map_callback(
+                    make_message(rospy.Time.from_sec(3.0), [0, 100, 0, 0])
+                )
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(controller.map_generation, 2)
+
 
 class NavigationPathTrackingTest(unittest.TestCase):
     def setUp(self):
@@ -332,6 +412,19 @@ class NavigationGoalProjectionTest(unittest.TestCase):
         self.assertAlmostEqual(point[0], 1.2)
         self.assertAlmostEqual(point[1], 0.0)
         self.assertAlmostEqual(point[2], 0.08)
+
+    def test_batch_tf_transform_matches_single_point_transform(self):
+        rotation = tf.transformations.quaternion_from_euler(0.1, -0.2, 0.3)
+        transform = ((0.2, -0.1, 0.08), rotation)
+        points = [(1.0, 0.0, 0.2), (-0.5, 0.3, 0.1)]
+        expected = tuple(
+            NavController._transform_point(transform, *point)
+            for point in points
+        )
+        actual = NavController._transform_points(transform, points)
+        for actual_point, expected_point in zip(actual, expected):
+            for actual_value, expected_value in zip(actual_point, expected_point):
+                self.assertAlmostEqual(actual_value, expected_value)
 
 
 class NavigationReadinessTest(unittest.TestCase):

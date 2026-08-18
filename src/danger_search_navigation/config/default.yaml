@@ -18,7 +18,8 @@ clear_costmaps_service: /move_base/clear_costmaps
 # 共享 OccupancyGrid A*。未知、占据和所有非自由格均不可通行。
 occupied_threshold: 65
 robot_radius: 0.30
-inflation_padding: 0.10
+# SimEnv 联调先使用较小的额外余量；机器人实际硬碰撞半径仍为 0.30 m。
+inflation_padding: 0.03
 allow_diagonal: true
 max_planner_expansions: 75000
 
