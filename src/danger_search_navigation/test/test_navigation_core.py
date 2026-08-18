@@ -12,6 +12,7 @@ from unittest.mock import patch
 import rospy
 import tf.transformations
 import yaml
+from geometry_msgs.msg import Twist
 
 
 SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
@@ -182,6 +183,7 @@ class NavigationStateTest(unittest.TestCase):
         self.assertAlmostEqual(config["goal_projection_max_radius"], 0.28)
         self.assertAlmostEqual(config["goal_projection_step"], 0.05)
         self.assertAlmostEqual(config["projection_tracking_tolerance"], 0.05)
+        self.assertAlmostEqual(config["planning_failure_tolerance_s"], 0.8)
 
     def test_cancel_clears_goal_and_has_zero_velocity_semantics(self):
         state = GoalState()
@@ -228,6 +230,33 @@ class NavigationStateTest(unittest.TestCase):
         finish = text.index("        self.safety_stop_sub", start)
 
         self.assertIn("queue_size=1", text[start:finish])
+
+    def test_control_timer_publishes_zero_while_planning(self):
+        controller = NavController.__new__(NavController)
+        controller.lock = threading.RLock()
+        controller.goal_state = SimpleNamespace(
+            active=True,
+            record_command=lambda stamp: setattr(controller, "recorded_stamp", stamp),
+        )
+        controller.planning_active = True
+        controller.last_cmd_time = rospy.Time(0)
+
+        class Publisher:
+            def __init__(self):
+                self.messages = []
+
+            def publish(self, message):
+                self.messages.append(message)
+
+        controller.cmd_pub = Publisher()
+        with patch("nav_controller.rospy.Time.now", return_value=rospy.Time.from_sec(1.0)):
+            controller.control_loop(None)
+        self.assertEqual(len(controller.cmd_pub.messages), 1)
+        message = controller.cmd_pub.messages[0]
+        self.assertIsInstance(message, Twist)
+        self.assertEqual(message.linear.x, 0.0)
+        self.assertEqual(message.angular.z, 0.0)
+        self.assertNotEqual(controller.last_cmd_time, rospy.Time(0))
 
     def test_map_content_dedup_keeps_planner_and_generation(self):
         controller = NavController.__new__(NavController)

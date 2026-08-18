@@ -101,6 +101,9 @@ class NavController:
         self.goal_tolerance_yaw = float(rospy.get_param("~goal_tolerance_yaw", 0.20))
         self.goal_timeout = float(rospy.get_param("~goal_timeout", 60.0))
         self.stuck_timeout = float(rospy.get_param("~stuck_timeout", 5.0))
+        self.planning_failure_tolerance_s = float(
+            rospy.get_param("~planning_failure_tolerance_s", 0.8)
+        )
         self.progress_distance = float(rospy.get_param("~progress_distance", 0.10))
         self.stuck_command_speed = float(rospy.get_param("~stuck_command_speed", 0.05))
         self.goal_projection_max_radius = float(
@@ -152,6 +155,8 @@ class NavController:
         self.failure_code = "NONE"
         self.failure_detail = ""
         self.controller_active = False
+        self.planning_active = False
+        self.planning_failure_since = None
         self.last_cmd_time = rospy.Time(0)
         self.active_tracking_target = None
         self.goal_projected = False
@@ -217,6 +222,7 @@ class NavController:
             self.rotate_in_place_gain, self.final_yaw_gain, self.replan_period,
             self.replan_min_interval, self.replan_deviation_distance,
             self.stuck_timeout, self.progress_distance,
+            self.planning_failure_tolerance_s,
         )
         if any(not math.isfinite(value) or value <= 0.0 for value in positive_values):
             raise rospy.ROSInitException("导航正数参数无效")
@@ -538,6 +544,26 @@ class NavController:
             return None
         return planner.plan_toward_unknown(start_xy, goal[:2], dynamic_cells)
 
+    def _plan_for_target(self, current, target, now):
+        """尝试一次完整规划；调用方负责规划期间的零速心跳和重试。"""
+        dynamic_cells, _, obstacle_fresh = self._dynamic_obstacle_snapshot(now)
+        dynamic_cells = dynamic_cells if obstacle_fresh else ()
+        route, tracking_target, projected = self._plan_goal_path(
+            current[:2], target, dynamic_cells
+        )
+        if route is None:
+            route = self._plan_unknown_fallback(current[:2], target, dynamic_cells)
+            tracking_target = target if route is not None else None
+            projected = False
+        return route, tracking_target, projected
+
+    def _planning_elapsed(self, now):
+        with self.lock:
+            since = self.planning_failure_since
+        if since is None:
+            return 0.0
+        return max(0.0, (now - since).to_sec())
+
     def _pose_from_message(self, msg):
         if msg.header.frame_id != self.map_frame or msg.header.stamp.is_zero():
             return None, False
@@ -774,23 +800,6 @@ class NavController:
         if current is None:
             self._finish_goal("LOCALIZATION_LOST", "读取规划起点时定位位姿已失效")
             return
-        dynamic_cells, _, obstacle_fresh = self._dynamic_obstacle_snapshot(now)
-        route, tracking_target, projected = self._plan_goal_path(
-            current[:2], target, dynamic_cells if obstacle_fresh else ()
-        )
-        if route is None:
-            route = self._plan_unknown_fallback(
-                current[:2], target, dynamic_cells if obstacle_fresh else ()
-            )
-            tracking_target = target if route is not None else None
-            projected = False
-        if not route:
-            self._finish_goal(
-                "UNREACHABLE",
-                "原始目标及目标容差范围内的候选落点均不可达",
-            )
-            return
-
         with self.lock:
             self.goal_state.begin(self._current_goal_id())
             self.has_active_goal = True
@@ -799,12 +808,66 @@ class NavController:
             self.goal_start_time = now
             self.last_position = current[:2]
             self.last_progress_time = now
-            self.active_tracking_target = tracking_target
-            self.goal_projected = projected
-            self._apply_route_locked(route, now)
+            self.active_tracking_target = target
+            self.goal_projected = False
+            self.planning_active = True
+            self.planning_failure_since = None
 
+        route = None
+        tracking_target = None
+        projected = False
         terminal_code = None
         terminal_detail = ""
+        while not rospy.is_shutdown():
+            now = rospy.Time.now()
+            if self.action_server.is_preempt_requested():
+                terminal_code, terminal_detail = "CANCELED", "目标被客户端取消"
+                break
+            ready, code, detail = self._navigation_readiness(now, require_obstacles=True)
+            if not ready:
+                terminal_code, terminal_detail = code, detail
+                break
+            if (now - self._goal_start_time()).to_sec() > self.goal_timeout:
+                terminal_code, terminal_detail = "TIMEOUT", "目标超过配置的执行时限"
+                break
+            current = self._current_pose_snapshot()
+            if current is None:
+                terminal_code, terminal_detail = "LOCALIZATION_LOST", "读取规划起点时定位位姿已失效"
+                break
+            route, tracking_target, projected = self._plan_for_target(
+                current, target, now
+            )
+            if route:
+                with self.lock:
+                    self.planning_active = False
+                    self.planning_failure_since = None
+                    self.active_tracking_target = tracking_target
+                    self.goal_projected = projected
+                    self._apply_route_locked(route, rospy.Time.now())
+                break
+            with self.lock:
+                if self.planning_failure_since is None:
+                    self.planning_failure_since = now
+            elapsed = self._planning_elapsed(rospy.Time.now())
+            if elapsed >= self.planning_failure_tolerance_s:
+                terminal_code = "UNREACHABLE"
+                terminal_detail = "初始规划容忍时间耗尽：原始目标及候选落点均不可达"
+                break
+            rospy.logwarn_throttle(
+                1.0,
+                "[navigation] 初始规划暂时不可达，%.2f/%.2f s 后失败",
+                elapsed,
+                self.planning_failure_tolerance_s,
+            )
+            rospy.sleep(self.replan_min_interval)
+
+        if terminal_code is not None or not route:
+            if terminal_code is None:
+                terminal_code = "CANCELED"
+                terminal_detail = "节点关闭中断初始规划"
+            self._finish_goal(terminal_code, terminal_detail)
+            return
+
         terminal_stuck = False
         rate = rospy.Rate(self.control_rate)
         while not rospy.is_shutdown():
@@ -849,23 +912,60 @@ class NavController:
                 or (now - last_replan).to_sec() >= self.replan_period
             )
             if replan_due and (now - last_replan).to_sec() >= self.replan_min_interval:
-                route, tracking_target, projected = self._plan_goal_path(
-                    current[:2], target, dynamic_cells if obstacle_fresh else ()
-                )
-                if route is None:
-                    route = self._plan_unknown_fallback(
-                        current[:2], target, dynamic_cells if obstacle_fresh else ()
-                    )
-                    tracking_target = target if route is not None else None
-                    projected = False
-                if not route:
-                    terminal_code = "UNREACHABLE"
-                    terminal_detail = "原始目标及目标容差范围内的候选落点均被最新地图或临时障碍阻断"
-                    break
                 with self.lock:
-                    self.active_tracking_target = tracking_target
-                    self.goal_projected = projected
-                    self._apply_route_locked(route, now)
+                    self.planning_active = True
+                route = None
+                while not rospy.is_shutdown():
+                    now = rospy.Time.now()
+                    if self.action_server.is_preempt_requested():
+                        terminal_code, terminal_detail = "CANCELED", "目标被客户端取消"
+                        break
+                    ready, code, detail = self._navigation_readiness(
+                        now, require_obstacles=True
+                    )
+                    if not ready:
+                        terminal_code, terminal_detail = code, detail
+                        break
+                    if (now - self._goal_start_time()).to_sec() > self.goal_timeout:
+                        terminal_code, terminal_detail = "TIMEOUT", "目标超过配置的执行时限"
+                        break
+                    current = self._current_pose_snapshot()
+                    if current is None:
+                        terminal_code = "LOCALIZATION_LOST"
+                        terminal_detail = "重规划时定位位姿已失效"
+                        break
+                    route, tracking_target, projected = self._plan_for_target(
+                        current, target, now
+                    )
+                    if route:
+                        with self.lock:
+                            self.planning_active = False
+                            self.planning_failure_since = None
+                            self.active_tracking_target = tracking_target
+                            self.goal_projected = projected
+                            self._apply_route_locked(route, rospy.Time.now())
+                        route_blocked = False
+                        front_clearance = float("inf")
+                        break
+                    with self.lock:
+                        if self.planning_failure_since is None:
+                            self.planning_failure_since = now
+                    elapsed = self._planning_elapsed(rospy.Time.now())
+                    if elapsed >= self.planning_failure_tolerance_s:
+                        terminal_code = "UNREACHABLE"
+                        terminal_detail = (
+                            "重规划容忍时间耗尽：原始目标及候选落点被最新地图或临时障碍阻断"
+                        )
+                        break
+                    rospy.logwarn_throttle(
+                        1.0,
+                        "[navigation] 重规划暂时不可达，%.2f/%.2f s 后失败",
+                        elapsed,
+                        self.planning_failure_tolerance_s,
+                    )
+                    rospy.sleep(self.replan_min_interval)
+                if terminal_code is not None:
+                    break
 
             if self._requested_goal_reached(current, target):
                 terminal_code = "SUCCEEDED"
@@ -914,6 +1014,8 @@ class NavController:
             self.waypoint_index = 0
             self.active_tracking_target = None
             self.goal_projected = False
+            self.planning_active = False
+            self.planning_failure_since = None
             self.failure_code = code
             self.failure_detail = detail
             self.is_stuck = bool(stuck)
@@ -936,10 +1038,11 @@ class NavController:
         self._stop_robot()
 
     def control_loop(self, _event):
-        """没有活动目标时持续发送零速度，消除旧命令残留。"""
+        """无活动目标或规划中持续发送零速度，消除旧命令残留。"""
         with self.lock:
             active = self.goal_state.active
-        if not active:
+            planning = self.planning_active
+        if not active or planning:
             self._stop_robot()
 
     def _is_stuck(self, current_xy, linear_x, now):

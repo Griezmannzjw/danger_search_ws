@@ -62,6 +62,8 @@ projection_tracking_tolerance: 0.05
 control_rate: 20.0
 health_rate: 5.0
 goal_timeout: 60.0
+# 规划短暂失败时保持零速并重试的容忍时间；cmd_mux 仍独立使用 0.5 s 看门狗。
+planning_failure_tolerance_s: 0.8
 goal_tolerance_xy: 0.30
 goal_tolerance_yaw: 0.20
 lookahead_distance: 0.60
