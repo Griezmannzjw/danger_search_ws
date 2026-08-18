@@ -123,6 +123,8 @@ class TestLocalizationConfig(unittest.TestCase):
         source = launch_path.read_text()
         self.assertIn("localization_source') == 'gicp'", source)
         self.assertIn("localization_source') == 'gazebo_truth'", source)
+        self.assertIn("tf_publish_future_tolerance_s", source)
+        self.assertIn("localization_source') == 'gazebo_truth' else 0.5", source)
         self.assertEqual(source.count('name="lidar_odometry"'), 1)
         self.assertEqual(source.count('name="gazebo_truth_odometry"'), 1)
 
