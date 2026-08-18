@@ -9,6 +9,7 @@ import unittest
 from types import SimpleNamespace
 
 import rospy
+import tf.transformations
 import yaml
 
 
@@ -147,6 +148,10 @@ class NavigationStateTest(unittest.TestCase):
         self.assertEqual(config["obstacle_cloud_timeout"], 1.0)
         self.assertEqual(config["cruise_speed"], 0.35)
         self.assertEqual(config["max_linear_speed"], 0.35)
+        self.assertAlmostEqual(config["lidar_pitch"], 0.0)
+        self.assertAlmostEqual(config["goal_projection_max_radius"], 0.28)
+        self.assertAlmostEqual(config["goal_projection_step"], 0.05)
+        self.assertAlmostEqual(config["projection_tracking_tolerance"], 0.05)
 
     def test_cancel_clears_goal_and_has_zero_velocity_semantics(self):
         state = GoalState()
@@ -225,6 +230,108 @@ class NavigationPathTrackingTest(unittest.TestCase):
         self.assertAlmostEqual(linear_x, 0.35 * math.cos(heading))
         self.assertGreater(angular_z, 0.0)
         self.assertLess(linear_x, 0.40)
+
+
+class NavigationGoalProjectionTest(unittest.TestCase):
+    def setUp(self):
+        self.controller = NavController.__new__(NavController)
+        self.controller.lock = threading.RLock()
+        self.controller.planner = None
+        self.controller.goal_projection_max_radius = 0.28
+        self.controller.goal_projection_step = 0.05
+        self.controller.goal_tolerance_xy = 0.30
+        self.controller.goal_tolerance_yaw = 0.20
+        self.controller.projection_tracking_tolerance = 0.05
+
+    def _grid(self, occupied=()):
+        width, height, resolution = 80, 40, 0.05
+        data = [0] * (width * height)
+        for cell_x, cell_y in occupied:
+            data[cell_y * width + cell_x] = 100
+        return InflatedOccupancyGrid(
+            width, height, resolution, 0.0, 0.0, 0.0, data,
+            robot_radius=0.0,
+        )
+
+    def test_free_goal_is_not_projected(self):
+        self.controller.planner = self._grid()
+        route, target, projected = self.controller._plan_goal_path(
+            (0.125, 0.525), (1.525, 0.525, 0.0)
+        )
+        self.assertIsNotNone(route)
+        self.assertEqual(target, (1.525, 0.525, 0.0))
+        self.assertFalse(projected)
+
+    def test_blocked_goal_projects_to_lateral_free_cell(self):
+        self.controller.planner = self._grid(occupied=[(30, 10)])
+        route, target, projected = self.controller._plan_goal_path(
+            (0.125, 0.525), (1.525, 0.525, 0.0)
+        )
+        self.assertIsNotNone(route)
+        self.assertTrue(projected)
+        self.assertLessEqual(
+            math.hypot(target[0] - 1.525, target[1] - 0.525), 0.30
+        )
+        self.assertNotEqual(target[:2], (1.525, 0.525))
+
+    def test_projected_goal_does_not_succeed_from_tracking_tolerance_only(self):
+        requested = (2.8413, 0.0358, 0.1074)
+        current = (2.4436, -0.0070, 0.1074)
+        projected = (2.6761, 0.1689, 0.1074)
+
+        self.assertLess(math.hypot(current[0] - projected[0], current[1] - projected[1]), 0.30)
+        self.assertEqual(self.controller._tracking_tolerance(True), 0.05)
+        self.assertFalse(self.controller._requested_goal_reached(current, requested))
+
+    def test_projection_radius_reserves_tracking_tolerance(self):
+        candidates = self.controller._goal_candidates((1.0, 1.0), 0.0, (0.0, 1.0))
+        self.assertTrue(candidates)
+        self.assertLessEqual(
+            max(math.hypot(x - 1.0, y - 1.0) for x, y in candidates),
+            self.controller.goal_tolerance_xy - self.controller.projection_tracking_tolerance,
+        )
+
+    def test_projection_rejects_candidate_materially_behind_start(self):
+        candidates = self.controller._goal_candidates((0.10, 0.0), 0.0, (0.0, 0.0))
+        self.assertTrue(candidates)
+        self.assertTrue(all(x >= -0.05 - 1e-9 for x, _ in candidates))
+
+    def test_projection_prefers_nearest_goal_offset_before_route_length(self):
+        class OffsetPlanner:
+            def plan(_self, _start, candidate, _dynamic):
+                offset = math.hypot(candidate[0] - 1.0, candidate[1])
+                if offset < 1e-9:
+                    return None
+                if offset <= 0.051:
+                    return [(0.0, 0.0), (0.0, 2.0), candidate]
+                return [(0.0, 0.0), candidate]
+
+        self.controller.planner = OffsetPlanner()
+        route, target, projected = self.controller._plan_goal_path(
+            (0.0, 0.0), (1.0, 0.0, 0.0)
+        )
+        self.assertTrue(projected)
+        self.assertIsNotNone(route)
+        self.assertAlmostEqual(math.hypot(target[0] - 1.0, target[1]), 0.05)
+
+    def test_projection_returns_none_when_all_candidates_are_blocked(self):
+        occupied = [(x, y) for x in range(20, 42) for y in range(0, 40)]
+        self.controller.planner = self._grid(occupied=occupied)
+        route, target, projected = self.controller._plan_goal_path(
+            (0.125, 0.525), (1.525, 0.525, 0.0)
+        )
+        self.assertIsNone(route)
+        self.assertIsNone(target)
+        self.assertFalse(projected)
+
+    def test_tf_transform_uses_translation_without_manual_pitch(self):
+        rotation = tf.transformations.quaternion_from_euler(0.0, 0.0, 0.0)
+        point = self.controller._transform_point(
+            ((0.2, 0.0, 0.08), rotation), 1.0, 0.0, 0.0
+        )
+        self.assertAlmostEqual(point[0], 1.2)
+        self.assertAlmostEqual(point[1], 0.0)
+        self.assertAlmostEqual(point[2], 0.08)
 
 
 class NavigationReadinessTest(unittest.TestCase):

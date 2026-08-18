@@ -78,12 +78,6 @@ class NavController:
         self.quaternion_norm_tolerance = float(rospy.get_param("~quaternion_norm_tolerance", 0.05))
         self.require_obstacle_cloud = bool(rospy.get_param("~require_obstacle_cloud", True))
         self.lidar_frame = rospy.get_param("~lidar_frame", "laser_livox")
-        self.lidar_x = float(rospy.get_param("~lidar_x", 0.20))
-        self.lidar_y = float(rospy.get_param("~lidar_y", 0.0))
-        self.lidar_z = float(rospy.get_param("~lidar_z", 0.08))
-        self.lidar_roll = float(rospy.get_param("~lidar_roll", 0.0))
-        self.lidar_pitch = float(rospy.get_param("~lidar_pitch", 0.785))
-        self.lidar_yaw = float(rospy.get_param("~lidar_yaw", 0.0))
         self.obstacle_min_z = float(rospy.get_param("~obstacle_min_z", -0.30))
         self.obstacle_max_z = float(rospy.get_param("~obstacle_max_z", 0.80))
         self.obstacle_range_min = float(rospy.get_param("~obstacle_range_min", 0.15))
@@ -108,6 +102,15 @@ class NavController:
         self.stuck_timeout = float(rospy.get_param("~stuck_timeout", 5.0))
         self.progress_distance = float(rospy.get_param("~progress_distance", 0.10))
         self.stuck_command_speed = float(rospy.get_param("~stuck_command_speed", 0.05))
+        self.goal_projection_max_radius = float(
+            rospy.get_param("~goal_projection_max_radius", 0.28)
+        )
+        self.goal_projection_step = float(
+            rospy.get_param("~goal_projection_step", 0.05)
+        )
+        self.projection_tracking_tolerance = float(
+            rospy.get_param("~projection_tracking_tolerance", 0.05)
+        )
         self.control_rate = float(rospy.get_param("~control_rate", 20.0))
         self.health_rate = float(rospy.get_param("~health_rate", 5.0))
         self._validate_configuration()
@@ -128,9 +131,7 @@ class NavController:
         self.obstacle_frame_valid = False
         self.safety_stop = False
         self.clear_costmaps_requested = False
-        self.lidar_rotation = tf.transformations.euler_matrix(
-            self.lidar_roll, self.lidar_pitch, self.lidar_yaw
-        )[:3, :3]
+        self.tf_listener = tf.TransformListener(cache_time=rospy.Duration(10.0))
 
         self.goal_state = GoalState()
         self.has_active_goal = False
@@ -146,6 +147,8 @@ class NavController:
         self.failure_detail = ""
         self.controller_active = False
         self.last_cmd_time = rospy.Time(0)
+        self.active_tracking_target = None
+        self.goal_projected = False
 
         self.cmd_pub = rospy.Publisher(self.nav_cmd_topic, Twist, queue_size=10)
         self.health_pub = rospy.Publisher(self.health_topic, NavigationHealth, queue_size=10)
@@ -218,6 +221,16 @@ class NavController:
             raise rospy.ROSInitException("点云高度范围无效")
         if self.obstacle_range_min < 0.0 or self.obstacle_range_min >= self.obstacle_range_max:
             raise rospy.ROSInitException("点云距离范围无效")
+        if (not math.isfinite(self.goal_projection_max_radius)
+                or self.goal_projection_max_radius <= 0.0
+                or not math.isfinite(self.goal_projection_step)
+                or self.goal_projection_step <= 0.0
+                or self.goal_projection_step > self.goal_projection_max_radius):
+            raise rospy.ROSInitException("目标投影参数无效")
+        if (not math.isfinite(self.projection_tracking_tolerance)
+                or self.projection_tracking_tolerance <= 0.0
+                or self.projection_tracking_tolerance >= self.goal_tolerance_xy):
+            raise rospy.ROSInitException("投影跟踪容差必须位于 0 和目标容差之间")
         if not 1 <= self.occupied_threshold <= 100:
             raise rospy.ROSInitException("占据阈值必须位于 1..100")
 
@@ -278,25 +291,38 @@ class NavController:
     def obstacle_callback(self, cloud):
         """把有效原始 /scan 转为 base 坐标下的临时障碍，不用作定位。"""
         points = []
-        frame_valid = cloud.header.frame_id == self.lidar_frame and not cloud.header.stamp.is_zero()
+        frame_valid = bool(cloud.header.frame_id) and not cloud.header.stamp.is_zero()
         if frame_valid:
-            count = len(cloud.points)
-            step = max(1, int(math.ceil(float(count) / self.obstacle_max_points)))
-            for point in cloud.points[::step]:
-                if not self._finite(point.x, point.y, point.z):
-                    continue
-                if point.x * point.x + point.y * point.y + point.z * point.z < self.zero_point_radius ** 2:
-                    continue
-                base_x, base_y, base_z = self._lidar_to_base(point.x, point.y, point.z)
-                distance = math.hypot(base_x, base_y)
-                if not self.obstacle_min_z <= base_z <= self.obstacle_max_z:
-                    continue
-                if not self.obstacle_range_min <= distance <= self.obstacle_range_max:
-                    continue
-                points.append((base_x, base_y, base_z))
+            try:
+                transform = self.tf_listener.lookupTransform(
+                    self.base_frame, cloud.header.frame_id, cloud.header.stamp
+                )
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as exc:
+                rospy.logwarn_throttle(
+                    5.0, "[navigation] 点云 TF 不可用 %s <- %s: %s",
+                    self.base_frame, cloud.header.frame_id, str(exc)
+                )
+                frame_valid = False
+            if frame_valid:
+                count = len(cloud.points)
+                step = max(1, int(math.ceil(float(count) / self.obstacle_max_points)))
+                for point in cloud.points[::step]:
+                    if not self._finite(point.x, point.y, point.z):
+                        continue
+                    if point.x * point.x + point.y * point.y + point.z * point.z < self.zero_point_radius ** 2:
+                        continue
+                    base_x, base_y, base_z = self._transform_point(
+                        transform, point.x, point.y, point.z
+                    )
+                    distance = math.hypot(base_x, base_y)
+                    if not self.obstacle_min_z <= base_z <= self.obstacle_max_z:
+                        continue
+                    if not self.obstacle_range_min <= distance <= self.obstacle_range_max:
+                        continue
+                    points.append((base_x, base_y, base_z))
         else:
             rospy.logwarn_throttle(
-                5.0, "[navigation] 点云帧或时间戳无效，期望帧: %s", self.lidar_frame
+                5.0, "[navigation] 点云帧或时间戳无效"
             )
         with self.lock:
             self.latest_obstacles_base = points
@@ -314,11 +340,97 @@ class NavController:
         if bool(msg.data) and active:
             self._stop_robot()
 
-    def _plan_path(self, start_xy, goal_xy, dynamic_cells=()):
-        """make_plan 与 Action 唯一允许调用的共享规划入口。"""
+    @staticmethod
+    def _transform_point(transform, x, y, z):
+        translation, rotation = transform
+        matrix = tf.transformations.quaternion_matrix(rotation)
+        rotated = matrix.dot((x, y, z, 1.0))
+        return (
+            rotated[0] + translation[0],
+            rotated[1] + translation[1],
+            rotated[2] + translation[2],
+        )
+
+    def _tracking_tolerance(self, projected):
+        return (
+            self.projection_tracking_tolerance
+            if projected else self.goal_tolerance_xy
+        )
+
+    def _requested_goal_reached(self, current, target):
+        return goal_reached(
+            current, target, self.goal_tolerance_xy, self.goal_tolerance_yaw
+        )
+
+    def _goal_candidates(self, goal_xy, goal_yaw, start_xy=None):
+        """Generate nearby endpoints, preferring lateral doorway corrections."""
+        radius = min(
+            self.goal_projection_max_radius,
+            self.goal_tolerance_xy - self.projection_tracking_tolerance,
+        )
+        if radius <= 0.0:
+            return []
+        normal = (-math.sin(goal_yaw), math.cos(goal_yaw))
+        tangent = (math.cos(goal_yaw), math.sin(goal_yaw))
+        candidates = []
+        steps = int(math.floor(radius / self.goal_projection_step + 1e-9))
+        for ring in range(1, steps + 1):
+            distance = ring * self.goal_projection_step
+            offsets = (
+                (normal[0] * distance, normal[1] * distance),
+                (-normal[0] * distance, -normal[1] * distance),
+            )
+            for lateral_x, lateral_y in offsets:
+                candidates.append((distance, lateral_x, lateral_y))
+            for tangent_sign in (-1.0, 1.0):
+                for lateral_sign in (-1.0, 1.0):
+                    offset_x = normal[0] * distance * lateral_sign + tangent[0] * distance * tangent_sign
+                    offset_y = normal[1] * distance * lateral_sign + tangent[1] * distance * tangent_sign
+                    offset_distance = math.hypot(offset_x, offset_y)
+                    if offset_distance <= radius + 1e-9:
+                        candidates.append((offset_distance, offset_x, offset_y))
+        candidates.sort(key=lambda item: (item[0], abs(item[1] * tangent[0] + item[2] * tangent[1])))
+        points = [(goal_xy[0] + dx, goal_xy[1] + dy) for _, dx, dy in candidates]
+        if start_xy is None:
+            return points
+        # Do not select a projected endpoint materially behind the robot.
+        tangent = (math.cos(goal_yaw), math.sin(goal_yaw))
+        return [
+            point for point in points
+            if (point[0] - start_xy[0]) * tangent[0]
+            + (point[1] - start_xy[1]) * tangent[1] >= -0.05
+        ]
+
+    def _plan_goal_path(self, start_xy, goal, dynamic_cells=()):
+        """Plan to the requested goal or a safe endpoint within goal tolerance."""
         with self.lock:
             planner = self.planner
-        return None if planner is None else planner.plan(start_xy, goal_xy, dynamic_cells)
+        if planner is None:
+            return None, None, False
+        goal_xy = goal[:2]
+        route = planner.plan(start_xy, goal_xy, dynamic_cells)
+        if route is not None:
+            return route, goal, False
+        projected_routes = []
+        for candidate in self._goal_candidates(goal_xy, goal[2], start_xy):
+            route = planner.plan(start_xy, candidate, dynamic_cells)
+            if route is not None:
+                route_length = path_lengths(route)[-1] if len(route) > 1 else 0.0
+                goal_offset = math.hypot(
+                    candidate[0] - goal_xy[0], candidate[1] - goal_xy[1]
+                )
+                projected_routes.append((goal_offset, route_length, candidate, route))
+        if projected_routes:
+            _, _, candidate, route = min(
+                projected_routes, key=lambda item: (item[0], item[1])
+            )
+            return route, (candidate[0], candidate[1], goal[2]), True
+        return None, None, False
+
+    def _plan_path(self, start_xy, goal, dynamic_cells=()):
+        """make_plan and Action share goal projection and A* planning."""
+        route, _, _ = self._plan_goal_path(start_xy, goal, dynamic_cells)
+        return route
 
     def _plan_action_path(self, start_xy, goal_xy, dynamic_cells=()):
         """Keep an Action on known free cells while approaching an unknown goal."""
@@ -326,10 +438,17 @@ class NavController:
             planner = self.planner
         if planner is None:
             return None
-        route = planner.plan(start_xy, goal_xy, dynamic_cells)
+        route, _, _ = self._plan_goal_path(start_xy, goal_xy, dynamic_cells)
         if route is not None:
             return route
-        return planner.plan_toward_unknown(start_xy, goal_xy, dynamic_cells)
+        return self._plan_unknown_fallback(start_xy, goal_xy, dynamic_cells)
+
+    def _plan_unknown_fallback(self, start_xy, goal, dynamic_cells=()):
+        with self.lock:
+            planner = self.planner
+        if planner is None:
+            return None
+        return planner.plan_toward_unknown(start_xy, goal[:2], dynamic_cells)
 
     def _pose_from_message(self, msg):
         if msg.header.frame_id != self.map_frame or msg.header.stamp.is_zero():
@@ -466,10 +585,6 @@ class NavController:
             pass
         return "goal-%d" % rospy.Time.now().to_nsec()
 
-    def _lidar_to_base(self, x, y, z):
-        rotated = self.lidar_rotation.dot((x, y, z))
-        return rotated[0] + self.lidar_x, rotated[1] + self.lidar_y, rotated[2] + self.lidar_z
-
     def _is_stamp_fresh(self, stamp, timeout, now):
         if stamp.is_zero():
             return False
@@ -502,7 +617,7 @@ class NavController:
         # GetPlan 的常见零时间戳 start 请求使用最新已验证的定位位姿。
         dynamic_cells, _, obstacle_fresh = self._dynamic_obstacle_snapshot(rospy.Time.now())
         path_points = self._plan_path(
-            start[:2], goal[:2], dynamic_cells if obstacle_fresh else ()
+            start[:2], goal, dynamic_cells if obstacle_fresh else ()
         )
         if not path_points:
             return response
@@ -552,11 +667,20 @@ class NavController:
             self._finish_goal("LOCALIZATION_LOST", "读取规划起点时定位位姿已失效")
             return
         dynamic_cells, _, obstacle_fresh = self._dynamic_obstacle_snapshot(now)
-        route = self._plan_action_path(
-            current[:2], target[:2], dynamic_cells if obstacle_fresh else ()
+        route, tracking_target, projected = self._plan_goal_path(
+            current[:2], target, dynamic_cells if obstacle_fresh else ()
         )
+        if route is None:
+            route = self._plan_unknown_fallback(
+                current[:2], target, dynamic_cells if obstacle_fresh else ()
+            )
+            tracking_target = target if route is not None else None
+            projected = False
         if not route:
-            self._finish_goal("UNREACHABLE", "起点或目标位于不可通行栅格，或当前地图中无路径")
+            self._finish_goal(
+                "UNREACHABLE",
+                "原始目标及目标容差范围内的候选落点均不可达",
+            )
             return
 
         with self.lock:
@@ -567,6 +691,8 @@ class NavController:
             self.goal_start_time = now
             self.last_position = current[:2]
             self.last_progress_time = now
+            self.active_tracking_target = tracking_target
+            self.goal_projected = projected
             self._apply_route_locked(route, now)
 
         terminal_code = None
@@ -594,11 +720,14 @@ class NavController:
             route, route_generation, last_replan = self._route_snapshot()
             route_blocked = self._path_is_blocked(route, dynamic_cells if obstacle_fresh else ())
             deviation = self._path_deviation(current[:2], route)
+            with self.lock:
+                tracking_target = self.active_tracking_target or target
             route_endpoint_reached = (
                 bool(route)
                 and math.hypot(
                     current[0] - route[-1][0], current[1] - route[-1][1]
-                ) <= self.goal_tolerance_xy
+                ) <= self._tracking_tolerance(self.goal_projected)
+                and not self._requested_goal_reached(current, target)
             )
             with self.lock:
                 requested = self.clear_costmaps_requested
@@ -612,21 +741,38 @@ class NavController:
                 or (now - last_replan).to_sec() >= self.replan_period
             )
             if replan_due and (now - last_replan).to_sec() >= self.replan_min_interval:
-                route = self._plan_action_path(
-                    current[:2], target[:2], dynamic_cells if obstacle_fresh else ()
+                route, tracking_target, projected = self._plan_goal_path(
+                    current[:2], target, dynamic_cells if obstacle_fresh else ()
                 )
+                if route is None:
+                    route = self._plan_unknown_fallback(
+                        current[:2], target, dynamic_cells if obstacle_fresh else ()
+                    )
+                    tracking_target = target if route is not None else None
+                    projected = False
                 if not route:
-                    terminal_code, terminal_detail = "UNREACHABLE", "最新地图或临时障碍已阻断路径"
+                    terminal_code = "UNREACHABLE"
+                    terminal_detail = "原始目标及目标容差范围内的候选落点均被最新地图或临时障碍阻断"
                     break
                 with self.lock:
+                    self.active_tracking_target = tracking_target
+                    self.goal_projected = projected
                     self._apply_route_locked(route, now)
 
-            if goal_reached(current, target, self.goal_tolerance_xy, self.goal_tolerance_yaw):
-                terminal_code, terminal_detail = "SUCCEEDED", "已达到目标位置和最终朝向"
+            if self._requested_goal_reached(current, target):
+                terminal_code = "SUCCEEDED"
+                terminal_detail = (
+                    "已到达目标容差内的安全落点并满足最终朝向"
+                    if self.goal_projected
+                    else "已达到目标位置和最终朝向"
+                )
                 break
-            distance_to_goal = math.hypot(current[0] - target[0], current[1] - target[1])
-            yaw_error = normalize_angle(target[2] - current[2])
-            if distance_to_goal <= self.goal_tolerance_xy:
+            distance_to_goal = math.hypot(
+                current[0] - tracking_target[0], current[1] - tracking_target[1]
+            )
+            yaw_error = normalize_angle(tracking_target[2] - current[2])
+            tracking_tolerance = self._tracking_tolerance(self.goal_projected)
+            if distance_to_goal <= tracking_tolerance:
                 self._publish_velocity(0.0, self.final_yaw_gain * yaw_error)
             else:
                 linear_x, angular_z = self._path_tracking_command(current, self._route_snapshot()[0])
@@ -658,6 +804,8 @@ class NavController:
             self.active_path = []
             self.active_path_lengths = []
             self.waypoint_index = 0
+            self.active_tracking_target = None
+            self.goal_projected = False
             self.failure_code = code
             self.failure_detail = detail
             self.is_stuck = bool(stuck)

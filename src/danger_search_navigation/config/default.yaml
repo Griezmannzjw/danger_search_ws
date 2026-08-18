@@ -34,12 +34,13 @@ quaternion_norm_tolerance: 0.05
 # 若为 true，缺失、过期或帧错误的 /scan 会安全结束活动目标。
 require_obstacle_cloud: true
 
-# /scan 到 base 的部署外参与局部动态障碍筛选。点云仅做障碍保护，不用于定位。
+# /scan 到 base 的外参由消息 frame 和时间戳对应的 TF 提供。以下旧参数仅为
+# 兼容历史配置保留，navigation 不再用手工旋转变换点云。
 lidar_x: 0.20
 lidar_y: 0.00
 lidar_z: 0.08
 lidar_roll: 0.00
-lidar_pitch: 0.785
+lidar_pitch: 0.00
 lidar_yaw: 0.00
 obstacle_min_z: -0.30
 obstacle_max_z: 0.80
@@ -49,6 +50,12 @@ zero_point_radius: 0.05
 obstacle_max_points: 2000
 dynamic_stop_distance: 0.60
 dynamic_front_half_angle: 0.52
+
+# 目标被门框或临时障碍占据时，在目标容差内寻找安全落点。
+goal_projection_max_radius: 0.28
+goal_projection_step: 0.05
+# 投影终点仅用于内部跟踪；Action 仍需满足原始目标容差。
+projection_tracking_tolerance: 0.05
 
 # 非完整底盘的路径跟踪、最终朝向和有限频率重规划。
 control_rate: 20.0
