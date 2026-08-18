@@ -110,6 +110,29 @@ class TestLocalizationConfig(unittest.TestCase):
         self.assertEqual(mapper_node.attrib["type"], "occupancy_mapper.py")
         self.assertFalse(config["use_hector_correction"])
 
+    def test_gazebo_truth_source_is_explicit_and_exclusive(self):
+        launch_path = self.package_dir / "launch" / "localization.launch"
+        root = ElementTree.parse(launch_path).getroot()
+        arguments = {
+            argument.attrib["name"]: argument.attrib.get("default")
+            for argument in root.findall("arg")
+        }
+        self.assertEqual(arguments["localization_source"], "gicp")
+        self.assertEqual(arguments["gazebo_base_link"], "a1_gazebo::base")
+
+        source = launch_path.read_text()
+        self.assertIn("localization_source') == 'gicp'", source)
+        self.assertIn("localization_source') == 'gazebo_truth'", source)
+        self.assertEqual(source.count('name="lidar_odometry"'), 1)
+        self.assertEqual(source.count('name="gazebo_truth_odometry"'), 1)
+
+        truth_script = (
+            self.package_dir / "scripts" / "gazebo_truth_odometry.py"
+        ).read_text()
+        self.assertIn('"~gicp_pose_topic"', truth_script)
+        self.assertNotIn("TransformBroadcaster", truth_script)
+        self.assertNotIn("/localization/pose", truth_script)
+
     def test_pose_guard_is_wired_before_public_pose_and_mapping(self):
         config_path = self.package_dir / "config" / "default.yaml"
         config = yaml.safe_load(config_path.read_text())

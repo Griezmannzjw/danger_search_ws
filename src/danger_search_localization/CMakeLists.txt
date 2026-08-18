@@ -6,6 +6,7 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
   nav_msgs
   geometry_msgs
+  gazebo_msgs
   tf2_ros
   tf2_geometry_msgs
   danger_search_common
@@ -23,6 +24,7 @@ catkin_package(
   sensor_msgs
   nav_msgs
   geometry_msgs
+  gazebo_msgs
   tf2_ros
   tf2_geometry_msgs
   danger_search_common
@@ -50,6 +52,7 @@ catkin_install_python(PROGRAMS
   scripts/pose_estimator.py
   scripts/scan_projector.py
   scripts/occupancy_mapper.py
+  scripts/gazebo_truth_odometry.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
@@ -65,4 +68,5 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_scan_projection.py)
   catkin_add_nosetests(test/test_occupancy_mapping.py)
   catkin_add_nosetests(test/test_vertical_estimation.py)
+  catkin_add_nosetests(test/test_gazebo_truth.py)
 endif()

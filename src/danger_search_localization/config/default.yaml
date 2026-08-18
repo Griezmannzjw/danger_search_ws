@@ -19,6 +19,14 @@ validated_gicp_pose_topic: /localization/validated_pose
 raw_map_topic: /localization/raw_map
 use_hector_correction: false
 
+# SimEnv integration-test truth source. Production launch defaults to GICP.
+gazebo_link_states_topic: /gazebo/link_states
+gazebo_base_link: a1_gazebo::base
+gazebo_truth_max_age_s: 0.20
+gazebo_truth_max_future_s: 0.05
+gazebo_truth_xy_variance: 0.0001
+gazebo_truth_yaw_variance: 0.0001
+
 # 垂直低权重 SE(2) GICP 维护连续 odom->base，避免 Livox 高度层差异主导平面里程计。
 lidar_odom_voxel_size_m: 0.25
 lidar_odom_min_range_m: 0.40

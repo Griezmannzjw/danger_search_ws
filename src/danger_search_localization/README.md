@@ -4,6 +4,22 @@
 经验证位姿构建二维占据地图。Hector 受限全局修正仅是显式开启的兼容模式，不属于
 默认数据链。后端仍可在不改变公共接口的前提下替换为 FAST-LIO 或其他 LIO。
 
+### SimEnv 真值定位测试模式
+
+为隔离验证 navigation、exploration、perception 和 mission，可显式启用 Gazebo 真值
+定位。该模式读取 `/gazebo/link_states` 中的 `a1_gazebo::base`，将首次有效位姿定义为
+`(0,0,0)`，并只替代内部 `/localization/raw_pose` 来源。位姿守卫、传感器建图、公共
+状态和 `map -> odom -> base` TF 仍使用正常数据链，adapter 仍是唯一 TF 发布者。
+
+```bash
+roslaunch danger_search_bringup competition.launch \
+  localization_source:=gazebo_truth
+```
+
+这是 SimEnv 联调专用入口，不得用于正式比赛。无需开启 `ENABLE_REFEREE_ODOM` 或
+ground-truth TF；同时开启 referee odom 会造成重复 TF 发布。默认
+`localization_source:=gicp` 保持不变。
+
 ## 当前数据链
 
 ```text
@@ -39,6 +55,8 @@ POINTCLOUD_USE_GROUND_TRUTH_ODOM=0 \
 
 `ENABLE_GROUND_TRUTH=1` 仅供 SimEnv 的 `junior_ctrl` 获取步态策略观测；本包不订阅
 这些真值话题，referee 里程计和真值变换点云仍由另外两个选项禁用。
+上述约束针对默认 GICP 正式模式；只有显式 `gazebo_truth` 测试模式会读取 Gazebo
+`/gazebo/link_states`。
 
 点云投影会排除机器人自身范围；同一角度的回波先按距离聚类，只接受具有足够
 多点支持的最近表面并使用簇中位数，随后删除没有相邻连续表面支持的孤立命中。

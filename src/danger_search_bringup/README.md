@@ -28,6 +28,8 @@ SimEnv/results/detected_danger.json
 | `result_file` | `$(arg simenv_root)/results/detected_danger.json` | 可选的完整结果文件覆盖 |
 | `autostart` | `false` | 为 true 时所有预检就绪后自动开始任务 |
 | `open_main_entrance` | `true` | 调用官方服务实际打开主入口；仅隔离调试时关闭 |
+| `localization_source` | `gicp` | `gicp` 为正式默认；`gazebo_truth` 仅用于 SimEnv 模块联调 |
+| `gazebo_base_link` | `a1_gazebo::base` | 真值测试模式读取的 Gazebo link 名称 |
 
 零配置启动：
 
@@ -41,6 +43,16 @@ roslaunch danger_search_bringup competition.launch autostart:=true
 roslaunch danger_search_bringup competition.launch \
   autostart:=true simenv_root:=/absolute/path/to/SimEnv
 ```
+
+隔离定位误差、测试其他模块时可使用起点归零的 Gazebo 真值定位：
+
+```bash
+roslaunch danger_search_bringup competition.launch \
+  localization_source:=gazebo_truth
+```
+
+该参数不得用于正式比赛，也不要同时启用 SimEnv referee odom；真值节点只替换内部
+里程计来源，公共接口和传感器占据地图保持不变。
 
 ## P0 推荐流程
 

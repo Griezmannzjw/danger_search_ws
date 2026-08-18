@@ -1,6 +1,8 @@
 <launch>
   <arg name="config_file" default="$(find danger_search_localization)/config/default.yaml" />
   <arg name="use_hector_correction" default="false" />
+  <arg name="localization_source" default="gicp" />
+  <arg name="gazebo_base_link" default="a1_gazebo::base" />
 
   <!-- 只读取官方原始 /scan；不读取 /Odometry_gazebo 或真值变换后的点云。 -->
   <node name="local_scan_projector"
@@ -11,14 +13,27 @@
   </node>
 
   <!-- GICP 提供连续局部里程计，其健康状态参与 P0 readiness。 -->
-  <node name="lidar_odometry"
-        pkg="danger_search_localization"
-        type="lidar_odometry_node"
-        output="screen">
-    <rosparam command="load" file="$(arg config_file)" />
-  </node>
+  <group if="$(eval arg('localization_source') == 'gicp')">
+    <node name="lidar_odometry"
+          pkg="danger_search_localization"
+          type="lidar_odometry_node"
+          output="screen">
+      <rosparam command="load" file="$(arg config_file)" />
+    </node>
+  </group>
 
-  <group unless="$(arg use_hector_correction)">
+  <!-- SimEnv integration test only. It publishes internal odometry, never TF. -->
+  <group if="$(eval arg('localization_source') == 'gazebo_truth')">
+    <node name="gazebo_truth_odometry"
+          pkg="danger_search_localization"
+          type="gazebo_truth_odometry.py"
+          output="screen">
+      <rosparam command="load" file="$(arg config_file)" />
+      <param name="gazebo_base_link" value="$(arg gazebo_base_link)" />
+    </node>
+  </group>
+
+  <group if="$(eval arg('localization_source') == 'gazebo_truth' or not arg('use_hector_correction'))">
     <node name="local_occupancy_mapper"
           pkg="danger_search_localization"
           type="occupancy_mapper.py"
@@ -28,7 +43,7 @@
   </group>
 
   <!-- Optional compatibility backend. P0 defaults to the odometry-driven map. -->
-  <group if="$(arg use_hector_correction)">
+  <group if="$(eval arg('localization_source') == 'gicp' and arg('use_hector_correction'))">
     <node name="hector_mapping"
           pkg="hector_mapping"
           type="hector_mapping"
@@ -48,6 +63,7 @@
         type="pose_estimator.py"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
-    <param name="use_hector_correction" value="$(arg use_hector_correction)" />
+    <param name="use_hector_correction"
+           value="$(eval arg('localization_source') == 'gicp' and arg('use_hector_correction'))" />
   </node>
 </launch>
