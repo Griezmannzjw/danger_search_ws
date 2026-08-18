@@ -20,7 +20,7 @@ class MissionContractTest(unittest.TestCase):
         self.assertGreater(config["return_timeout_s"], 0)
         self.assertEqual(config["mission_timeout_s"], 0.0)
         self.assertTrue(config["entry_enabled"])
-        self.assertEqual(config["entry_step_m"], 0.4)
+        self.assertEqual(config["entry_step_m"], 0.6)
         self.assertLess(config["entry_step_m"], config["entry_distance_m"])
         self.assertEqual(config["entry_timeout_s"], 150.0)
         self.assertGreaterEqual(config["entry_max_retries"], 1)

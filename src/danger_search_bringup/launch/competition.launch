@@ -6,6 +6,7 @@
   <arg name="simenv_root" default="$(find danger_search_bringup)/../../../SimEnv" />
   <arg name="result_file" default="$(arg simenv_root)/results/detected_danger.json" />
   <arg name="autostart" default="false" />
+  <arg name="entry_enabled" default="true" />
   <arg name="open_main_entrance" default="true" />
   <arg name="use_hector_correction" default="false" />
   <arg name="localization_source" default="gicp" />
@@ -61,5 +62,6 @@
     <!-- 放在 YAML 后面，保证命令行 launch 参数拥有最高优先级。 -->
     <param name="result_file" value="$(arg result_file)" />
     <param name="autostart" value="$(arg autostart)" />
+    <param name="entry_enabled" value="$(arg entry_enabled)" />
   </node>
 </launch>

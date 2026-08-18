@@ -38,7 +38,7 @@ entry_enabled: true
 # 从门外任务起点量取的总前向进入距离；达到 distance-tolerance 后开始探索。
 entry_distance_m: 4.2
 # 每段短目标的前向增量。避免目标一次落到尚未建图的室内深处。
-entry_step_m: 0.4
+entry_step_m: 0.6
 entry_completion_tolerance_m: 0.25
 # Action 单段失败时先等待新地图，再从当前实际位姿生成下一短目标。
 entry_retry_delay_s: 1.0
