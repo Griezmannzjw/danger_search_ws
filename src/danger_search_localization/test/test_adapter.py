@@ -163,6 +163,38 @@ class TestLocalizationAdapter(unittest.TestCase):
         )
         self.assertEqual(reason, "GICP_ODOMETRY_LOST:GICP_TRACKING_LOST")
 
+    def test_pose_guard_rejection_has_specific_degraded_reason(self):
+        pose = PoseWithCovarianceStamped()
+        reason = self.adapter._status_reason(
+            pose,
+            pose_fresh=True,
+            map_fresh=True,
+            stable=False,
+            gicp_degraded=True,
+            pose_guard_degraded=True,
+            pose_guard_reason="RAW_POSE_TRANSLATION_JUMP",
+        )
+        self.assertEqual(
+            reason,
+            "POSE_GUARD_DEGRADED_HOLDING_LAST_POSE:"
+            "RAW_POSE_TRANSLATION_JUMP",
+        )
+
+    def test_pose_guard_lost_reason_takes_priority(self):
+        pose = PoseWithCovarianceStamped()
+        reason = self.adapter._status_reason(
+            pose,
+            pose_fresh=True,
+            map_fresh=True,
+            stable=False,
+            gicp_degraded=True,
+            gicp_lost=True,
+            pose_guard_degraded=True,
+            pose_guard_lost=True,
+            pose_guard_reason="RAW_POSE_YAW_JUMP",
+        )
+        self.assertEqual(reason, "POSE_GUARD_LOST:RAW_POSE_YAW_JUMP")
+
     def test_gicp_lost_tracking_state_is_lost(self):
         pose = PoseWithCovarianceStamped()
         self.assertEqual(

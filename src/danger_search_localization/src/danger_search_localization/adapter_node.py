@@ -17,6 +17,7 @@ from danger_search_common.msg import (
 )
 
 from .config import AdapterConfig
+from .pose_filter import PoseStabilizer
 from .pose_fusion import compose, HectorGicpFusion, Pose2D
 from .vertical_estimation import (
     VerticalEstimator,
@@ -42,6 +43,9 @@ class LocalizationAdapterNode:
         self.gicp_pose_topic = rospy.get_param(
             "~gicp_pose_topic", "/localization/raw_pose"
         )
+        self.validated_gicp_pose_topic = rospy.get_param(
+            "~validated_gicp_pose_topic", "/localization/validated_pose"
+        )
         self.raw_map_topic = rospy.get_param(
             "~raw_map_topic", "/localization/raw_map"
         )
@@ -60,6 +64,7 @@ class LocalizationAdapterNode:
             rospy.get_param("~use_hector_correction", False)
         )
         self.pose_fusion = HectorGicpFusion(self.config)
+        self.pose_stabilizer = PoseStabilizer(self.config)
         self.vertical_estimator = VerticalEstimator(self.config)
 
         self.lock = threading.RLock()
@@ -93,6 +98,11 @@ class LocalizationAdapterNode:
 
         self.pose_pub = rospy.Publisher(
             self.pose_topic, PoseWithCovarianceStamped, queue_size=10
+        )
+        self.validated_pose_pub = rospy.Publisher(
+            self.validated_gicp_pose_topic,
+            PoseWithCovarianceStamped,
+            queue_size=10,
         )
         self.map_pub = rospy.Publisher(
             self.map_topic, OccupancyGrid, queue_size=1, latch=True
@@ -217,32 +227,87 @@ class LocalizationAdapterNode:
             _, _, yaw = quaternion_to_rpy(
                 (orientation.x, orientation.y, orientation.z, orientation.w)
             )
+        except ValueError as exc:
+            rospy.logerr_throttle(1.0, "[localization] invalid GICP pose: %s", str(exc))
+            return
+
+        gicp_healthy = self._gicp_covariance_healthy(message)
+        if not gicp_healthy:
+            with self.lock:
+                self.gicp_consecutive_failures += 1
+                self.last_gicp_fusion_reason = "GICP_COVARIANCE_UNHEALTHY"
+            rospy.logwarn_throttle(
+                1.0,
+                "[localization] holding last trusted pose because raw GICP "
+                "covariance is unhealthy",
+            )
+            return
+
+        stamp_s = message.header.stamp.to_sec()
+        with self.lock:
+            guarded = self.pose_stabilizer.update(
+                stamp_s,
+                message.pose.pose.position.x,
+                message.pose.pose.position.y,
+                yaw,
+            )
+        if not guarded.accepted:
+            with self.lock:
+                self.gicp_consecutive_failures += 1
+                self.last_gicp_fusion_reason = (
+                    "POSE_GUARD_REJECTED:" + guarded.reason
+                )
+            rospy.logwarn_throttle(
+                1.0,
+                "[localization] rejected discontinuous GICP pose: %s "
+                "(consecutive=%d)",
+                guarded.reason,
+                guarded.consecutive_rejections,
+            )
+            return
+
+        local_pose = Pose2D(
+            guarded.pose.x,
+            guarded.pose.y,
+            guarded.pose.yaw,
+        )
+        try:
             if self.use_hector_correction:
                 with self.lock:
                     result = self.pose_fusion.update_local(
-                        message.header.stamp.to_sec(),
-                        message.pose.pose.position.x,
-                        message.pose.pose.position.y,
-                        yaw,
+                        stamp_s,
+                        local_pose.x,
+                        local_pose.y,
+                        local_pose.yaw,
                     )
         except ValueError as exc:
             rospy.logerr_throttle(1.0, "[localization] invalid GICP pose: %s", str(exc))
             return
 
-        pose = copy.deepcopy(message)
-        pose.header.frame_id = self.map_frame
         if self.use_hector_correction:
             fused_pose = result.pose
             correction = result.correction
             fusion_reason = result.reason
         else:
-            fused_pose = Pose2D(
-                message.pose.pose.position.x,
-                message.pose.pose.position.y,
-                yaw,
-            )
+            fused_pose = local_pose
             correction = Pose2D(0.0, 0.0, 0.0)
             fusion_reason = "TRACKING_GICP_LOCAL_OCCUPANCY_MAP"
+
+        validated_pose = copy.deepcopy(message)
+        validated_pose.header.frame_id = self.odom_frame
+        validated_pose.pose.pose.position.x = local_pose.x
+        validated_pose.pose.pose.position.y = local_pose.y
+        validated_pose.pose.pose.position.z = 0.0
+        local_qx, local_qy, local_qz, local_qw = quaternion_from_rpy(
+            0.0, 0.0, local_pose.yaw
+        )
+        validated_pose.pose.pose.orientation.x = local_qx
+        validated_pose.pose.pose.orientation.y = local_qy
+        validated_pose.pose.pose.orientation.z = local_qz
+        validated_pose.pose.pose.orientation.w = local_qw
+
+        pose = copy.deepcopy(validated_pose)
+        pose.header.frame_id = self.map_frame
         pose.pose.pose.position.x = fused_pose.x
         pose.pose.pose.position.y = fused_pose.y
         pose.pose.pose.position.z = 0.0
@@ -251,7 +316,7 @@ class LocalizationAdapterNode:
         pose.pose.pose.orientation.y = qy
         pose.pose.pose.orientation.z = qz
         pose.pose.pose.orientation.w = qw
-        gicp_healthy = self._gicp_covariance_healthy(message)
+        self._set_output_covariance(validated_pose, gicp_healthy)
         self._set_output_covariance(pose, gicp_healthy)
         with self.lock:
             if gicp_healthy:
@@ -260,13 +325,11 @@ class LocalizationAdapterNode:
             else:
                 self.gicp_consecutive_failures += 1
             self.latest_pose = pose
-            self.latest_local_pose = Pose2D(
-                message.pose.pose.position.x,
-                message.pose.pose.position.y,
-                yaw,
-            )
+            self.latest_local_pose = local_pose
             self.latest_map_to_odom = correction
-            self.last_gicp_fusion_reason = fusion_reason
+            self.last_gicp_fusion_reason = (
+                fusion_reason + ":" + guarded.reason
+            )
             self.last_pose_received = rospy.Time.now()
             pending_hector_pose = (
                 self.pending_hector_pose if self.use_hector_correction else None
@@ -282,6 +345,10 @@ class LocalizationAdapterNode:
                 self.pending_hector_pose = None
             else:
                 pending_hector_pose = None
+        # The mapper only sees poses that passed both the discontinuity guard
+        # and the raw GICP covariance check.  No publication means map freeze.
+        if gicp_healthy:
+            self.validated_pose_pub.publish(validated_pose)
         if pending_hector_pose is not None:
             self._backend_pose_callback(pending_hector_pose)
 
@@ -502,6 +569,8 @@ class LocalizationAdapterNode:
             hector_age = self._age(now, self.last_hector_pose_accepted)
             gicp_fusion_reason = self.last_gicp_fusion_reason
             hector_fusion_reason = self.last_hector_fusion_reason
+            pose_guard_rejections = self.pose_stabilizer.consecutive_rejections
+            pose_guard_reason = self.pose_stabilizer.last_reason
 
         pose_fresh = pose_age <= self.config.pose_fresh_timeout_s
         map_fresh = map_age <= self.config.map_fresh_timeout_s
@@ -510,10 +579,14 @@ class LocalizationAdapterNode:
             if self.use_hector_correction
             else True
         )
-        gicp_degraded = (
+        pose_guard_degraded = pose_guard_rejections > 0
+        pose_guard_lost = (
+            pose_guard_rejections >= self.config.pose_rejections_before_lost
+        )
+        gicp_degraded = pose_guard_degraded or (
             gicp_healthy_age > self.config.gicp_healthy_fresh_timeout_s
         )
-        gicp_lost = (
+        gicp_lost = pose_guard_lost or (
             gicp_healthy_age > self.config.gicp_healthy_lost_timeout_s
         )
         hector_degraded = not hector_fresh
@@ -552,6 +625,9 @@ class LocalizationAdapterNode:
             gicp_fusion_reason,
             hector_fusion_reason,
             self.use_hector_correction,
+            pose_guard_degraded,
+            pose_guard_lost,
+            pose_guard_reason,
         )
         current_floor = (
             vertical.current_floor
@@ -684,11 +760,18 @@ class LocalizationAdapterNode:
         gicp_fusion_reason="",
         hector_fusion_reason="",
         use_hector_correction=True,
+        pose_guard_degraded=False,
+        pose_guard_lost=False,
+        pose_guard_reason="",
     ):
         if pose is None:
             return "WAITING_FOR_SCAN_MATCHING_POSE"
         if not pose_fresh:
             return "SCAN_MATCHING_POSE_STALE"
+        if pose_guard_lost:
+            return "POSE_GUARD_LOST:" + pose_guard_reason
+        if pose_guard_degraded:
+            return "POSE_GUARD_DEGRADED_HOLDING_LAST_POSE:" + pose_guard_reason
         if gicp_lost:
             return "GICP_ODOMETRY_LOST:" + gicp_fusion_reason
         if gicp_degraded:

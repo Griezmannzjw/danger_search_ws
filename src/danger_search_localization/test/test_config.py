@@ -74,8 +74,15 @@ class TestLocalizationConfig(unittest.TestCase):
 
         self.assertEqual(config["backend_pose_topic"], "/localization/hector_pose")
         self.assertEqual(config["gicp_pose_topic"], "/localization/raw_pose")
+        self.assertEqual(
+            config["validated_gicp_pose_topic"],
+            "/localization/validated_pose",
+        )
         self.assertNotEqual(
             config["backend_pose_topic"], config["gicp_pose_topic"]
+        )
+        self.assertNotEqual(
+            config["gicp_pose_topic"], config["validated_gicp_pose_topic"]
         )
 
         launch_path = self.package_dir / "launch" / "localization.launch"
@@ -99,3 +106,39 @@ class TestLocalizationConfig(unittest.TestCase):
         )
         self.assertEqual(mapper_node.attrib["type"], "occupancy_mapper.py")
         self.assertFalse(config["use_hector_correction"])
+
+    def test_pose_guard_is_wired_before_public_pose_and_mapping(self):
+        config_path = self.package_dir / "config" / "default.yaml"
+        config = yaml.safe_load(config_path.read_text())
+        adapter_source = (
+            self.package_dir
+            / "src"
+            / "danger_search_localization"
+            / "adapter_node.py"
+        ).read_text()
+        mapper_source = (
+            self.package_dir
+            / "src"
+            / "danger_search_localization"
+            / "occupancy_mapper_node.py"
+        ).read_text()
+
+        self.assertIn("PoseStabilizer", adapter_source)
+        self.assertIn("self.pose_stabilizer.update", adapter_source)
+        self.assertIn("self.validated_pose_pub.publish", adapter_source)
+        self.assertIn("~validated_gicp_pose_topic", mapper_source)
+        self.assertAlmostEqual(config["pose_jump_translation_margin_m"], 0.08)
+        self.assertAlmostEqual(config["pose_jump_yaw_margin_rad"], 0.10)
+        self.assertAlmostEqual(config["pose_gate_max_dt_s"], 0.50)
+        self.assertEqual(config["pose_rejections_before_lost"], 3)
+        self.assertNotIn("pose_recovery_timeout_s", config)
+
+    def test_no_command_velocity_position_fallback_is_configured(self):
+        config_path = self.package_dir / "config" / "default.yaml"
+        config = yaml.safe_load(config_path.read_text())
+        forbidden = {
+            "command_translation_weight",
+            "use_imu_translation_constraint",
+            "use_cmd_vel_motion_constraints",
+        }
+        self.assertTrue(forbidden.isdisjoint(config))

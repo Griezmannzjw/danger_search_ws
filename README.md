@@ -10,7 +10,7 @@
 |---------|---------|
 | localization是`/tf`唯一发布者，提供`map→odom→base` | ✅ 20Hz发布，链完整 |
 | 地图有已知自由区域（非全未知） | ✅ 初始化2m半径自由区域 |
-| 定位用允许的IMU/激光，不用`cmd_vel_sent`做里程计 | ✅ GICP局部里程计 + Hector受限全局修正，IMU用于重力校正 |
+| 定位用允许的IMU/激光，不用`cmd_vel_sent`做里程计 | ✅ 默认纯 GICP 位移 + 同源占据地图；Hector 仅为可选受限修正 |
 | `make_plan`基于实际地图判断可达性，不返回无条件直线 | ✅ 膨胀占据栅格 A* |
 | 所有话题/服务/frame从ROS参数读取，无硬编码 | ✅ 全部参数化 |
 | 结果文件路径可移植 | ✅ launch自动查找同级SimEnv，可用一个参数覆盖 |
@@ -62,8 +62,8 @@
          ▼                                           │
 ┌─────────────────────┐                             │
 │  Localization       │◄────────────────────────────┘
-│  - IMU航位推算      │
-│  - 激光占据栅格     │
+│  - GICP激光里程计   │
+│  - 位姿门控/地图冻结│
 │  - 唯一TF发布者     │
 │  - 发布位姿和地图   │
 └─────────────────────┘
@@ -172,7 +172,7 @@ roslaunch danger_search_bringup competition.launch autostart:=true
 ```bash
 # 1. 检查全部运行节点
 rosnode list
-# 应看到scan projector、GICP、Hector、localization adapter及5个功能节点
+# 默认应看到scan projector、GICP、local occupancy mapper、localization adapter及5个功能节点
 
 # 2. 检查TF链是否完整
 rosrun tf view_frames && evince frames.pdf
@@ -302,7 +302,7 @@ rospack find danger_search_bringup
 
 | 模块 | P0实现 | 升级方向 | 负责人 |
 |------|--------|---------|--------|
-| localization | GICP连续里程计 + Hector受限修正和2D栅格 | LIO/回环检测、多楼层地图 | 导航组 |
+| localization | 默认 GICP连续里程计 + 同源2D栅格；可选Hector受限修正 | LIO/回环检测、多楼层地图 | 导航组 |
 | navigation | P控制器+直线避障 | 完整move_base：global planner(Dijkstra/A*) + local planner(DWA/TEB) + costmap_2d | 导航组 |
 | exploration | 最近可达前沿+自动收敛 | 信息增益、房间拓扑、多楼层电梯/楼梯 | 探索组 |
 | perception | RGB-D球体识别和map定位 | YOLO/实例分割、跨视角复核 | 识别组 |

@@ -15,6 +15,7 @@ raw_scan_topic: /scan
 projected_scan_topic: /localization/scan
 backend_pose_topic: /localization/hector_pose
 gicp_pose_topic: /localization/raw_pose
+validated_gicp_pose_topic: /localization/validated_pose
 raw_map_topic: /localization/raw_map
 use_hector_correction: false
 
@@ -138,11 +139,10 @@ pose_yaw_deadband_rad: 0.010
 pose_filter_time_constant_s: 0.15
 pose_max_linear_speed_mps: 1.0
 pose_max_angular_speed_rps: 2.0
-pose_jump_translation_margin_m: 0.25
-pose_jump_yaw_margin_rad: 0.30
-pose_gate_max_dt_s: 1.00
-pose_rejections_before_lost: 10
-pose_recovery_timeout_s: 3.0          # 连续拒绝超过此时间自动重新锚定位姿
+pose_jump_translation_margin_m: 0.08
+pose_jump_yaw_margin_rad: 0.10
+pose_gate_max_dt_s: 0.50
+pose_rejections_before_lost: 3
 
 # Hector + GICP 融合：GICP 维护 odom->base，Hector 只提供受限 map->odom 修正。
 fusion_local_history_size: 30

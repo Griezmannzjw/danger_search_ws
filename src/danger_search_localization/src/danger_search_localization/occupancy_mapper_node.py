@@ -22,7 +22,7 @@ class OccupancyMapperNode:
             "~projected_scan_topic", "/localization/scan"
         )
         self.pose_topic = rospy.get_param(
-            "~gicp_pose_topic", "/localization/raw_pose"
+            "~validated_gicp_pose_topic", "/localization/validated_pose"
         )
         self.map_topic = rospy.get_param(
             "~raw_map_topic", "/localization/raw_map"

@@ -147,7 +147,6 @@ class AdapterConfig:
     pose_jump_yaw_margin_rad: float = 0.10
     pose_gate_max_dt_s: float = 0.50
     pose_rejections_before_lost: int = 3
-    pose_recovery_timeout_s: float = 3.0
     fusion_local_history_size: int = 30
     fusion_max_pose_pair_age_s: float = 0.80
     fusion_initial_correction_translation_m: float = 0.30
@@ -211,7 +210,6 @@ class AdapterConfig:
         _require(self.pose_jump_yaw_margin_rad >= 0.0, "pose yaw margin cannot be negative")
         _require(self.pose_gate_max_dt_s > 0.0, "pose gate dt must be positive")
         _require(self.pose_rejections_before_lost >= 1, "pose rejection limit must be positive")
-        _require(self.pose_recovery_timeout_s > 0.0, "pose recovery timeout must be positive")
         _require(self.fusion_local_history_size >= 2, "fusion history must contain at least two poses")
         _require(self.fusion_max_pose_pair_age_s > 0.0, "fusion pose pair timeout must be positive")
         _require(
