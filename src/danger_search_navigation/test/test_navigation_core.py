@@ -9,6 +9,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import rospy
 import tf.transformations
 import yaml
@@ -21,13 +22,17 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 from navigation_core import (
+    DynamicObstacleTemporalFilter,
+    FootprintHistory,
     GoalState,
     InflatedOccupancyGrid,
+    PoseProgressChecker,
+    event_replan_required,
     goal_reached,
     path_lengths,
     path_progress,
 )
-from nav_controller import NavController
+from nav_controller import NavController, UrdfFootprintProvider
 
 
 def make_grid(width, height, occupied=(), unknown=(), **kwargs):
@@ -48,6 +53,159 @@ def make_grid(width, height, occupied=(), unknown=(), **kwargs):
 
 
 class InflatedOccupancyGridTest(unittest.TestCase):
+    def test_event_replan_ignores_elapsed_time_but_keeps_safety_events(self):
+        self.assertFalse(event_replan_required(False, False, False, 0.79, 0.80))
+        self.assertTrue(event_replan_required(True, False, False, 0.0, 0.80))
+        self.assertTrue(event_replan_required(False, True, False, 0.0, 0.80))
+        self.assertTrue(event_replan_required(False, False, True, 0.0, 0.80))
+        self.assertTrue(event_replan_required(False, False, False, 0.81, 0.80))
+
+    def test_blacklisted_start_can_escape_but_never_reenter(self):
+        grid = make_grid(9, 5, robot_radius=0.0)
+        blacklist = {(1, 2), (2, 2)}
+
+        route = grid.plan(
+            (1.5, 2.5), (7.5, 2.5), blacklist_cells=blacklist
+        )
+
+        self.assertIsNotNone(route)
+        route_cells = [grid.world_to_cell(*point) for point in route]
+        first_outside = next(
+            index for index, cell in enumerate(route_cells) if cell not in blacklist
+        )
+        self.assertTrue(all(
+            cell not in blacklist for cell in route_cells[first_outside:]
+        ))
+        self.assertTrue(grid.path_is_traversable(route, blacklist_cells=blacklist))
+        self.assertFalse(grid.path_is_traversable(
+            [(1.5, 2.5), (3.5, 2.5), (2.5, 2.5)],
+            blacklist_cells=blacklist,
+        ))
+
+    def test_blacklisted_goal_is_still_rejected(self):
+        grid = make_grid(7, 5, robot_radius=0.0)
+        self.assertIsNone(grid.plan(
+            (1.5, 2.5), (5.5, 2.5), blacklist_cells={(5, 2)}
+        ))
+
+    def test_blacklist_sweep_allows_monotonic_exit_only(self):
+        grid = make_grid(30, 15, robot_radius=0.0)
+        footprint = ((-0.2, -0.2), (0.2, -0.2), (0.2, 0.2), (-0.2, 0.2))
+        blacklist = {(cell_x, cell_y) for cell_x in range(4, 8) for cell_y in range(6, 9)}
+
+        safe, _ = grid.swept_path_metrics(
+            [(5.5, 7.5), (10.5, 7.5)], footprint,
+            blacklist_cells=blacklist,
+            allow_blacklist_escape=True,
+        )
+        reentering, _ = grid.trajectory_metrics(
+            [(5.5, 7.5, 0.0), (10.5, 7.5, 0.0), (5.5, 7.5, 0.0)],
+            footprint,
+            blacklist_cells=blacklist,
+            allow_blacklist_escape=True,
+        )
+
+        self.assertTrue(safe)
+        self.assertFalse(reentering)
+
+    def test_blacklist_escape_translates_before_turning(self):
+        grid = InflatedOccupancyGrid(
+            80, 40, 0.10, 0.0, 0.0, 0.0, [0] * (80 * 40),
+            robot_radius=0.0,
+        )
+        footprint = ((-0.35, -0.15), (0.30, -0.15),
+                     (0.30, 0.15), (-0.35, 0.15))
+        blacklist = {(20, 20)}
+
+        safe, _ = grid.swept_path_metrics(
+            [(2.05, 2.05), (3.05, 2.05)],
+            footprint,
+            blacklist_cells=blacklist,
+            initial_yaw=math.pi / 2.0,
+            final_yaw=0.0,
+            allow_blacklist_escape=True,
+        )
+
+        self.assertTrue(safe)
+
+    def test_vectorized_urdf_self_filter_matches_collision_volumes(self):
+        provider = UrdfFootprintProvider("", ((-0.1, -0.1), (0.1, -0.1),
+                                              (0.1, 0.1), (-0.1, 0.1)), 0.4, 0.04)
+        provider.transformed = [
+            (np.eye(4), ("box", (0.4, 0.2, 0.2))),
+            (np.eye(4), ("sphere", (0.1,))),
+        ]
+        points = ((0.0, 0.0, 0.0), (0.19, 0.09, 0.09), (0.3, 0.0, 0.0))
+
+        batch = provider.contains_many(points)
+
+        self.assertEqual(batch.tolist(), [True, True, False])
+        self.assertEqual(
+            batch.tolist(), [provider.contains(point) for point in points]
+        )
+    def test_clearance_cost_and_blacklist_are_part_of_a_star(self):
+        grid = make_grid(9, 7, robot_radius=0.0)
+        blocked = {(4, 3)}
+        route = grid.plan((1.5, 3.5), (7.5, 3.5), blacklist_cells=blocked)
+        self.assertIsNotNone(route)
+        self.assertNotIn((4, 3), [grid.world_to_cell(*point) for point in route])
+        self.assertFalse(grid.path_is_traversable(
+            [(1.5, 3.5), (4.5, 3.5)], blacklist_cells=blocked
+        ))
+
+    def test_swept_footprint_rejects_wall_corner(self):
+        grid = make_grid(20, 20, occupied=[(10, 10)], robot_radius=0.0)
+        footprint = ((-0.4, -0.3), (0.4, -0.3), (0.4, 0.3), (-0.4, 0.3))
+        safe, _ = grid.swept_path_metrics(
+            [(7.5, 10.5), (9.5, 10.5)], footprint
+        )
+        self.assertFalse(safe)
+
+    def test_swept_footprint_checks_rotation_at_path_corner(self):
+        width = height = 80
+        data = [0] * (width * height)
+        data[46 * width + 46] = 100
+        grid = InflatedOccupancyGrid(
+            width, height, 0.05, 0.0, 0.0, 0.0, data,
+            robot_radius=0.0,
+        )
+        footprint = ((-0.50, -0.10), (0.50, -0.10),
+                     (0.50, 0.10), (-0.50, 0.10))
+
+        safe, _ = grid.swept_path_metrics(
+            [(1.0, 2.0), (2.0, 2.0)], footprint, final_yaw=math.pi / 2.0
+        )
+
+        self.assertFalse(safe)
+
+    def test_recovery_prefers_backup_then_clearer_lateral(self):
+        grid = InflatedOccupancyGrid(
+            40, 40, 0.10, -2.0, -2.0, 0.0, [0] * (40 * 40),
+            robot_radius=0.0,
+        )
+        footprint = ((-0.15, -0.10), (0.15, -0.10), (0.15, 0.10), (-0.15, 0.10))
+        backup = grid.choose_recovery((0.0, 0.0, 0.0), footprint)
+        self.assertIsNotNone(backup)
+        self.assertEqual(backup.maneuver, "BACKUP")
+        self.assertGreaterEqual(backup.distance, 0.30)
+        rear = grid.world_to_cell(-0.30, 0.0)
+        left = grid.world_to_cell(0.0, 0.30)
+        lateral = grid.choose_recovery(
+            (0.0, 0.0, 0.0), footprint, dynamic_cells={rear, left}
+        )
+        self.assertIsNotNone(lateral)
+        self.assertEqual(lateral.maneuver, "STRAFE_RIGHT")
+
+
+class FootprintHistoryTest(unittest.TestCase):
+    def test_history_covers_recent_leg_sweep_and_expires(self):
+        fallback = ((-0.3, -0.1), (0.3, -0.1), (0.3, 0.1), (-0.3, 0.1))
+        history = FootprintHistory(fallback, history_seconds=0.4, padding=0.04)
+        first = history.update(1.0, fallback)
+        swept = history.update(1.2, fallback + ((0.45, 0.0),))
+        self.assertGreater(max(point[0] for point in swept), max(point[0] for point in first))
+        expired = history.current(1.7)
+        self.assertLess(max(point[0] for point in expired), 0.40)
     def test_cached_opencv_inflation_matches_reference_offsets(self):
         width = height = 9
         data = [0] * (width * height)
@@ -57,7 +215,7 @@ class InflatedOccupancyGridTest(unittest.TestCase):
             width, height, 0.05, 0.0, 0.0, 0.0, data,
             occupied_threshold=65, robot_radius=0.15, inflation_padding=0.05,
         )
-        expected = [value != 0 for value in data]
+        expected = [value < 0 or value >= 65 for value in data]
         offsets = [
             (dx, dy)
             for dy in range(-4, 5)
@@ -76,6 +234,18 @@ class InflatedOccupancyGridTest(unittest.TestCase):
             tuple(bool(value) for value in grid.inflated_blocked),
             tuple(expected),
         )
+
+    def test_occupancy_threshold_allows_low_probability_noise(self):
+        data = [0, 1, 24, 64, 65, 100, -1]
+        grid = InflatedOccupancyGrid(
+            len(data), 1, 1.0, 0.0, 0.0, 0.0, data,
+            occupied_threshold=65,
+        )
+
+        self.assertTrue(all(grid.traversable((cell_x, 0)) for cell_x in range(4)))
+        self.assertFalse(grid.traversable((4, 0)))
+        self.assertFalse(grid.traversable((5, 0)))
+        self.assertFalse(grid.traversable((6, 0)))
 
     def test_a_star_routes_around_static_obstacle(self):
         # 墙没有到达顶边，路径必须绕墙而不是直线穿越。
@@ -113,6 +283,57 @@ class InflatedOccupancyGridTest(unittest.TestCase):
         route = grid.plan((0.5, 2.5), (6.5, 2.5), dynamic_cells=[(3, 2)])
         self.assertIsNotNone(route)
         self.assertTrue(grid.path_is_traversable(route, dynamic_cells=[(3, 2)]))
+
+    def test_static_and_dynamic_inflation_radii_are_independent(self):
+        resolution = 0.05
+        width = height = 21
+        center = (10, 10)
+        data = [0] * (width * height)
+        data[center[1] * width + center[0]] = 100
+        grid = InflatedOccupancyGrid(
+            width, height, resolution, 0.0, 0.0, 0.0, data,
+            robot_radius=0.30,
+            inflation_padding=0.03,
+            dynamic_inflation_radius=0.30,
+        )
+        diagonal_cell = (15, 14)  # sqrt(0.25^2 + 0.20^2) ~= 0.320 m
+
+        self.assertFalse(grid.traversable(diagonal_cell))
+        self.assertNotIn(diagonal_cell, grid.expanded_cells([center]))
+
+    def test_dynamic_footprint_clearing_frees_start_but_not_static_obstacles(self):
+        width = height = 20
+        resolution = 0.10
+        start_cell = (10, 10)
+        dynamic_cell = (13, 10)
+        start_world = (1.05, 1.05)
+        free_grid = InflatedOccupancyGrid(
+            width, height, resolution, 0.0, 0.0, 0.0, [0] * (width * height),
+            robot_radius=0.30, dynamic_inflation_radius=0.30,
+        )
+        dynamic_blocked = free_grid.expanded_cells(
+            [dynamic_cell], dynamic_clear_world=start_world
+        )
+
+        self.assertNotIn(start_cell, dynamic_blocked)
+        self.assertIn((16, 10), dynamic_blocked)
+        self.assertTrue(free_grid.traversable(start_cell, dynamic_blocked))
+        self.assertIsNone(
+            free_grid.plan(start_world, (0.05, 1.05), [dynamic_cell])
+        )
+        self.assertIsNotNone(
+            free_grid.plan(
+                start_world, (0.05, 1.05), [dynamic_cell], start_world
+            )
+        )
+
+        static_data = [0] * (width * height)
+        static_data[start_cell[1] * width + start_cell[0]] = 100
+        static_grid = InflatedOccupancyGrid(
+            width, height, resolution, 0.0, 0.0, 0.0, static_data,
+            robot_radius=0.30, dynamic_inflation_radius=0.30,
+        )
+        self.assertFalse(static_grid.traversable(start_cell, dynamic_blocked))
 
     def test_unknown_is_blocked_without_expanding_over_free_cells(self):
         # unknown 本身不可通行，但机器人膨胀只围绕真实占据栅格。
@@ -168,7 +389,110 @@ class InflatedOccupancyGridTest(unittest.TestCase):
         self.assertIsNone(grid.plan((0.5, 0.5), (1.5, 1.5)))
 
 
+class DynamicObstacleTemporalFilterTest(unittest.TestCase):
+    def setUp(self):
+        self.cell = (7, 11)
+        self.filter = DynamicObstacleTemporalFilter(3, 2, 0.50)
+
+    def test_single_frame_cell_is_not_confirmed(self):
+        self.assertEqual(self.filter.observe(1.0, {self.cell}), set())
+
+    def test_two_hits_in_three_frames_confirm_cell(self):
+        self.filter.observe(1.0, {self.cell})
+        self.filter.observe(1.1, set())
+        self.assertEqual(self.filter.observe(1.2, {self.cell}), {self.cell})
+
+    def test_duplicate_scan_timestamp_counts_once(self):
+        self.filter.observe(1.0, {self.cell})
+        self.filter.observe(1.1, set())
+        self.assertEqual(self.filter.observe(1.0, {self.cell}), set())
+
+    def test_confirmed_cell_survives_brief_disappearance_within_ttl(self):
+        self.filter.observe(1.0, {self.cell})
+        self.filter.observe(1.1, {self.cell})
+        self.filter.observe(1.2, set())
+        self.assertEqual(self.filter.confirmed_cells(1.59), {self.cell})
+
+    def test_confirmed_cell_expires_after_ttl(self):
+        self.filter.observe(1.0, {self.cell})
+        self.filter.observe(1.1, {self.cell})
+        self.assertEqual(self.filter.confirmed_cells(1.61), set())
+
+    def test_valid_empty_frame_does_not_immediately_clear_confirmed_cell(self):
+        self.filter.observe(1.0, {self.cell})
+        self.filter.observe(1.1, {self.cell})
+        self.assertEqual(self.filter.observe(1.2, set()), {self.cell})
+
+    def test_observing_confirmed_cell_renews_its_ttl(self):
+        self.filter.observe(1.0, {self.cell})
+        self.filter.observe(1.1, {self.cell})
+        self.filter.observe(1.2, set())
+        self.filter.observe(1.3, set())
+        self.filter.observe(1.4, set())
+        self.assertEqual(self.filter.observe(1.45, {self.cell}), {self.cell})
+        self.assertEqual(self.filter.confirmed_cells(1.94), {self.cell})
+        self.assertEqual(self.filter.confirmed_cells(1.96), set())
+
+    def test_reset_clears_scan_history_and_confirmed_cells(self):
+        self.filter.observe(1.0, {self.cell})
+        self.filter.observe(1.1, {self.cell})
+        self.filter.reset()
+        self.assertEqual(self.filter.confirmed_cells(1.1), set())
+        self.assertEqual(self.filter.observe(1.2, {self.cell}), set())
+
+
 class NavigationStateTest(unittest.TestCase):
+    def test_pose_progress_checker_counts_continuous_rotation(self):
+        checker = PoseProgressChecker(0.05, 0.20, 8.0, 0.05, 0.05)
+        for step in range(31):
+            self.assertFalse(checker.update(
+                (0.0, 0.0, 0.04 * step), (0.0, 0.0, 0.20), 0.5 * step
+            ))
+        self.assertEqual(checker.mode, PoseProgressChecker.ROTATING)
+
+    def test_pose_progress_checker_retimes_translation_after_rotation(self):
+        checker = PoseProgressChecker(0.05, 0.20, 8.0, 0.05, 0.05)
+        self.assertFalse(checker.update((0.0, 0.0, 0.0), (0.0, 0.0, 0.2), 0.0))
+        self.assertFalse(checker.update((0.0, 0.0, 0.19), (0.0, 0.0, 0.2), 7.9))
+        self.assertFalse(checker.update((0.0, 0.0, 0.19), (0.1, 0.0, 0.0), 8.0))
+        self.assertFalse(checker.update((0.049, 0.0, 0.19), (0.1, 0.0, 0.0), 15.9))
+        self.assertTrue(checker.update((0.049, 0.0, 0.19), (0.1, 0.0, 0.0), 16.0))
+
+    def test_pose_progress_checker_idle_does_not_accumulate(self):
+        checker = PoseProgressChecker(0.05, 0.20, 8.0, 0.05, 0.05)
+        self.assertFalse(checker.update((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0))
+        self.assertFalse(checker.update((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 100.0))
+        self.assertEqual(checker.mode, PoseProgressChecker.IDLE)
+
+    def test_pose_progress_checker_excludes_planning_pause(self):
+        checker = PoseProgressChecker(0.05, 0.20, 8.0, 0.05, 0.05)
+        self.assertFalse(checker.update((0.0, 0.0, 0.0), (0.1, 0.0, 0.0), 0.0))
+        checker.pause(4.0)
+        checker.resume(104.0)
+        self.assertFalse(checker.update((0.0, 0.0, 0.0), (0.1, 0.0, 0.0), 107.9))
+        self.assertTrue(checker.update((0.0, 0.0, 0.0), (0.1, 0.0, 0.0), 108.0))
+
+    def test_no_valid_trajectory_uses_independent_three_second_clock(self):
+        controller = NavController.__new__(NavController)
+        controller.lock = threading.RLock()
+        controller.blocked_since = None
+        controller.blocked_recovery_timeout = 3.0
+        controller.progress_checker = PoseProgressChecker()
+        controller.goal_state = SimpleNamespace(stuck=False)
+        controller.is_stuck = False
+        pose = (0.0, 0.0, 0.0)
+        command = (0.0, 0.0, 0.0)
+
+        self.assertIsNone(controller._recovery_should_start(
+            pose, command, False, rospy.Time.from_sec(10.0)
+        ))
+        self.assertIsNone(controller._recovery_should_start(
+            pose, command, False, rospy.Time.from_sec(12.99)
+        ))
+        self.assertEqual(controller._recovery_should_start(
+            pose, command, False, rospy.Time.from_sec(13.0)
+        ), "NO_VALID_TRAJECTORY")
+
     def test_obstacle_timeout_default_covers_map_rebuild_stall(self):
         with open(
             os.path.join(PACKAGE_DIR, "config", "default.yaml"),
@@ -177,13 +501,36 @@ class NavigationStateTest(unittest.TestCase):
             config = yaml.safe_load(stream)
 
         self.assertEqual(config["obstacle_cloud_timeout"], 1.0)
+        self.assertEqual(config["dynamic_confirmation_frames"], 3)
+        self.assertEqual(config["dynamic_confirmation_hits"], 2)
+        self.assertAlmostEqual(config["dynamic_obstacle_ttl"], 0.50)
+        self.assertAlmostEqual(config["inflation_padding"], 0.0)
+        self.assertAlmostEqual(config["dynamic_inflation_radius"], 0.15)
+        self.assertAlmostEqual(config["footprint_padding"], 0.02)
+        self.assertAlmostEqual(config["clearance_soft_margin"], 0.05)
+        self.assertAlmostEqual(config["clearance_cost_weight"], 1.0)
+        self.assertAlmostEqual(config["dynamic_stop_distance"], 0.45)
         self.assertEqual(config["cruise_speed"], 0.35)
         self.assertEqual(config["max_linear_speed"], 0.35)
         self.assertAlmostEqual(config["lidar_pitch"], 0.0)
-        self.assertAlmostEqual(config["goal_projection_max_radius"], 0.28)
+        self.assertAlmostEqual(config["goal_projection_max_radius"], 0.40)
         self.assertAlmostEqual(config["goal_projection_step"], 0.05)
-        self.assertAlmostEqual(config["projection_tracking_tolerance"], 0.05)
-        self.assertAlmostEqual(config["planning_failure_tolerance_s"], 0.8)
+        self.assertAlmostEqual(config["projection_tracking_tolerance"], 0.10)
+        self.assertAlmostEqual(config["goal_tolerance_xy"], 0.45)
+        self.assertAlmostEqual(config["goal_tolerance_yaw"], 0.35)
+        self.assertAlmostEqual(config["goal_timeout"], 120.0)
+        self.assertAlmostEqual(config["planning_failure_tolerance_s"], 5.0)
+        self.assertAlmostEqual(config["replan_deviation_distance"], 0.80)
+        self.assertNotIn("replan_period", config)
+        self.assertAlmostEqual(config["progress_distance"], 0.03)
+        self.assertAlmostEqual(config["progress_angle"], 0.12)
+        self.assertAlmostEqual(config["stuck_timeout"], 12.0)
+        self.assertAlmostEqual(config["blocked_recovery_timeout"], 5.0)
+        self.assertAlmostEqual(config["recovery_speed"], 0.15)
+        self.assertAlmostEqual(config["recovery_min_distance"], 0.20)
+        self.assertAlmostEqual(config["recovery_time_allowance"], 15.0)
+        self.assertAlmostEqual(config["recovery_no_progress_timeout"], 5.0)
+        self.assertAlmostEqual(config["recovery_progress_distance"], 0.01)
 
     def test_cancel_clears_goal_and_has_zero_velocity_semantics(self):
         state = GoalState()
@@ -231,6 +578,241 @@ class NavigationStateTest(unittest.TestCase):
 
         self.assertIn("queue_size=1", text[start:finish])
 
+    def test_obstacle_footprint_contains_edges_but_not_adjacent_points(self):
+        controller = NavController.__new__(NavController)
+        controller.robot_radius = 0.30
+        controller.obstacle_footprint_min_x = -0.35
+        controller.obstacle_footprint_max_x = 0.30
+        controller.obstacle_footprint_min_y = -0.15
+        controller.obstacle_footprint_max_y = 0.15
+
+        self.assertTrue(controller._point_inside_obstacle_footprint(0.0, 0.0))
+        self.assertTrue(controller._point_inside_obstacle_footprint(0.30, 0.15))
+        self.assertTrue(controller._point_inside_obstacle_footprint(-0.35, -0.15))
+        self.assertTrue(controller._point_inside_obstacle_footprint(0.18, 0.16))
+        self.assertTrue(controller._point_inside_obstacle_footprint(0.30, 0.0))
+        self.assertFalse(controller._point_inside_obstacle_footprint(0.301, 0.0))
+        self.assertFalse(controller._point_inside_obstacle_footprint(0.0, -0.301))
+
+    def test_obstacle_callback_filters_footprint_after_tf(self):
+        controller = NavController.__new__(NavController)
+        controller.lock = threading.RLock()
+        controller.tf_listener = SimpleNamespace(
+            lookupTransform=lambda *_args: ((0.20, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        )
+        controller.base_frame = "base"
+        controller.obstacle_max_points = 100
+        controller.zero_point_radius = 0.05
+        controller.obstacle_min_z = -0.30
+        controller.obstacle_max_z = 0.80
+        controller.obstacle_range_min = 0.15
+        controller.obstacle_range_max = 8.00
+        controller.robot_radius = 0.30
+        controller.obstacle_footprint_min_x = -0.35
+        controller.obstacle_footprint_max_x = 0.30
+        controller.obstacle_footprint_min_y = -0.15
+        controller.obstacle_footprint_max_y = 0.15
+        controller.obstacle_tf_failure_count = 0
+        controller.obstacle_invalid_count = 0
+        controller.goal_state = SimpleNamespace(active=False)
+        controller.require_obstacle_cloud = False
+        controller.dynamic_obstacle_filter = DynamicObstacleTemporalFilter(3, 2, 0.50)
+        stamp = rospy.Time.from_sec(10.0)
+        cloud = SimpleNamespace(
+            header=SimpleNamespace(frame_id="laser_livox", stamp=stamp),
+            points=[
+                SimpleNamespace(x=0.10, y=0.0, z=0.0),  # TF 后位于前边界。
+                SimpleNamespace(x=-0.10, y=0.0, z=0.0),  # TF 后位于 footprint 内。
+                SimpleNamespace(x=0.11, y=0.0, z=0.0),  # TF 后刚好位于 footprint 外。
+                SimpleNamespace(x=0.31, y=0.0, z=0.0),  # 传感器坐标内，base 坐标外。
+            ],
+        )
+
+        controller.obstacle_callback(cloud)
+
+        self.assertEqual(controller.obstacle_stamp, stamp)
+        self.assertTrue(controller.obstacle_frame_valid)
+        self.assertEqual(
+            controller.latest_obstacles_base,
+            [(0.31, 0.0, 0.0), (0.51, 0.0, 0.0)],
+        )
+
+        controller.planner = InflatedOccupancyGrid(
+            40, 20, 0.10, 0.0, 0.0, 0.0, [0] * 800,
+            robot_radius=0.30, inflation_padding=0.03,
+        )
+        controller.current_pose = (1.0, 1.0, 0.0)
+        controller.obstacle_cloud_timeout = 1.0
+        controller.max_future_stamp_skew = 0.05
+        controller.dynamic_front_half_angle = 0.52
+        dynamic_cells, front_clearance, fresh = controller._dynamic_obstacle_snapshot(
+            rospy.Time.from_sec(10.5)
+        )
+        self.assertTrue(fresh)
+        # 单帧原始点必须立即触发前方净空保护，但不能直接传给 A*。
+        self.assertEqual(dynamic_cells, set())
+        self.assertAlmostEqual(front_clearance, 0.31)
+        self.assertTrue(controller.planner.plan((0.05, 1.05), (3.95, 1.05)))
+
+    def test_dynamic_snapshot_passes_only_confirmed_cells_to_a_star(self):
+        controller = NavController.__new__(NavController)
+        controller.lock = threading.RLock()
+        controller.planner = InflatedOccupancyGrid(
+            40, 20, 0.10, 0.0, 0.0, 0.0, [0] * 800,
+            robot_radius=0.30,
+            inflation_padding=0.03,
+            dynamic_inflation_radius=0.30,
+        )
+        controller.current_pose = (1.0, 1.0, 0.0)
+        controller.latest_obstacles_base = [(0.60, 0.0, 0.0)]
+        controller.obstacle_frame_valid = True
+        controller.obstacle_cloud_timeout = 1.0
+        controller.max_future_stamp_skew = 0.05
+        controller.dynamic_front_half_angle = 0.52
+        controller.dynamic_obstacle_filter = DynamicObstacleTemporalFilter(3, 2, 0.50)
+
+        controller.obstacle_stamp = rospy.Time.from_sec(10.0)
+        first_cells, first_clearance, fresh = controller._dynamic_obstacle_snapshot(
+            rospy.Time.from_sec(10.1)
+        )
+        self.assertTrue(fresh)
+        self.assertEqual(first_cells, set())
+        self.assertAlmostEqual(first_clearance, 0.60)
+
+        controller.obstacle_stamp = rospy.Time.from_sec(10.2)
+        confirmed_cells, _, fresh = controller._dynamic_obstacle_snapshot(
+            rospy.Time.from_sec(10.3)
+        )
+        self.assertTrue(fresh)
+        self.assertEqual(confirmed_cells, {(16, 10)})
+        self.assertIsNone(
+            controller.planner.plan((0.05, 1.05), (1.65, 1.05), confirmed_cells)
+        )
+
+    def test_dynamic_snapshot_filters_static_background_but_keeps_clearance(self):
+        controller = NavController.__new__(NavController)
+        controller.lock = threading.RLock()
+        data = [0] * (20 * 10)
+        data[5 * 20 + 16] = 100
+        data[5 * 20 + 19] = -1
+        controller.planner = InflatedOccupancyGrid(
+            20, 10, 0.10, 0.0, 0.0, 0.0, data,
+            robot_radius=0.30,
+            inflation_padding=0.03,
+            dynamic_inflation_radius=0.30,
+        )
+        controller.current_pose = (1.0, 0.5, 0.0)
+        # (15, 5) 位于静态膨胀区，(16, 5) 是静态占据格，(19, 5) 未知。
+        controller.latest_obstacles_base = [
+            (0.50, 0.0, 0.0), (0.60, 0.0, 0.0), (0.90, 0.0, 0.0)
+        ]
+        controller.obstacle_frame_valid = True
+        controller.obstacle_cloud_timeout = 1.0
+        controller.max_future_stamp_skew = 0.05
+        controller.dynamic_front_half_angle = 0.52
+        controller.dynamic_obstacle_filter = DynamicObstacleTemporalFilter(3, 2, 0.50)
+
+        for scan_time in (10.0, 10.2):
+            controller.obstacle_stamp = rospy.Time.from_sec(scan_time)
+            dynamic_cells, front_clearance, fresh = controller._dynamic_obstacle_snapshot(
+                rospy.Time.from_sec(scan_time + 0.1)
+            )
+            self.assertTrue(fresh)
+            self.assertEqual(dynamic_cells, set())
+            self.assertAlmostEqual(front_clearance, 0.50)
+
+    def test_confirmed_dynamic_cell_is_removed_after_static_map_update(self):
+        controller = NavController.__new__(NavController)
+        controller.lock = threading.RLock()
+        controller.planner = InflatedOccupancyGrid(
+            40, 20, 0.10, 0.0, 0.0, 0.0, [0] * 800,
+            robot_radius=0.30,
+            dynamic_inflation_radius=0.30,
+        )
+        controller.current_pose = (1.0, 1.0, 0.0)
+        controller.latest_obstacles_base = [(0.60, 0.0, 0.0)]
+        controller.obstacle_frame_valid = True
+        controller.obstacle_cloud_timeout = 1.0
+        controller.max_future_stamp_skew = 0.05
+        controller.dynamic_front_half_angle = 0.52
+        controller.dynamic_obstacle_filter = DynamicObstacleTemporalFilter(3, 2, 0.50)
+
+        for scan_time in (10.0, 10.2):
+            controller.obstacle_stamp = rospy.Time.from_sec(scan_time)
+            confirmed_cells, _, _ = controller._dynamic_obstacle_snapshot(
+                rospy.Time.from_sec(scan_time + 0.1)
+            )
+        self.assertEqual(confirmed_cells, {(16, 10)})
+
+        updated_data = [0] * 800
+        updated_data[10 * 40 + 16] = 100
+        controller.planner = InflatedOccupancyGrid(
+            40, 20, 0.10, 0.0, 0.0, 0.0, updated_data,
+            robot_radius=0.30,
+            dynamic_inflation_radius=0.30,
+        )
+        controller.latest_obstacles_base = []
+        controller.obstacle_stamp = rospy.Time.from_sec(10.3)
+        dynamic_cells, _, fresh = controller._dynamic_obstacle_snapshot(
+            rospy.Time.from_sec(10.35)
+        )
+
+        self.assertTrue(fresh)
+        self.assertEqual(dynamic_cells, set())
+
+    def test_static_wall_echoes_do_not_close_a_narrow_corridor(self):
+        controller = NavController.__new__(NavController)
+        controller.lock = threading.RLock()
+        width, height = 12, 7
+        data = [0] * (width * height)
+        for cell_x in range(width):
+            data[cell_x] = 100
+            data[(height - 1) * width + cell_x] = 100
+        controller.planner = InflatedOccupancyGrid(
+            width, height, 0.10, 0.0, 0.0, 0.0, data,
+            robot_radius=0.10,
+            dynamic_inflation_radius=0.20,
+        )
+        start = (0.15, 0.35)
+        goal = (1.05, 0.35)
+        controller.current_pose = (start[0], start[1], 0.0)
+        # 两个点分别位于上下墙的静态膨胀区；若作为动态点二次膨胀，
+        # 会在 x=5 处合并并封住整个三格宽的可通行走廊。
+        controller.latest_obstacles_base = [(0.40, -0.20, 0.0), (0.40, 0.20, 0.0)]
+        controller.obstacle_frame_valid = True
+        controller.obstacle_cloud_timeout = 1.0
+        controller.max_future_stamp_skew = 0.05
+        controller.dynamic_front_half_angle = 0.52
+        controller.dynamic_obstacle_filter = DynamicObstacleTemporalFilter(3, 2, 0.50)
+
+        self.assertTrue(controller.planner.plan(start, goal))
+        self.assertIsNone(controller.planner.plan(start, goal, {(5, 1), (5, 5)}))
+        for scan_time in (10.0, 10.2):
+            controller.obstacle_stamp = rospy.Time.from_sec(scan_time)
+            dynamic_cells, front_clearance, fresh = controller._dynamic_obstacle_snapshot(
+                rospy.Time.from_sec(scan_time + 0.1)
+            )
+
+        self.assertTrue(fresh)
+        self.assertEqual(dynamic_cells, set())
+        self.assertAlmostEqual(front_clearance, math.hypot(0.40, 0.20))
+        self.assertTrue(controller.planner.plan(start, goal, dynamic_cells))
+
+    def test_remaining_path_ignores_obstacles_behind_robot(self):
+        controller = NavController.__new__(NavController)
+        controller.lock = threading.RLock()
+        controller.waypoint_index = 0
+        controller.planner = make_grid(
+            5, 1, robot_radius=0.0, dynamic_inflation_radius=0.0
+        )
+        route = [(0.5, 0.5), (1.5, 0.5), (2.5, 0.5), (3.5, 0.5), (4.5, 0.5)]
+        current = (2.5, 0.5)
+        remaining = controller._remaining_route(current, route)
+
+        self.assertEqual(remaining, route[2:])
+        self.assertFalse(controller._path_is_blocked(remaining, {(0, 0)}, current))
+        self.assertTrue(controller._path_is_blocked(remaining, {(3, 0)}, current))
+
     def test_control_timer_publishes_zero_while_planning(self):
         controller = NavController.__new__(NavController)
         controller.lock = threading.RLock()
@@ -269,11 +851,14 @@ class NavigationStateTest(unittest.TestCase):
         controller.map_generation = 0
         controller.map_unchanged_count = 0
         controller.map_build_count = 0
+        controller.dynamic_obstacle_geometry = None
+        controller.dynamic_obstacle_filter = DynamicObstacleTemporalFilter(3, 2, 0.50)
         controller.planner = None
         controller.goal_state = SimpleNamespace(active=False)
         controller.occupied_threshold = 65
         controller.robot_radius = 0.30
         controller.inflation_padding = 0.10
+        controller.dynamic_inflation_radius = 0.30
         controller.allow_diagonal = True
         controller.max_expansions = 100
         controller.quaternion_norm_tolerance = 0.05
@@ -407,7 +992,7 @@ class NavigationGoalProjectionTest(unittest.TestCase):
 
     def test_projection_prefers_nearest_goal_offset_before_route_length(self):
         class OffsetPlanner:
-            def plan(_self, _start, candidate, _dynamic):
+            def plan(_self, _start, candidate, _dynamic, _dynamic_clear_world=None):
                 offset = math.hypot(candidate[0] - 1.0, candidate[1])
                 if offset < 1e-9:
                     return None

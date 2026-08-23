@@ -2,15 +2,18 @@
 
 单楼层 S0/P0 探索规划模块。当前目标是跑通合法选点、路径校验、导航执行、有限恢复、稳定完成判定和任务停止链路；这不是最终比赛探索算法。
 
-## S0 当前算法
+## 当前算法
 
-S0 按 `SimEnv/AGENTS.md` 采用 **最近可达简单前沿（nearest reachable frontier）**：
+节点保留简单前沿聚类，但导航目标使用前沿内侧观察位，而不是未知边界本身：
 
-1. 在当前二维占据地图中，把与未知栅格四邻接的已知自由栅格识别为前沿。
-2. 使用 8 邻域连通性聚类前沿，过滤长度小于 `min_frontier_length` 的噪声前沿。
-3. 每个前沿簇选择最接近簇质心的自由栅格作为候选，确保目标仍位于已知自由空间。
-4. 按机器人到候选的欧氏距离由近到远排序，并调用 `/move_base/make_plan` 逐个验证。
-5. 将首个返回非空路径的候选作为 `MoveBaseGoal` 发送给 navigation。
+1. 在当前二维占据地图中，把与未知栅格四邻接、占据概率低于 `free_threshold` 的已知栅格识别为前沿。
+2. 按 `connectivity_occupied_threshold` 提取静态障碍并以圆形 `connectivity_clearance_radius` 膨胀，从机器人附近自由格进行 4 邻域搜索，只保留当前连通区域内的前沿。
+3. 使用 8 邻域连通性聚类可达前沿，过滤长度小于 `min_frontier_length` 的噪声前沿。
+4. 在每个前沿簇的已知可达侧搜索距边界 `0.30-0.70 m`（默认约 `0.45 m`）的观察位，检查完整落点净空并令朝向指向未知区域。
+5. 调用 `/move_base/make_plan` 获取真实路径，拒绝穿越长期黑名单的候选，并按路径长度、整条路径最小净空和前沿信息量联合评分。
+6. 发送得分最优的观察位；允许选择稍远但更宽、更有信息量的前沿。
+
+默认连通性占据阈值为 `65`，圆形净空为 `0.30 m`，与 navigation 的静态地图规划配置一致。候选数量上限在可达区域筛选后生效；全图前沿数量仍用于区分“确实没有前沿”和“存在但当前区域不可达”。
 
 该算法是确定性的 P0 基线。按团队追加验收要求，本包在简单前沿上实现了保守自动完成：输入新鲜且健康、无活动导航目标、地图超过稳定窗口且连续多轮无可达前沿时，才发布一次完成事件。它仍不包含 WFD、信息增益和定位修正版本等完整 P1 能力。
 
@@ -20,7 +23,7 @@ S0 按 `SimEnv/AGENTS.md` 采用 **最近可达简单前沿（nearest reachable 
 - 使用 `/localization/pose`、`/mapping/status` 和 `/navigation/health` 判断输入是否就绪。
 - 调用 `/move_base/make_plan`，仅发送返回非空路径的候选。
 - 通过 `/move_base` Action 发送、监控、超时取消导航目标。
-- 对失败位置执行短期冷却，连续失败达到上限后退避，不无限重试同一候选。
+- 对普通失败位置执行 15 s 短期空间冷却。只有收到 `/navigation/recovery_event` 的失败事件或最终 `CONTROL_FAILED` 时，才把卡死点周围 `0.70 m` 内低净空通道和失败终点写入长期黑名单；暂停、成功和短期冷却都不清除。只有区域连续两个显著地图版本恢复安全净空才失效。
 - 通过 Trigger 服务幂等地启停；停止时取消全部活动目标。
 
 模块不发布 `/cmd_vel`，不实现路径跟踪，不读取真值，不汇总危险源结果，也不负责调用任务级 `/danger_search/finish`。S0 允许人工结束任务。
@@ -47,6 +50,7 @@ exploration --MoveBaseGoal--> navigation
 | `/localization/pose` | `geometry_msgs/PoseWithCovarianceStamped` |
 | `/mapping/status` | `danger_search_common/MappingStatus` |
 | `/navigation/health` | `danger_search_common/NavigationHealth` |
+| `/navigation/recovery_event` | `danger_search_common/RecoveryEvent` |
 
 发布：
 
@@ -54,6 +58,8 @@ exploration --MoveBaseGoal--> navigation
 |---|---|---|
 | `/exploration/status` | `std_msgs/String`（JSON） | `state/reason/remaining_frontier_count/known_grid_ratio/map_revision/has_active_goal` |
 | `/exploration/complete` | `std_msgs/Bool`（latched） | 每个会话开始发布 `false`，满足收敛条件后只发布一次 `true` |
+| `/exploration/observation_goals` | `geometry_msgs/PoseArray` | 当前前沿内侧观察位（RViz 诊断） |
+| `/exploration/trap_blacklist` | `nav_msgs/GridCells` | 跨目标、跨暂停保留的卡死区域（RViz 诊断） |
 
 调用：
 
@@ -89,7 +95,7 @@ roslaunch danger_search_exploration exploration.launch
 
 1. start 前不发送目标，重复 start 返回可预测成功。
 2. 地图或位姿无效、建图未稳定/丢失、导航未就绪时不发送目标。
-3. 候选来自有效前沿簇，必须在地图范围内且栅格值为 `0`，并通过非空 `make_plan` 校验。
+3. 候选来自有效前沿簇，必须在地图范围内且栅格值位于 `[0, free_threshold)`，并通过非空 `make_plan` 校验。
 4. 成功后继续选择新目标；失败、取消和超时不会无限重试同一位置。
 5. stop 取消全部目标，旧 Action 回调不能重新激活已停止的会话，重复 stop 返回可预测成功。
 6. 输入过期、地图未初始化、导航服务不可用和定位丢失分别进入明确的 WAITING/FAILED 原因，不计入无可达前沿轮次。

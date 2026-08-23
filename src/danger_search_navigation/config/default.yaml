@@ -15,11 +15,14 @@ move_base_action_name: /move_base
 make_plan_service: /move_base/make_plan
 clear_costmaps_service: /move_base/clear_costmaps
 
-# 共享 OccupancyGrid A*。未知、占据和所有非自由格均不可通行。
+# 共享 OccupancyGrid A*。未知格以及达到 occupied_threshold 的格不可通行；
+# 0..64 的低占据概率格允许通行，避免概率地图中的轻微噪声被当成实体墙。
 occupied_threshold: 65
 robot_radius: 0.30
-# SimEnv 联调先使用较小的额外余量；机器人实际硬碰撞半径仍为 0.30 m。
-inflation_padding: 0.03
+# 静态 A* 保持机器人本体半径；最终完整 footprint 扫掠仍是硬约束。
+inflation_padding: 0.00
+# 已确认 /scan 障碍仅作轻量预膨胀，最终由 footprint 扫掠复核。
+dynamic_inflation_radius: 0.15
 allow_diagonal: true
 max_planner_expansions: 75000
 
@@ -49,23 +52,41 @@ obstacle_range_min: 0.15
 obstacle_range_max: 8.00
 zero_point_radius: 0.05
 obstacle_max_points: 2000
-dynamic_stop_distance: 0.60
+# /scan 点先通过 TF 转到 base，再删除 A1 二维 footprint 内（含边界）的自体点。
+# 这里不含规划膨胀余量；footprint 外的真实近障仍须参与停车和动态障碍膨胀。
+obstacle_footprint_min_x: -0.35
+obstacle_footprint_max_x: 0.30
+obstacle_footprint_min_y: -0.15
+obstacle_footprint_max_y: 0.15
+# 规划 footprint 从 URDF 腿部 TF 动态生成；以下参数控制短时步态扫掠和保底外扩。
+footprint_padding: 0.02
+footprint_history_seconds: 0.40
+footprint_timeout: 0.50
+# A* 在硬膨胀外继续惩罚低净空单元，把路线推向通道中央。
+clearance_soft_margin: 0.05
+clearance_cost_weight: 1.0
+dynamic_stop_distance: 0.45
 dynamic_front_half_angle: 0.52
+# A* 只接收最近 3 个不同 /scan 时间戳中至少出现 2 次的动态栅格。
+# 已确认栅格在最后一次观测后保留 0.50 s；这不是点云新鲜度 timeout。
+dynamic_confirmation_frames: 3
+dynamic_confirmation_hits: 2
+dynamic_obstacle_ttl: 0.50
 
 # 目标被门框或临时障碍占据时，在目标容差内寻找安全落点。
-goal_projection_max_radius: 0.28
+goal_projection_max_radius: 0.40
 goal_projection_step: 0.05
 # 投影终点仅用于内部跟踪；Action 仍需满足原始目标容差。
-projection_tracking_tolerance: 0.05
+projection_tracking_tolerance: 0.10
 
-# 非完整底盘的路径跟踪、最终朝向和有限频率重规划。
+# 非完整底盘的路径跟踪、最终朝向和事件触发重规划。
 control_rate: 20.0
 health_rate: 5.0
-goal_timeout: 60.0
+goal_timeout: 120.0
 # 规划短暂失败时保持零速并重试的容忍时间；cmd_mux 仍独立使用 0.5 s 看门狗。
-planning_failure_tolerance_s: 0.8
-goal_tolerance_xy: 0.30
-goal_tolerance_yaw: 0.20
+planning_failure_tolerance_s: 5.0
+goal_tolerance_xy: 0.45
+goal_tolerance_yaw: 0.35
 lookahead_distance: 0.60
 cruise_speed: 0.35
 max_linear_speed: 0.35
@@ -73,9 +94,22 @@ max_angular_speed: 0.50
 rotate_in_place_angle: 0.45
 rotate_in_place_gain: 1.50
 final_yaw_gain: 1.20
-replan_period: 1.00
 replan_min_interval: 0.25
-replan_deviation_distance: 0.50
-stuck_timeout: 5.00
-progress_distance: 0.10
+replan_deviation_distance: 0.80
+stuck_timeout: 12.00
+progress_distance: 0.03
+progress_angle: 0.12
 stuck_command_speed: 0.05
+blocked_recovery_timeout: 5.00
+
+# 全向局部轨迹与有限次卡死恢复。
+local_rollout_time: 0.80
+local_lateral_speed: 0.15
+recovery_max_attempts: 2
+recovery_speed: 0.15
+recovery_target_distance: 0.40
+recovery_min_distance: 0.20
+recovery_max_distance: 0.50
+recovery_time_allowance: 15.0
+recovery_no_progress_timeout: 5.00
+recovery_progress_distance: 0.01

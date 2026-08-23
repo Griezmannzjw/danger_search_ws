@@ -9,6 +9,7 @@ map_topic: /map
 pose_topic: /localization/pose
 mapping_status_topic: /mapping/status
 navigation_health_topic: /navigation/health
+recovery_event_topic: /navigation/recovery_event
 move_base_action_name: /move_base
 make_plan_service: /move_base/make_plan
 start_service: /danger_search/start_exploration
@@ -19,14 +20,34 @@ complete_topic: /exploration/complete
 # 探索参数
 goal_interval: 2.0
 max_retry: 3
-min_frontier_length: 0.6
+min_frontier_length: 0.4
+# 已观测且占据概率低于该值的栅格可作为探索前沿。未知值 -1 始终不可达。
+free_threshold: 40
+# 前沿连通性使用与 navigation 静态规划一致的 0.30 m 本体净空。
+connectivity_occupied_threshold: 65
+connectivity_clearance_radius: 0.30
 max_frontier_candidates: 20
-goal_timeout: 60.0
+goal_timeout: 120.0
 plan_tolerance: 0.5
-failed_goal_cooldown: 30.0
-failed_goal_radius: 0.75
+failed_goal_cooldown: 15.0
+failed_goal_radius: 0.50
 dependency_check_timeout: 0.1
 input_timeout: 3.0
 no_frontier_cycles_required: 5
 map_stable_time: 8.0
 map_change_cell_threshold: 5
+
+# 前沿目标放在已知区内侧，并朝向未知区。
+observation_min_distance: 0.30
+observation_target_distance: 0.45
+observation_max_distance: 0.70
+goal_clearance_margin: 0.02
+# 使用真实路径长度、前沿信息量和路径最小净空综合排序。
+path_length_weight: 1.0
+frontier_gain_weight: 0.30
+path_clearance_weight: 0.15
+
+# 恢复触发后记住局部低净空通道，不随短期目标冷却清除。
+trap_blacklist_radius: 0.70
+trap_clearance_margin: 0.08
+blacklist_clear_revisions: 2

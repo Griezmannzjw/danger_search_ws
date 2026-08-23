@@ -19,6 +19,7 @@ add_message_files(
   FloorMapInfo.msg
   MappingStatus.msg
   NavigationHealth.msg
+  RecoveryEvent.msg
 )
 
 ## P0统一使用std_srvs/Trigger，不需要自定义srv

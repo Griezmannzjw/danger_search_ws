@@ -46,10 +46,11 @@ exploration 只有在以下条件同时成立时才能发目标：
 | 话题 | 类型 | 发布者 | 最低要求 |
 |------|------|--------|----------|
 | `/navigation/health` | `danger_search_common/NavigationHealth` | navigation | 至少真实提供 `ready`、`controller_active`、`has_active_goal`、`stuck` 和 `failure_code` |
+| `/navigation/recovery_event` | `danger_search_common/RecoveryEvent` | navigation | 恢复触发/成功/失败、动作、尝试次数、卡死与目标位姿、计划/实际距离和最小净空 |
 | `/danger_search/nav_cmd_vel` | `geometry_msgs/Twist` | navigation | 导航期望速度，只供 control 消费 |
 | `/cmd_vel` | `geometry_msgs/Twist` | control | 发送给机器人控制器的最终速度，control 是唯一发布者 |
 P0 沿用 `/danger_search/nav_cmd_vel` 和 `geometry_msgs/Twist`，不新增 `/navigation/cmd_vel`，也不改为 `TwistStamped`。只能有一套正式 navigation/control 链路对外提供 `/move_base` 和 `/cmd_vel`，禁止多个节点争抢速度输出或重复提供任务导航入口。
-取消、超时、失败或 stop 后，navigation 必须停止旧目标的速度输出，control 必须在配置的命令超时内发布零速度。`/navigation/path` 和 `/danger_search/cmd_vel_sent` 可作为诊断接口，但不属于 P0 核心契约。
+取消、超时、失败或 stop 后，navigation 必须停止旧目标的速度输出，control 必须在配置的命令超时内发布零速度。`/navigation/global_path`、`/navigation/local_trajectory`、`/navigation/footprint`、`/navigation/trap_blacklist`、`/exploration/observation_goals`、`/exploration/trap_blacklist` 和 `/danger_search/cmd_vel_sent` 可作为诊断接口，但不属于 P0 核心契约。
 ### 3.3 危险源感知
 | 话题 | 类型 | 发布者 | 最低要求 |
 |------|------|--------|----------|
