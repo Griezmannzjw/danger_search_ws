@@ -24,6 +24,7 @@ gazebo_link_states_topic: /gazebo/link_states
 gazebo_base_link: a1_gazebo::base
 gazebo_truth_max_age_s: 0.20
 gazebo_truth_max_future_s: 0.05
+gazebo_truth_history_size: 1000       # 回调乱序时按扫描时间插值历史 truth，不只使用最新帧
 gazebo_truth_xy_variance: 0.0001
 gazebo_truth_yaw_variance: 0.0001
 

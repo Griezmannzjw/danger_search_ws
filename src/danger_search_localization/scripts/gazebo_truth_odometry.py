@@ -37,6 +37,9 @@ class GazeboTruthOdometry:
             max_future_s=self._nonnegative_param(
                 "~gazebo_truth_max_future_s", 0.05
             ),
+            history_size=self._positive_int_param(
+                "~gazebo_truth_history_size", 1000
+            ),
         )
         self.lock = threading.RLock()
         self.publisher = rospy.Publisher(
@@ -68,6 +71,13 @@ class GazeboTruthOdometry:
         if not math.isfinite(value) or value < 0.0:
             raise rospy.ROSInitException("%s must be non-negative and finite" % name)
         return value
+
+    @staticmethod
+    def _positive_int_param(name, default):
+        value = rospy.get_param(name, default)
+        if int(value) != value or int(value) < 2:
+            raise rospy.ROSInitException("%s must be an integer of at least two" % name)
+        return int(value)
 
     def _link_states_callback(self, message):
         try:

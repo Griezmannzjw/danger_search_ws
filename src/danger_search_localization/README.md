@@ -10,6 +10,9 @@
 定位。该模式读取 `/gazebo/link_states` 中的 `a1_gazebo::base`，将首次有效位姿定义为
 `(0,0,0)`，并只替代内部 `/localization/raw_pose` 来源。位姿守卫、传感器建图、公共
 状态和 `map -> odom -> base` TF 仍使用正常数据链，adapter 仍是唯一 TF 发布者。
+`LinkStates` 没有消息时间戳，因此节点用接收时的仿真时间保存最近 1000 个 truth
+位姿，并复用扫描投影模块的 SE(2) 插值按 `/scan.header.stamp` 配对；ROS 回调乱序时
+不再拿“最新 truth”冒充扫描时刻，也不会仅因最新 truth 提前超过 50 ms 丢弃扫描。
 
 ```bash
 roslaunch danger_search_bringup competition.launch \

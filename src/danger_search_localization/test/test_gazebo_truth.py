@@ -56,6 +56,18 @@ class TestGazeboTruth(unittest.TestCase):
         self.assertIsNotNone(core.pose_at(10.2))
         self.assertIsNotNone(core.pose_at(9.95))
 
+    def test_pose_at_interpolates_history_when_latest_truth_is_newer(self):
+        core = GazeboTruthCore(max_age_s=0.2, max_future_s=0.05)
+        core.update(10.0, 0.0, 0.0, 0.0)
+        core.update(10.1, 1.0, 0.0, 0.1)
+        core.update(10.2, 2.0, 0.0, 0.2)
+
+        x, y, yaw = core.pose_at(10.05)
+
+        self.assertAlmostEqual(x, 0.5)
+        self.assertAlmostEqual(y, 0.0)
+        self.assertAlmostEqual(yaw, 0.05)
+
     def test_time_rollback_reanchors_pose(self):
         core = GazeboTruthCore()
         core.update(10.0, 1.0, 2.0, 0.3)
@@ -69,6 +81,8 @@ class TestGazeboTruth(unittest.TestCase):
     def test_invalid_inputs_are_rejected(self):
         with self.assertRaises(ValueError):
             GazeboTruthCore(max_age_s=0.0)
+        with self.assertRaises(ValueError):
+            GazeboTruthCore(history_size=1)
         with self.assertRaises(ValueError):
             quaternion_yaw(0.0, 0.0, 0.0, 0.0)
         with self.assertRaises(ValueError):

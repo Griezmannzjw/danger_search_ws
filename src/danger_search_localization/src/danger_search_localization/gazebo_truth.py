@@ -1,7 +1,10 @@
 """ROS-independent planar pose handling for the Gazebo truth test source."""
 
+from collections import deque
 from dataclasses import dataclass
 import math
+
+from .scan_projection import interpolate_planar_pose
 
 
 def normalize_angle(angle):
@@ -54,19 +57,23 @@ class TruthSample:
 class GazeboTruthCore:
     """Capture a start frame and serve fresh relative planar truth poses."""
 
-    def __init__(self, max_age_s=0.20, max_future_s=0.05):
+    def __init__(self, max_age_s=0.20, max_future_s=0.05, history_size=1000):
         self.max_age_s = float(max_age_s)
         self.max_future_s = float(max_future_s)
         if not math.isfinite(self.max_age_s) or self.max_age_s <= 0.0:
             raise ValueError("max_age_s must be positive and finite")
         if not math.isfinite(self.max_future_s) or self.max_future_s < 0.0:
             raise ValueError("max_future_s must be non-negative and finite")
+        if int(history_size) != history_size or int(history_size) < 2:
+            raise ValueError("history_size must be an integer of at least two")
         self.origin = None
         self.latest = None
+        self.history = deque(maxlen=int(history_size))
 
     def reset(self):
         self.origin = None
         self.latest = None
+        self.history.clear()
 
     def update(self, stamp_s, x, y, yaw):
         values = tuple(float(value) for value in (stamp_s, x, y, yaw))
@@ -78,17 +85,49 @@ class GazeboTruthCore:
         yaw = normalize_angle(yaw)
         if self.origin is None:
             self.origin = (x, y, yaw)
-        self.latest = TruthSample(stamp_s, x, y, yaw)
+        sample = TruthSample(stamp_s, x, y, yaw)
+        if self.history and abs(stamp_s - self.history[-1].stamp_s) <= 1e-9:
+            self.history[-1] = sample
+        else:
+            self.history.append(sample)
+        self.latest = sample
 
     def pose_at(self, stamp_s):
         stamp_s = float(stamp_s)
-        if not math.isfinite(stamp_s) or self.latest is None or self.origin is None:
+        if (not math.isfinite(stamp_s) or self.latest is None
+                or self.origin is None or not self.history):
             return None
-        age = stamp_s - self.latest.stamp_s
         epsilon = 1e-9
-        if age > self.max_age_s + epsilon or age < -self.max_future_s - epsilon:
+        oldest = self.history[0]
+        latest = self.history[-1]
+        if stamp_s > latest.stamp_s + self.max_age_s + epsilon:
             return None
+        if stamp_s < oldest.stamp_s - self.max_future_s - epsilon:
+            return None
+
+        if stamp_s <= oldest.stamp_s + epsilon:
+            selected = (oldest.x, oldest.y, oldest.yaw)
+        elif stamp_s >= latest.stamp_s - epsilon:
+            selected = (latest.x, latest.y, latest.yaw)
+        else:
+            selected = None
+            previous = oldest
+            for following in tuple(self.history)[1:]:
+                if following.stamp_s + epsilon >= stamp_s:
+                    span = following.stamp_s - previous.stamp_s
+                    ratio = 0.0 if span <= epsilon else (
+                        stamp_s - previous.stamp_s
+                    ) / span
+                    selected = interpolate_planar_pose(
+                        (previous.x, previous.y, previous.yaw),
+                        (following.x, following.y, following.yaw),
+                        ratio,
+                    )
+                    break
+                previous = following
+            if selected is None:
+                return None
         return relative_planar_pose(
             self.origin,
-            (self.latest.x, self.latest.y, self.latest.yaw),
+            selected,
         )
