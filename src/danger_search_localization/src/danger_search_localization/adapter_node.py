@@ -7,8 +7,9 @@ import threading
 import rospy
 import tf2_ros
 from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import Imu
+from std_msgs.msg import Header
 
 from danger_search_common.msg import (
     FloorMapInfo,
@@ -27,6 +28,51 @@ from .vertical_estimation import (
     quaternion_to_rpy,
     rotate_vector,
 )
+
+
+class LocalVelocityEstimator:
+    """Differentiate trusted odom-frame poses into a base-frame planar twist."""
+
+    def __init__(self, max_dt_s=0.50):
+        if not math.isfinite(max_dt_s) or max_dt_s <= 0.0:
+            raise ValueError("max odometry differentiation interval must be positive")
+        self.max_dt_s = float(max_dt_s)
+        self.previous = None
+
+    @staticmethod
+    def _angle_delta(current, previous):
+        return math.atan2(
+            math.sin(current - previous), math.cos(current - previous)
+        )
+
+    def update(self, stamp_s, pose):
+        values = (stamp_s, pose.x, pose.y, pose.yaw)
+        if not all(math.isfinite(value) for value in values):
+            self.previous = None
+            return (0.0, 0.0, 0.0), True
+
+        current = (float(stamp_s), float(pose.x), float(pose.y), float(pose.yaw))
+        if self.previous is None:
+            self.previous = current
+            return (0.0, 0.0, 0.0), True
+
+        previous = self.previous
+        dt = current[0] - previous[0]
+        if dt <= 0.0:
+            # Do not replace a newer reference with an out-of-order sample.
+            return (0.0, 0.0, 0.0), True
+        self.previous = current
+        if dt > self.max_dt_s:
+            return (0.0, 0.0, 0.0), True
+
+        odom_vx = (current[1] - previous[1]) / dt
+        odom_vy = (current[2] - previous[2]) / dt
+        cosine = math.cos(current[3])
+        sine = math.sin(current[3])
+        base_vx = cosine * odom_vx + sine * odom_vy
+        base_vy = -sine * odom_vx + cosine * odom_vy
+        yaw_rate = self._angle_delta(current[3], previous[3]) / dt
+        return (base_vx, base_vy, yaw_rate), False
 
 
 class LocalizationAdapterNode:
@@ -49,8 +95,14 @@ class LocalizationAdapterNode:
         self.raw_map_topic = rospy.get_param(
             "~raw_map_topic", "/localization/raw_map"
         )
+        self.mapping_pause_topic = rospy.get_param(
+            "~mapping_pause_topic", "/localization/mapping_pause"
+        )
         self.pose_topic = rospy.get_param(
             "~pose_topic", "/localization/pose"
+        )
+        self.odom_topic = rospy.get_param(
+            "~odom_topic", "/localization/odom"
         )
         self.map_topic = rospy.get_param("~map_topic", "/map")
         self.mapping_status_topic = rospy.get_param(
@@ -66,6 +118,30 @@ class LocalizationAdapterNode:
         self.pose_fusion = HectorGicpFusion(self.config)
         self.pose_stabilizer = PoseStabilizer(self.config)
         self.vertical_estimator = VerticalEstimator(self.config)
+        self.odom_velocity_max_dt_s = float(
+            rospy.get_param("~odom_velocity_max_dt_s", 0.50)
+        )
+        self.odom_velocity_stale_timeout_s = float(
+            rospy.get_param("~odom_velocity_stale_timeout_s", 0.50)
+        )
+        self.odom_twist_variance = float(
+            rospy.get_param("~odom_twist_variance", 0.02)
+        )
+        self.odom_twist_degraded_variance = float(
+            rospy.get_param("~odom_twist_degraded_variance", 1.0)
+        )
+        odom_values = (
+            self.odom_velocity_max_dt_s,
+            self.odom_velocity_stale_timeout_s,
+            self.odom_twist_variance,
+            self.odom_twist_degraded_variance,
+        )
+        if (not all(math.isfinite(value) and value > 0.0 for value in odom_values)
+                or self.odom_twist_degraded_variance < self.odom_twist_variance):
+            raise rospy.ROSInitException("invalid localization odometry parameters")
+        self.velocity_estimator = LocalVelocityEstimator(
+            self.odom_velocity_max_dt_s
+        )
 
         self.lock = threading.RLock()
         self.latest_pose = None
@@ -76,6 +152,9 @@ class LocalizationAdapterNode:
         self.last_map_received = rospy.Time(0)
         self.last_public_map_published = rospy.Time(0)
         self.last_map_update = rospy.Time(0)
+        self.last_map_load_time = rospy.Time(0)
+        self.map_reset_pending = False
+        self.last_mapping_pause_received = rospy.Time(0)
         self.map_version = 0
         self.map_update_count = 0
         self.last_map_stamp = rospy.Time(0)
@@ -84,6 +163,9 @@ class LocalizationAdapterNode:
         self.base_from_imu_quaternion = None
         self.latest_local_pose = None
         self.latest_map_to_odom = Pose2D(0.0, 0.0, 0.0)
+        self.latest_local_velocity = (0.0, 0.0, 0.0)
+        self.latest_local_velocity_degraded = True
+        self.last_local_velocity_received = rospy.Time(0)
         self.last_tf_stamp = rospy.Time(0)
         self.gicp_consecutive_failures = 0
         self.hector_consecutive_rejections = 0
@@ -98,6 +180,9 @@ class LocalizationAdapterNode:
 
         self.pose_pub = rospy.Publisher(
             self.pose_topic, PoseWithCovarianceStamped, queue_size=10
+        )
+        self.odom_pub = rospy.Publisher(
+            self.odom_topic, Odometry, queue_size=10
         )
         self.validated_pose_pub = rospy.Publisher(
             self.validated_gicp_pose_topic,
@@ -135,6 +220,10 @@ class LocalizationAdapterNode:
             OccupancyGrid,
             self._map_callback,
             queue_size=1,
+        )
+        self.mapping_pause_sub = rospy.Subscriber(
+            self.mapping_pause_topic, Header, self._mapping_pause_callback,
+            queue_size=10,
         )
         self.imu_sub = rospy.Subscriber(
             self.config.imu_topic,
@@ -271,6 +360,25 @@ class LocalizationAdapterNode:
             guarded.pose.y,
             guarded.pose.yaw,
         )
+        raw_position = message.pose.pose.position
+        raw_delta_xy = math.hypot(
+            local_pose.x - float(raw_position.x),
+            local_pose.y - float(raw_position.y),
+        )
+        raw_delta_yaw = abs(math.atan2(
+            math.sin(local_pose.yaw - yaw), math.cos(local_pose.yaw - yaw)
+        ))
+        rospy.loginfo_throttle(
+            2.0,
+            "[localization] canonical/raw pose delta: mode=%s xy=%.4fm yaw=%.3fdeg",
+            self.config.pose_stabilizer_mode,
+            raw_delta_xy,
+            math.degrees(raw_delta_yaw),
+        )
+        with self.lock:
+            local_velocity, velocity_degraded = self.velocity_estimator.update(
+                stamp_s, local_pose
+            )
         try:
             if self.use_hector_correction:
                 with self.lock:
@@ -326,6 +434,9 @@ class LocalizationAdapterNode:
                 self.gicp_consecutive_failures += 1
             self.latest_pose = pose
             self.latest_local_pose = local_pose
+            self.latest_local_velocity = local_velocity
+            self.latest_local_velocity_degraded = velocity_degraded
+            self.last_local_velocity_received = rospy.Time.now()
             self.latest_map_to_odom = correction
             self.last_gicp_fusion_reason = (
                 fusion_reason + ":" + guarded.reason
@@ -364,10 +475,27 @@ class LocalizationAdapterNode:
         now = rospy.Time.now()
         with self.lock:
             self.last_map_received = now
+            load_time = message.info.map_load_time
+            previous_load_time = getattr(self, "last_map_load_time", rospy.Time(0))
+            if (
+                previous_load_time != rospy.Time(0)
+                and load_time != rospy.Time(0)
+                and load_time != previous_load_time
+            ):
+                self.map_update_count = 0
+                self.last_map_stamp = rospy.Time(0)
+                self.map_reset_pending = True
+                self.last_map_update = now
+                rospy.logwarn("[localization] detected occupancy map reset epoch")
+            self.last_map_load_time = load_time
             # rospy delivers a new message object per callback. Keep that immutable
             # snapshot directly; copying a 1024x1024 grid twice starves sensor callbacks.
             self.latest_raw_map = message
         self._publish_cached_map_if_safe()
+
+    def _mapping_pause_callback(self, _message):
+        with self.lock:
+            self.last_mapping_pause_received = rospy.Time.now()
 
     def _publish_cached_map_if_safe(self, now=None):
         now = now or rospy.Time.now()
@@ -399,7 +527,10 @@ class LocalizationAdapterNode:
                 if stamp != self.last_map_stamp:
                     self.last_map_stamp = stamp
                     self.map_version += 1
-                    self.map_update_count += 1
+                    if self.map_reset_pending:
+                        self.map_reset_pending = False
+                    else:
+                        self.map_update_count += 1
                     self.last_map_update = stamp or rospy.Time.now()
                     self.last_public_map_published = now
             self.map_pub.publish(message)
@@ -486,6 +617,9 @@ class LocalizationAdapterNode:
             vertical = self.vertical_estimator.snapshot()
             local_pose = self.latest_local_pose
             correction = self.latest_map_to_odom
+            local_velocity = self.latest_local_velocity
+            velocity_degraded = self.latest_local_velocity_degraded
+            velocity_received = self.last_local_velocity_received
         if pose is None:
             return
         # The cached GICP measurement may be older than the adapter timer.
@@ -511,6 +645,18 @@ class LocalizationAdapterNode:
 
         if local_pose is None:
             return
+        velocity_stale = (
+            velocity_received == rospy.Time(0)
+            or self._age(pose_stamp, velocity_received)
+            > self.odom_velocity_stale_timeout_s
+        )
+        self._publish_odometry(
+            pose_stamp,
+            local_pose,
+            vertical,
+            (0.0, 0.0, 0.0) if velocity_stale else local_velocity,
+            velocity_degraded or velocity_stale,
+        )
         # Hector and perception query TF at sensor timestamps that can lead the
         # adapter timer under simulation load. A short, bounded future stamp is
         # the standard ROS transform-tolerance pattern for this scheduling gap.
@@ -550,6 +696,43 @@ class LocalizationAdapterNode:
         odom_to_base.transform.rotation.w = qw
         self.tf_broadcaster.sendTransform([map_to_odom, odom_to_base])
 
+    def _publish_odometry(self, stamp, local_pose, vertical, velocity, degraded):
+        message = Odometry()
+        message.header.stamp = stamp
+        message.header.frame_id = self.odom_frame
+        message.child_frame_id = self.base_frame
+        message.pose.pose.position.x = local_pose.x
+        message.pose.pose.position.y = local_pose.y
+        if self.config.vertical_estimation_enabled and vertical.initialized:
+            message.pose.pose.position.z = vertical.z
+            qx, qy, qz, qw = quaternion_from_rpy(
+                vertical.roll, vertical.pitch, local_pose.yaw
+            )
+        else:
+            qx, qy, qz, qw = quaternion_from_rpy(0.0, 0.0, local_pose.yaw)
+        message.pose.pose.orientation.x = qx
+        message.pose.pose.orientation.y = qy
+        message.pose.pose.orientation.z = qz
+        message.pose.pose.orientation.w = qw
+        message.twist.twist.linear.x = velocity[0]
+        message.twist.twist.linear.y = velocity[1]
+        message.twist.twist.angular.z = velocity[2]
+
+        for index in (0, 7):
+            message.pose.covariance[index] = self.config.fallback_xy_variance
+        message.pose.covariance[35] = self.config.fallback_yaw_variance
+        for index in (14, 21, 28):
+            message.pose.covariance[index] = self.config.fallback_unobserved_variance
+        twist_variance = (
+            self.odom_twist_degraded_variance
+            if degraded else self.odom_twist_variance
+        )
+        for index in (0, 7, 35):
+            message.twist.covariance[index] = twist_variance
+        for index in (14, 21, 28):
+            message.twist.covariance[index] = self.config.fallback_unobserved_variance
+        self.odom_pub.publish(message)
+
     def _publish_status(self, _event=None):
         now = rospy.Time.now()
         with self.lock:
@@ -559,6 +742,7 @@ class LocalizationAdapterNode:
             map_version = self.map_version
             map_update_count = self.map_update_count
             last_map_update = self.last_map_update
+            mapping_pause_received = self.last_mapping_pause_received
             vertical = self.vertical_estimator.snapshot()
             fusion_initialized = (
                 self.pose_fusion.initialized
@@ -573,7 +757,17 @@ class LocalizationAdapterNode:
             pose_guard_reason = self.pose_stabilizer.last_reason
 
         pose_fresh = pose_age <= self.config.pose_fresh_timeout_s
-        map_fresh = map_age <= self.config.map_fresh_timeout_s
+        mapping_paused = (
+            self._age(now, mapping_pause_received)
+            <= self.config.mapping_pause_timeout_s
+        )
+        map_fresh = (
+            map_age <= self.config.map_fresh_timeout_s
+            or (
+                mapping_paused
+                and map_update_count >= self.config.min_map_updates_for_stable
+            )
+        )
         hector_fresh = (
             hector_age <= self.config.hector_pose_fresh_timeout_s
             if self.use_hector_correction
@@ -628,6 +822,7 @@ class LocalizationAdapterNode:
             pose_guard_degraded,
             pose_guard_lost,
             pose_guard_reason,
+            mapping_paused,
         )
         current_floor = (
             vertical.current_floor
@@ -763,6 +958,7 @@ class LocalizationAdapterNode:
         pose_guard_degraded=False,
         pose_guard_lost=False,
         pose_guard_reason="",
+        mapping_paused=False,
     ):
         if pose is None:
             return "WAITING_FOR_SCAN_MATCHING_POSE"
@@ -780,6 +976,8 @@ class LocalizationAdapterNode:
             return "HECTOR_CORRECTION_DEGRADED:" + hector_fusion_reason
         if not map_fresh:
             return "MAP_STALE"
+        if mapping_paused:
+            return "MAPPING_PAUSED_HIGH_ANGULAR_RATE"
         if not stable:
             return "WAITING_FOR_STABLE_MAP"
         if not vertical_fresh:

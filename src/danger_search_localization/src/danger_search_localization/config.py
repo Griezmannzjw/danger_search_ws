@@ -46,6 +46,12 @@ class ScanProjectionConfig:
     min_valid_scan_bins: int = 8
     min_angular_coverage_rad: float = 0.03
     drop_unstable_scans: bool = True
+    mapping_scan_topic: str = "/localization/mapping_scan"
+    mapping_pause_topic: str = "/localization/mapping_pause"
+    mapping_pause_enter_yaw_rate_rps: float = 0.35
+    mapping_pause_exit_yaw_rate_rps: float = 0.20
+    mapping_pause_stable_hold_s: float = 0.50
+    mapping_resume_min_frames: int = 3
 
     def __post_init__(self):
         _require(self.angle_min < self.angle_max, "scan angle range is invalid")
@@ -118,6 +124,28 @@ class ScanProjectionConfig:
             self.min_angular_coverage_rad > 0.0,
             "min_angular_coverage_rad must be positive",
         )
+        _require(bool(self.mapping_scan_topic), "mapping scan topic cannot be empty")
+        _require(bool(self.mapping_pause_topic), "mapping pause topic cannot be empty")
+        _require(
+            math.isfinite(self.mapping_pause_enter_yaw_rate_rps)
+            and self.mapping_pause_enter_yaw_rate_rps > 0.0,
+            "mapping pause enter yaw rate must be positive",
+        )
+        _require(
+            math.isfinite(self.mapping_pause_exit_yaw_rate_rps)
+            and 0.0 <= self.mapping_pause_exit_yaw_rate_rps
+            < self.mapping_pause_enter_yaw_rate_rps,
+            "mapping pause exit yaw rate must be below enter yaw rate",
+        )
+        _require(
+            math.isfinite(self.mapping_pause_stable_hold_s)
+            and self.mapping_pause_stable_hold_s >= 0.0,
+            "mapping pause stable hold cannot be negative",
+        )
+        _require(
+            self.mapping_resume_min_frames >= 1,
+            "mapping resume frame count must be positive",
+        )
 
     @property
     def bin_count(self):
@@ -141,6 +169,8 @@ class AdapterConfig:
     pose_position_deadband_m: float = 0.015
     pose_yaw_deadband_rad: float = 0.010
     pose_filter_time_constant_s: float = 0.15
+    pose_stabilizer_mode: str = "filtered_anchored"
+    mapping_pause_timeout_s: float = 0.35
     pose_max_linear_speed_mps: float = 1.0
     pose_max_angular_speed_rps: float = 2.0
     pose_jump_translation_margin_m: float = 0.08
@@ -204,6 +234,15 @@ class AdapterConfig:
         _require(self.pose_position_deadband_m >= 0.0, "pose deadband cannot be negative")
         _require(self.pose_yaw_deadband_rad >= 0.0, "yaw deadband cannot be negative")
         _require(self.pose_filter_time_constant_s > 0.0, "pose filter time constant must be positive")
+        _require(
+            self.pose_stabilizer_mode in ("filtered_anchored", "trusted_passthrough"),
+            "pose stabilizer mode is invalid",
+        )
+        _require(
+            math.isfinite(self.mapping_pause_timeout_s)
+            and self.mapping_pause_timeout_s > 0.0,
+            "mapping pause timeout must be positive",
+        )
         _require(self.pose_max_linear_speed_mps > 0.0, "maximum pose speed must be positive")
         _require(self.pose_max_angular_speed_rps > 0.0, "maximum pose yaw rate must be positive")
         _require(self.pose_jump_translation_margin_m >= 0.0, "pose jump margin cannot be negative")

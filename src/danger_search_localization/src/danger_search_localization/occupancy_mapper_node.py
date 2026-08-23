@@ -8,6 +8,7 @@ import rospy
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
+from std_srvs.srv import Empty, EmptyResponse
 
 from .occupancy_mapping import OccupancyMapperCore, OccupancyMappingConfig
 
@@ -19,13 +20,16 @@ class OccupancyMapperNode:
         self.odom_frame = rospy.get_param("~odom_frame", "odom")
         self.base_frame = rospy.get_param("~base_frame", "base")
         self.scan_topic = rospy.get_param(
-            "~projected_scan_topic", "/localization/scan"
+            "~mapping_scan_topic", "/localization/mapping_scan"
         )
         self.pose_topic = rospy.get_param(
             "~validated_gicp_pose_topic", "/localization/validated_pose"
         )
         self.map_topic = rospy.get_param(
             "~raw_map_topic", "/localization/raw_map"
+        )
+        self.reset_map_service = rospy.get_param(
+            "~reset_map_service", "/localization/reset_map"
         )
         self.unhealthy_variance = float(
             rospy.get_param("~gicp_unhealthy_variance_threshold", 1.0)
@@ -58,6 +62,7 @@ class OccupancyMapperNode:
         self.scan_cache = {}
         self.last_scan_stamp = rospy.Time(0)
         self.map_dirty = False
+        self.map_load_time = rospy.Time.now()
 
         self.publisher = rospy.Publisher(
             self.map_topic, OccupancyGrid, queue_size=1, latch=True
@@ -71,11 +76,14 @@ class OccupancyMapperNode:
         self.scan_subscriber = rospy.Subscriber(
             self.scan_topic, LaserScan, self._scan_callback, queue_size=10
         )
+        self.reset_service = rospy.Service(
+            self.reset_map_service, Empty, self._reset_map_callback
+        )
         self.timer = rospy.Timer(
             rospy.Duration(self.publish_period), self._publish_map
         )
         rospy.loginfo(
-            "[localization] trusted GICP occupancy mapper: %s + %s -> %s",
+            "[localization] canonical occupancy mapper: %s + %s -> %s",
             self.pose_topic,
             self.scan_topic,
             self.map_topic,
@@ -155,19 +163,39 @@ class OccupancyMapperNode:
         with self.lock:
             if self.core.update_count == 0:
                 return
-            message = OccupancyGrid()
-            message.header.stamp = self.last_scan_stamp
-            message.header.frame_id = self.map_frame
-            message.info.map_load_time = self.last_scan_stamp
-            message.info.resolution = self.config.resolution
-            message.info.width = self.config.size
-            message.info.height = self.config.size
-            message.info.origin.position.x = self.core.origin_x
-            message.info.origin.position.y = self.core.origin_y
-            message.info.origin.orientation.w = 1.0
-            message.data = self.core.occupancy_data()
+            message = self._map_message_locked(self.last_scan_stamp)
             self.map_dirty = False
         self.publisher.publish(message)
+
+    def _reset_map_callback(self, _request):
+        now = rospy.Time.now()
+        with self.lock:
+            if now <= self.map_load_time:
+                now = self.map_load_time + rospy.Duration.from_sec(1e-9)
+            self.core = OccupancyMapperCore(self.config)
+            self.pose_cache.clear()
+            self.scan_cache.clear()
+            self.last_scan_stamp = now
+            self.map_load_time = now
+            self.map_dirty = False
+            message = self._map_message_locked(now)
+        self.publisher.publish(message)
+        rospy.logwarn("[localization] occupancy map reset by service request")
+        return EmptyResponse()
+
+    def _map_message_locked(self, stamp):
+        message = OccupancyGrid()
+        message.header.stamp = stamp
+        message.header.frame_id = self.map_frame
+        message.info.map_load_time = self.map_load_time
+        message.info.resolution = self.config.resolution
+        message.info.width = self.config.size
+        message.info.height = self.config.size
+        message.info.origin.position.x = self.core.origin_x
+        message.info.origin.position.y = self.core.origin_y
+        message.info.origin.orientation.w = 1.0
+        message.data = self.core.occupancy_data()
+        return message
 
     @staticmethod
     def run():

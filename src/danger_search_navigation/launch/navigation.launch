@@ -1,8 +1,24 @@
 <launch>
-  <arg name="config_file" default="$(find danger_search_navigation)/config/default.yaml" />
+  <arg name="config_dir" default="$(find danger_search_navigation)/config" />
 
-  <node name="nav_controller" pkg="danger_search_navigation" type="nav_controller.py" output="screen">
-    <!-- 必须在节点内加载，保证所有配置均为 ~ 私有参数。 -->
-    <rosparam command="load" file="$(arg config_file)" />
+  <!-- Standard ROS navigation owns /move_base.  Its velocity output remains
+       behind danger_search_control/cmd_mux. -->
+  <node name="move_base" pkg="move_base" type="move_base" output="screen" clear_params="true">
+    <rosparam command="load" file="$(arg config_dir)/standard_move_base.yaml" />
+    <rosparam command="load" file="$(arg config_dir)/trajectory_planner.yaml" />
+    <rosparam command="load" file="$(arg config_dir)/costmap_common.yaml" ns="global_costmap" />
+    <rosparam command="load" file="$(arg config_dir)/costmap_common.yaml" ns="local_costmap" />
+    <rosparam command="load" file="$(arg config_dir)/global_costmap.yaml" ns="global_costmap" />
+    <rosparam command="load" file="$(arg config_dir)/local_costmap.yaml" ns="local_costmap" />
+    <remap from="cmd_vel" to="/danger_search/nav_cmd_vel" />
+  </node>
+
+  <!-- Compatibility only: converts standard action/recovery state to the
+       existing mission and exploration health contract. -->
+  <node name="navigation_monitor"
+        pkg="danger_search_navigation"
+        type="navigation_monitor.py"
+        output="screen">
+    <rosparam command="load" file="$(arg config_dir)/monitor.yaml" />
   </node>
 </launch>

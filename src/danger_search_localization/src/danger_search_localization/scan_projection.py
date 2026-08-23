@@ -96,6 +96,11 @@ class PoseCompensatedPointAccumulator:
             self._history.popleft()
         return reset
 
+    def clear(self):
+        """Discard all accumulated observations without changing configuration."""
+        self._history.clear()
+        self._last_stamp_s = None
+
     def points_in_latest_frame(self):
         if not self._history:
             return np.empty((0, 3), dtype=np.float64)

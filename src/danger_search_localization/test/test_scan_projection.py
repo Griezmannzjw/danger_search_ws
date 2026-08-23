@@ -3,6 +3,7 @@
 import math
 import unittest
 from collections import deque
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -18,6 +19,7 @@ from danger_search_localization.scan_projection import (
     transform_points_between_planar_poses,
     transform_points,
 )
+from danger_search_localization.scan_projector_node import ScanProjectorNode
 
 
 class TestScanProjection(unittest.TestCase):
@@ -234,6 +236,38 @@ class TestScanProjection(unittest.TestCase):
 
         self.assertTrue(accumulator.add(1.0, [1.0]))
         self.assertEqual(len(accumulator), 1)
+
+    def test_mapping_accumulator_pauses_then_requires_safe_frames(self):
+        projector = ScanProjectorNode.__new__(ScanProjectorNode)
+        projector.config = ScanProjectionConfig(
+            mapping_pause_stable_hold_s=0.0,
+            mapping_resume_min_frames=1,
+        )
+        projector.mapping_point_accumulator = PoseCompensatedPointAccumulator(3, 0.6)
+        projector.mapping_paused = False
+        projector.mapping_safe_since_s = None
+        projector.mapping_pause_count = 0
+        projector.mapping_resume_count = 0
+        projector.mapping_skipped_frames = 0
+        projector._publish_mapping_pause = lambda _header: None
+        header = SimpleNamespace(stamp=SimpleNamespace())
+        points = np.array([[1.0, 0.0, 0.5]])
+
+        self.assertFalse(
+            projector._add_mapping_frame(
+                1.0, header, (0.0, 0.0, 0.0), points, False, "HIGH_YAW_RATE"
+            )
+        )
+        self.assertTrue(projector.mapping_paused)
+        self.assertEqual(len(projector.mapping_point_accumulator), 0)
+
+        self.assertTrue(
+            projector._add_mapping_frame(
+                1.1, header, (0.0, 0.0, 0.0), points, True, "SAFE_YAW_RATE"
+            )
+        )
+        self.assertFalse(projector.mapping_paused)
+        self.assertEqual(len(projector.mapping_point_accumulator), 1)
 
     def test_pose_compensation_aligns_a_stationary_wall_while_robot_moves(self):
         point_in_first_base = np.array([[2.0, 0.0, 0.5]])

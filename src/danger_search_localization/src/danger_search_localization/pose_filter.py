@@ -28,7 +28,7 @@ class PoseFilterResult:
 
 
 class PoseStabilizer:
-    """SE(2) pose anchor, low-pass filter, and discontinuity gate."""
+    """SE(2) discontinuity gate with filtered or trusted-passthrough output."""
 
     def __init__(self, config):
         self.config = config
@@ -51,14 +51,27 @@ class PoseStabilizer:
         if not self.initialized:
             self.initialized = True
             self.anchor = FilteredPose(x, y, yaw)
-            self.previous_raw = FilteredPose(0.0, 0.0, 0.0)
-            self.output = FilteredPose(0.0, 0.0, 0.0)
+            initial = (
+                FilteredPose(x, y, yaw)
+                if self._trusted_passthrough
+                else FilteredPose(0.0, 0.0, 0.0)
+            )
+            self.previous_raw = initial
+            self.output = initial
             self.last_accepted_stamp_s = stamp_s
             self.consecutive_rejections = 0
-            self.last_reason = "INITIALIZED_AT_MISSION_ORIGIN"
+            self.last_reason = (
+                "INITIALIZED_TRUSTED_RELATIVE_POSE"
+                if self._trusted_passthrough
+                else "INITIALIZED_AT_MISSION_ORIGIN"
+            )
             return self.snapshot(True)
 
-        target = self._relative_to_anchor(x, y, yaw)
+        target = (
+            FilteredPose(x, y, yaw)
+            if self._trusted_passthrough
+            else self._relative_to_anchor(x, y, yaw)
+        )
         dt = stamp_s - self.last_accepted_stamp_s
         if dt <= 0.0:
             return self._reject("NON_INCREASING_RAW_POSE_STAMP")
@@ -86,6 +99,11 @@ class PoseStabilizer:
         self.last_accepted_stamp_s = stamp_s
         self.consecutive_rejections = 0
 
+        if self._trusted_passthrough:
+            self.output = target
+            self.last_reason = "TRACKING_TRUSTED_POSE"
+            return self.snapshot(True)
+
         residual_x = target.x - self.output.x
         residual_y = target.y - self.output.y
         residual_yaw = normalize_angle(target.yaw - self.output.yaw)
@@ -107,6 +125,10 @@ class PoseStabilizer:
         )
         self.last_reason = "TRACKING_FILTERED_SCAN_MATCHING"
         return self.snapshot(True)
+
+    @property
+    def _trusted_passthrough(self):
+        return self.config.pose_stabilizer_mode == "trusted_passthrough"
 
     def _relative_to_anchor(self, x, y, yaw):
         dx = x - self.anchor.x

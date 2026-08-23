@@ -2,13 +2,18 @@
 
 import math
 import struct
+import threading
 import unittest
 from types import SimpleNamespace
+from unittest import mock
+
+import rospy
 
 from danger_search_localization.occupancy_mapping import (
     OccupancyMapperCore,
     OccupancyMappingConfig,
 )
+from danger_search_localization.occupancy_mapper_node import OccupancyMapperNode
 
 
 class TestOccupancyMapping(unittest.TestCase):
@@ -70,3 +75,29 @@ class TestOccupancyMapping(unittest.TestCase):
 
         self.assertEqual(internal, external)
         self.assertEqual(internal, (50, 50))
+
+    def test_reset_service_replaces_latched_map_with_unknown_grid(self):
+        node = OccupancyMapperNode.__new__(OccupancyMapperNode)
+        node.config = OccupancyMappingConfig(size=16)
+        node.core = OccupancyMapperCore(node.config)
+        node.core.scores[:, :] = node.config.max_score
+        node.core.observed[:, :] = True
+        node.lock = threading.RLock()
+        node.pose_cache = {(1, 0): (0.0, 0.0, 0.0)}
+        node.scan_cache = {(1, 0): object()}
+        node.map_frame = "map"
+        node.last_scan_stamp = rospy.Time(0)
+        node.map_load_time = rospy.Time.from_sec(1.0)
+        node.map_dirty = True
+        node.publisher = mock.Mock()
+
+        with mock.patch.object(
+            rospy.Time, "now", return_value=rospy.Time.from_sec(2.0)
+        ):
+            node._reset_map_callback(None)
+
+        message = node.publisher.publish.call_args.args[0]
+        self.assertTrue(all(value == -1 for value in message.data))
+        self.assertEqual(message.info.map_load_time, rospy.Time.from_sec(2.0))
+        self.assertFalse(node.pose_cache)
+        self.assertFalse(node.scan_cache)

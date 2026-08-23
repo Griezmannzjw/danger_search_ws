@@ -6,6 +6,7 @@ odom_frame: odom
 base_frame: base
 current_floor: 0
 pose_topic: /localization/pose
+odom_topic: /localization/odom
 map_topic: /map
 mapping_status_topic: /mapping/status
 localization_status_topic: /localization/status
@@ -13,6 +14,8 @@ localization_status_topic: /localization/status
 # 内部话题
 raw_scan_topic: /scan
 projected_scan_topic: /localization/scan
+mapping_scan_topic: /localization/mapping_scan
+mapping_pause_topic: /localization/mapping_pause
 backend_pose_topic: /localization/hector_pose
 gicp_pose_topic: /localization/raw_pose
 validated_gicp_pose_topic: /localization/validated_pose
@@ -107,6 +110,11 @@ scan_accumulation_max_age_s: 0.6     # 仿真时钟回退或长停顿后清空�
 min_valid_scan_bins: 8               # Livox 单帧稀疏，短窗口至少保留 4 度有效角度
 min_angular_coverage_rad: 0.03       # 允许实测约 0.03--0.04 rad 的连续有效覆盖
 drop_unstable_scans: true            # 摔倒、剧烈转动或过低时不污染 Hector 地图
+# 原始 PointCloud 没有点级时间戳；高速旋转时仅暂停长期占据图。
+mapping_pause_enter_yaw_rate_rps: 0.35
+mapping_pause_exit_yaw_rate_rps: 0.20
+mapping_pause_stable_hold_s: 0.50
+mapping_resume_min_frames: 3
 
 # P0 默认使用可信 GICP 位姿直接构建占据栅格，避免稀疏 Livox 的第二套位姿漂移。
 occupancy_mapper_max_rays: 360
@@ -138,6 +146,10 @@ min_map_updates_for_stable: 2
 pose_publish_rate_hz: 20.0
 tf_publish_future_tolerance_s: 0.5
 status_publish_rate_hz: 2.0
+odom_velocity_max_dt_s: 0.50
+odom_velocity_stale_timeout_s: 0.50
+odom_twist_variance: 0.02
+odom_twist_degraded_variance: 1.0
 fallback_xy_variance: 0.10
 fallback_yaw_variance: 0.15
 fallback_unobserved_variance: 0.25
@@ -148,6 +160,8 @@ covariance_warning_trace: 2.0
 pose_position_deadband_m: 0.015
 pose_yaw_deadband_rad: 0.010
 pose_filter_time_constant_s: 0.15
+pose_stabilizer_mode: filtered_anchored
+mapping_pause_timeout_s: 0.35
 pose_max_linear_speed_mps: 1.0
 pose_max_angular_speed_rps: 2.0
 pose_jump_translation_margin_m: 0.08

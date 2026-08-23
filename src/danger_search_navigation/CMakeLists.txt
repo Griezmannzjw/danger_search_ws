@@ -39,9 +39,17 @@ include_directories(
 catkin_install_python(PROGRAMS
   scripts/nav_controller.py
   scripts/navigation_core.py
+  scripts/navigation_monitor.py
+  scripts/navigation_monitor_core.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(DIRECTORY launch config
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 
 if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_navigation_core.py)
+  catkin_add_nosetests(test/test_navigation_monitor.py)
+  catkin_add_nosetests(test/test_standard_config.py)
 endif()

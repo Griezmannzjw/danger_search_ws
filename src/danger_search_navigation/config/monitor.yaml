@@ -1,0 +1,20 @@
+map_frame: map
+map_topic: /map
+pose_topic: /localization/pose
+scan_topic: /localization/scan
+mapping_status_topic: /mapping/status
+nav_cmd_topic: /danger_search/nav_cmd_vel
+sent_cmd_topic: /danger_search/cmd_vel_sent
+health_topic: /navigation/health
+recovery_event_topic: /navigation/recovery_event
+move_base_status_topic: /move_base/status
+move_base_goal_topic: /move_base/goal
+move_base_result_topic: /move_base/result
+move_base_recovery_topic: /move_base/recovery_status
+global_plan_topic: /move_base/NavfnROS/plan
+health_rate: 5.0
+input_timeout: 2.0
+scan_timeout: 1.0
+command_timeout: 0.50
+recovery_success_distance: 0.05
+

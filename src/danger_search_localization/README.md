@@ -27,20 +27,22 @@ ground-truth TF；同时开启 referee odom 会造成重复 TF 发布。默认
 
 ```text
 /scan (官方原始 PointCloud, laser_livox)
-  +-> scan_projector.py -> /localization/scan
   |
   +-> lidar_odometry_node（生产 LidarOdometryCore，三维 GICP）
        -> /localization/raw_pose (odom，仅诊断)
        -> pose_estimator.py（首帧归零、死区/低通、物理跳变门控）
             +-> /localization/validated_pose (odom，仅健康帧)
-            |    +-> local_occupancy_mapper -> /localization/raw_map
+            |    +-> scan_projector.py -> /localization/scan（局部避障，持续）
+            |          +-> /localization/mapping_scan（长期建图，旋转安全时）
+            |               +-> local_occupancy_mapper -> /localization/raw_map
             +-> /localization/pose、/map、状态和 map -> odom -> base TF
 
-导航和建图都不直接消费 `/localization/raw_pose`。错误 GICP 帧会被保持在上一可信位姿，
+导航和建图都不直接消费 `/localization/raw_pose`；投影、长期建图和 TF 使用同一份
+`/localization/validated_pose`。错误 GICP 帧会被保持在上一可信位姿，
 不会发布到 `/localization/validated_pose`，因此地图同步冻结；连续异常使状态先降级再
 进入 LOST。系统不订阅 `/cmd_vel` 或 `/danger_search/cmd_vel_sent` 来计算位置。
 
-只有启动 `use_hector_correction:=true` 时，`/localization/scan` 才进入 Hector；Hector
+只有启动 `use_hector_correction:=true` 时，`/localization/mapping_scan` 才进入 Hector；Hector
 只提供经过同步和幅度限制的 `map -> odom` 修正，不能替换 GICP 物理平移。
 ```
 
@@ -69,8 +71,10 @@ POINTCLOUD_USE_GROUND_TRUTH_ODOM=0 \
 `enable_isolated_hit_filter`。
 
 投影使用短窗口叠加 Livox 扫描补足单帧的稀疏角度覆盖；窗口较短以限制未做运动补偿
-造成的重影。累计扫描至少包含 8 个有效 0.5 度 bin，并有至少 0.05 rad（约 3 度）的
-连续覆盖；机器人倾斜、旋转过快或雷达离地异常时直接丢弃该帧，避免污染地图。运行时
+造成的重影。原始 PointCloud 没有点级时间戳，因此 `|wz|>=0.35 rad/s` 时仅暂停
+`/localization/mapping_scan` 的长期落图；`/localization/scan` 保持发布给局部 costmap。
+角速度降至 `0.20 rad/s` 以下并稳定 `0.5 s`、累计 3 帧后恢复建图。机器人倾斜或雷达
+离地异常时仍会拒绝对应扫描。运行时
 可用以下命令确认数据链：
 
 ```bash
@@ -89,6 +93,7 @@ GICP 位姿和地图更新建立后，`/mapping/status` 应变为 `ready: True`�
 | `/tf`、`/tf_static` | TF | `map -> odom -> base` |
 | `/localization/pose` | `geometry_msgs/PoseWithCovarianceStamped` | `map` 中的当前位姿 |
 | `/map` | `nav_msgs/OccupancyGrid` | 当前单楼层二维占据地图 |
+| `/localization/reset_map` | `std_srvs/Empty` | 任务停止后清空自定义占据图并发布全未知地图 |
 | `/mapping/status` | `danger_search_common/MappingStatus` | 地图就绪、稳定、丢失、楼层和版本 |
 | `/localization/status` | `danger_search_common/LocalizationStatus` | 定位跟踪和协方差状态 |
 
@@ -132,6 +137,8 @@ rostopic echo /mapping/status
 rostopic echo /localization/pose
 rostopic echo /map --noarr
 rosrun tf tf_echo map base
+# 仅在任务停止且导航目标已取消后调用
+rosservice call /localization/reset_map "{}"
 ```
 
 ## 目前边界与升级项

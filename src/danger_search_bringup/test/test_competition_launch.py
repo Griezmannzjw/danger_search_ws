@@ -44,11 +44,17 @@ class CompetitionLaunchTest(unittest.TestCase):
         nodes = [node.attrib.get("name") for node in self.root.findall("node")]
         self.assertEqual(
             nodes,
-            ["entrance_door", "perception", "navigation", "exploration", "control", "mission"],
+            ["entrance_door", "perception", "exploration", "control", "mission"],
         )
         includes = self.root.findall("include")
-        self.assertEqual(len(includes), 1)
-        self.assertIn("danger_search_localization", includes[0].attrib["file"])
+        self.assertEqual(len(includes), 2)
+        include_files = [element.attrib["file"] for element in includes]
+        self.assertTrue(any(
+            "danger_search_localization" in path for path in include_files
+        ))
+        self.assertTrue(any(
+            "danger_search_navigation" in path for path in include_files
+        ))
 
 
 if __name__ == "__main__":

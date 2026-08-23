@@ -23,6 +23,8 @@ class TestLocalizationConfig(unittest.TestCase):
         self.assertFalse(scan_config.enable_isolated_hit_filter)
         self.assertFalse(scan_config.enable_ground_clearance_gate)
         self.assertEqual(scan_config.min_angular_coverage_rad, 0.03)
+        self.assertEqual(scan_config.mapping_pause_enter_yaw_rate_rps, 0.35)
+        self.assertEqual(scan_config.mapping_resume_min_frames, 3)
         AdapterConfig()
 
     def test_gicp_rebaseline_threshold_is_positive(self):
@@ -66,10 +68,17 @@ class TestLocalizationConfig(unittest.TestCase):
                 scan_accumulation_frames=2,
                 scan_accumulation_min_samples_per_bin=3,
             )
+        with self.assertRaises(ValueError):
+            ScanProjectionConfig(
+                mapping_pause_enter_yaw_rate_rps=0.20,
+                mapping_pause_exit_yaw_rate_rps=0.20,
+            )
 
     def test_pose_rate_below_interface_minimum_is_rejected(self):
         with self.assertRaises(ValueError):
             AdapterConfig(pose_publish_rate_hz=5.0)
+        with self.assertRaises(ValueError):
+            AdapterConfig(pose_stabilizer_mode="invalid")
 
     def test_default_pose_wiring_separates_hector_and_gicp(self):
         config_path = self.package_dir / "config" / "default.yaml"
@@ -125,6 +134,8 @@ class TestLocalizationConfig(unittest.TestCase):
         self.assertIn("localization_source') == 'gazebo_truth'", source)
         self.assertIn("tf_publish_future_tolerance_s", source)
         self.assertIn("localization_source') == 'gazebo_truth' else 0.5", source)
+        self.assertIn("pose_stabilizer_mode", source)
+        self.assertIn("trusted_passthrough", source)
         self.assertEqual(source.count('name="lidar_odometry"'), 1)
         self.assertEqual(source.count('name="gazebo_truth_odometry"'), 1)
 
@@ -155,6 +166,11 @@ class TestLocalizationConfig(unittest.TestCase):
         self.assertIn("self.pose_stabilizer.update", adapter_source)
         self.assertIn("self.validated_pose_pub.publish", adapter_source)
         self.assertIn("~validated_gicp_pose_topic", mapper_source)
+        projector_source = (
+            self.package_dir / "src" / "danger_search_localization" / "scan_projector_node.py"
+        ).read_text()
+        self.assertIn("~canonical_pose_topic", projector_source)
+        self.assertIn("/localization/validated_pose", projector_source)
         self.assertAlmostEqual(config["pose_jump_translation_margin_m"], 0.08)
         self.assertAlmostEqual(config["pose_jump_yaw_margin_rad"], 0.10)
         self.assertAlmostEqual(config["pose_gate_max_dt_s"], 0.50)

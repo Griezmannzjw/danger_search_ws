@@ -9,6 +9,7 @@ import rospy
 import tf2_ros
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from sensor_msgs.msg import Imu, LaserScan, PointCloud
+from std_msgs.msg import Header
 
 from .config import ScanProjectionConfig
 from .scan_projection import (
@@ -38,9 +39,13 @@ class ScanProjectorNode:
             self.config.scan_accumulation_frames,
             self.config.scan_accumulation_max_age_s,
         )
+        self.mapping_point_accumulator = PoseCompensatedPointAccumulator(
+            self.config.scan_accumulation_frames,
+            self.config.scan_accumulation_max_age_s,
+        )
         self.last_published_stamp_s = None
-        self.gicp_pose_topic = rospy.get_param(
-            "~gicp_pose_topic", "/localization/raw_pose"
+        self.canonical_pose_topic = rospy.get_param(
+            "~canonical_pose_topic", "/localization/validated_pose"
         )
         self.odom_frame = rospy.get_param("~odom_frame", "odom")
         self.gicp_unhealthy_variance_threshold = float(
@@ -51,11 +56,22 @@ class ScanProjectorNode:
         self.pending_poses = []
         self.last_healthy_pose = None
         self.last_consumed_point_stamp_s = None
+        self.mapping_paused = False
+        self.mapping_safe_since_s = None
+        self.mapping_pause_count = 0
+        self.mapping_resume_count = 0
+        self.mapping_skipped_frames = 0
 
         self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         self.publisher = rospy.Publisher(
             self.output_topic, LaserScan, queue_size=5
+        )
+        self.mapping_publisher = rospy.Publisher(
+            self.config.mapping_scan_topic, LaserScan, queue_size=5
+        )
+        self.mapping_pause_publisher = rospy.Publisher(
+            self.config.mapping_pause_topic, Header, queue_size=10
         )
         self.imu_subscriber = rospy.Subscriber(
             self.config.imu_topic, Imu, self._imu_callback, queue_size=200
@@ -64,16 +80,15 @@ class ScanProjectorNode:
             self.input_topic, PointCloud, self._cloud_callback, queue_size=2
         )
         self.gicp_subscriber = rospy.Subscriber(
-            self.gicp_pose_topic,
+            self.canonical_pose_topic,
             PoseWithCovarianceStamped,
             self._gicp_pose_callback,
             queue_size=20,
         )
         rospy.loginfo(
-            "[localization] projecting official %s to %s in frame %s",
-            self.input_topic,
-            self.output_topic,
-            self.base_frame,
+            "[localization] projecting %s -> %s (mapping=%s) in %s using canonical pose %s",
+            self.input_topic, self.output_topic, self.config.mapping_scan_topic,
+            self.base_frame, self.canonical_pose_topic,
         )
 
     def _imu_callback(self, message):
@@ -133,6 +148,9 @@ class ScanProjectorNode:
                 1.0, "[localization] invalid lidar transform: %s", str(exc)
             )
             return
+        mapping_eligible, mapping_reason = self._mapping_eligibility(
+            message.header.stamp
+        )
         if self.config.enable_imu_leveling:
             imu_sample = self._closest_imu(message.header.stamp.to_sec())
             if imu_sample is None:
@@ -181,7 +199,9 @@ class ScanProjectorNode:
                         )
                         roll = pitch = None
                     if roll is None:
-                        self._queue_points(message, points_base)
+                        self._queue_points(
+                            message, points_base, mapping_eligible, mapping_reason
+                        )
                         return
                     angular_speed = math.sqrt(
                         sum(float(value) ** 2 for value in angular_velocity)
@@ -216,15 +236,23 @@ class ScanProjectorNode:
                             )
                             if self.config.drop_unstable_scans:
                                 return
-        self._queue_points(message, points_base)
+        self._queue_points(
+            message, points_base, mapping_eligible, mapping_reason
+        )
 
-    def _queue_points(self, message, points_base):
+    def _queue_points(self, message, points_base, mapping_eligible, mapping_reason):
         stamp_s = message.header.stamp.to_sec()
         if not math.isfinite(stamp_s) or not np.isfinite(points_base).all():
             return
         with self.sync_lock:
             self.pending_point_frames.append(
-                (stamp_s, message.header, np.asarray(points_base).copy())
+                (
+                    stamp_s,
+                    message.header,
+                    np.asarray(points_base).copy(),
+                    bool(mapping_eligible),
+                    str(mapping_reason),
+                )
             )
             self.pending_point_frames.sort(key=lambda value: value[0])
             newest = self.pending_point_frames[-1][0]
@@ -307,7 +335,8 @@ class ScanProjectorNode:
             if not usable_frames:
                 continue
             previous = self.last_healthy_pose
-            for stamp_s, _, points in usable_frames:
+            mapping_scan_ready = False
+            for stamp_s, frame_header, points, mapping_eligible, mapping_reason in usable_frames:
                 if previous is None or pose_stamp_s <= previous[0]:
                     frame_pose = current_pose
                 else:
@@ -334,6 +363,14 @@ class ScanProjectorNode:
                         "[localization] compensated scan history reset",
                     )
                 self.last_consumed_point_stamp_s = stamp_s
+                mapping_scan_ready = self._add_mapping_frame(
+                    stamp_s,
+                    frame_header,
+                    frame_pose,
+                    points,
+                    mapping_eligible,
+                    mapping_reason,
+                )
 
             self.last_healthy_pose = (pose_stamp_s, current_pose)
             self.pending_point_frames = [
@@ -344,30 +381,45 @@ class ScanProjectorNode:
             header = usable_frames[-1][1]
             header.stamp = rospy.Time.from_sec(pose_stamp_s)
             self._publish_compensated_scan(header)
+            if mapping_scan_ready:
+                self._publish_mapping_scan(header)
 
     def _publish_compensated_scan(self, header):
-        points = self.point_accumulator.points_in_latest_frame()
-        ranges = project_planar_scan(points, self.config)
+        output = self._scan_from_accumulator(self.point_accumulator, header)
+        if output is not None:
+            self.publisher.publish(output)
 
+    def _publish_mapping_scan(self, header):
+        output = self._scan_from_accumulator(
+            self.mapping_point_accumulator, header, mapping=True
+        )
+        if output is not None:
+            self.mapping_publisher.publish(output)
+
+    def _scan_from_accumulator(self, accumulator, header, mapping=False):
+        points = accumulator.points_in_latest_frame()
+        ranges = project_planar_scan(points, self.config)
         finite_mask = np.isfinite(ranges)
         valid_bins = int(np.sum(finite_mask))
         if valid_bins < self.config.min_valid_scan_bins:
             rospy.logwarn_throttle(
                 2.0,
-                "[localization] dropping sparse scan: %d valid bins < %d",
+                "[localization] dropping %ssparse scan: %d valid bins < %d",
+                "mapping " if mapping else "",
                 valid_bins,
                 self.config.min_valid_scan_bins,
             )
-            return
+            return None
         angular_coverage = self._angular_coverage_of_finite(ranges, finite_mask)
         if angular_coverage < self.config.min_angular_coverage_rad:
             rospy.logwarn_throttle(
                 2.0,
-                "[localization] dropping narrow scan: %.2f rad coverage < %.2f",
+                "[localization] dropping %snarrow scan: %.2f rad coverage < %.2f",
+                "mapping " if mapping else "",
                 angular_coverage,
                 self.config.min_angular_coverage_rad,
             )
-            return
+            return None
 
         output = LaserScan()
         output.header.stamp = header.stamp
@@ -381,7 +433,97 @@ class ScanProjectorNode:
         output.range_min = self.config.range_min
         output.range_max = self.config.range_max
         output.ranges = ranges.tolist()
-        self.publisher.publish(output)
+        return output
+
+    def _mapping_eligibility(self, stamp):
+        sample = self._closest_imu(stamp.to_sec())
+        if sample is None:
+            return False, "IMU_STALE"
+        _, imu_frame, _, angular_velocity = sample
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_frame, imu_frame, stamp, rospy.Duration(self.config.tf_timeout_s)
+            )
+            rotation = transform.transform.rotation
+            base_rate = transform_points(
+                np.asarray([angular_velocity], dtype=np.float64),
+                (0.0, 0.0, 0.0),
+                (rotation.x, rotation.y, rotation.z, rotation.w),
+            )[0]
+        except (
+            ValueError,
+            tf2_ros.LookupException,
+            tf2_ros.ConnectivityException,
+            tf2_ros.ExtrapolationException,
+        ):
+            return False, "IMU_EXTRINSIC_UNAVAILABLE"
+        yaw_rate = abs(float(base_rate[2]))
+        if not math.isfinite(yaw_rate):
+            return False, "IMU_YAW_RATE_INVALID"
+        threshold = (
+            self.config.mapping_pause_exit_yaw_rate_rps
+            if self.mapping_paused
+            else self.config.mapping_pause_enter_yaw_rate_rps
+        )
+        if yaw_rate > threshold or (
+            not self.mapping_paused
+            and yaw_rate >= self.config.mapping_pause_enter_yaw_rate_rps
+        ):
+            return False, "HIGH_YAW_RATE:%.3f" % yaw_rate
+        return True, "SAFE_YAW_RATE:%.3f" % yaw_rate
+
+    def _add_mapping_frame(
+        self, stamp_s, header, pose, points, mapping_eligible, mapping_reason
+    ):
+        if not mapping_eligible:
+            if not self.mapping_paused:
+                self.mapping_paused = True
+                self.mapping_pause_count += 1
+                self.mapping_point_accumulator.clear()
+                rospy.logwarn(
+                    "[localization] pausing long-term mapping: %s", mapping_reason
+                )
+            self.mapping_safe_since_s = None
+            self.mapping_skipped_frames += 1
+            self._publish_mapping_pause(header)
+            return False
+
+        if self.mapping_paused:
+            if self.mapping_safe_since_s is None:
+                self.mapping_safe_since_s = stamp_s
+            if stamp_s - self.mapping_safe_since_s < self.config.mapping_pause_stable_hold_s:
+                self.mapping_skipped_frames += 1
+                self._publish_mapping_pause(header)
+                return False
+            self.mapping_paused = False
+            self.mapping_safe_since_s = None
+            self.mapping_resume_count += 1
+            rospy.loginfo(
+                "[localization] resumed long-term mapping: pauses=%d resumes=%d skipped=%d",
+                self.mapping_pause_count,
+                self.mapping_resume_count,
+                self.mapping_skipped_frames,
+            )
+
+        try:
+            reset = self.mapping_point_accumulator.add(stamp_s, pose, points)
+        except ValueError as exc:
+            rospy.logwarn_throttle(
+                1.0, "[localization] invalid mapping scan input: %s", str(exc)
+            )
+            return False
+        if reset:
+            rospy.logwarn_throttle(2.0, "[localization] mapping scan history reset")
+        if len(self.mapping_point_accumulator) < self.config.mapping_resume_min_frames:
+            self._publish_mapping_pause(header)
+            return False
+        return True
+
+    def _publish_mapping_pause(self, header):
+        pause = Header()
+        pause.stamp = header.stamp
+        pause.frame_id = self.base_frame
+        self.mapping_pause_publisher.publish(pause)
 
     def _published_scan_interval(self, stamp_s):
         interval = 0.0

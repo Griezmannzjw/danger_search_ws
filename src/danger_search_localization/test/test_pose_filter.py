@@ -80,6 +80,30 @@ class TestPoseStabilizer(unittest.TestCase):
         self.assertFalse(result.accepted)
         self.assertFalse(result.initialized)
 
+    def test_trusted_passthrough_preserves_relative_truth_without_lag(self):
+        truth_filter = PoseStabilizer(
+            AdapterConfig(pose_stabilizer_mode="trusted_passthrough")
+        )
+        first = truth_filter.update(1.0, 0.25, -0.40, 0.70)
+        second = truth_filter.update(1.1, 0.30, -0.37, 0.78)
+
+        self.assertTrue(first.accepted)
+        self.assertTrue(second.accepted)
+        self.assertAlmostEqual(first.pose.x, 0.25)
+        self.assertAlmostEqual(first.pose.y, -0.40)
+        self.assertAlmostEqual(first.pose.yaw, 0.70)
+        self.assertAlmostEqual(second.pose.x, 0.30)
+        self.assertAlmostEqual(second.pose.y, -0.37)
+        self.assertAlmostEqual(second.pose.yaw, 0.78)
+
+    def test_trusted_passthrough_keeps_time_and_jump_gate(self):
+        truth_filter = PoseStabilizer(
+            AdapterConfig(pose_stabilizer_mode="trusted_passthrough")
+        )
+        truth_filter.update(1.0, 0.0, 0.0, 0.0)
+        self.assertFalse(truth_filter.update(1.0, 0.0, 0.0, 0.0).accepted)
+        self.assertFalse(truth_filter.update(1.1, 5.0, 0.0, 0.0).accepted)
+
 
 if __name__ == "__main__":
     unittest.main()

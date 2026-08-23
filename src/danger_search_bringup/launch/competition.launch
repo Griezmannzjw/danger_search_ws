@@ -37,11 +37,8 @@
     <rosparam command="load" file="$(find danger_search_perception)/config/default.yaml" />
   </node>
 
-  <!-- 3. 导航控制模块 (move_base Action 服务器) -->
-  <node name="navigation" pkg="danger_search_navigation" type="nav_controller.py" output="screen">
-    <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
-    <rosparam command="load" file="$(find danger_search_navigation)/config/default.yaml" />
-  </node>
+  <!-- 3. 标准 move_base + Unitree TrajectoryPlannerROS + 兼容状态桥。 -->
+  <include file="$(find danger_search_navigation)/launch/navigation.launch" />
 
   <!-- 4. 探索规划模块 (move_base Action 客户端) -->
   <node name="exploration" pkg="danger_search_exploration" type="exploration_planner.py" output="screen">

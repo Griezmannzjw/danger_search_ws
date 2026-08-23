@@ -1,0 +1,49 @@
+# Standard ROS navigation stack.  The Unitree-provided TrajectoryPlannerROS
+# configuration is the baseline; values below are limited to the command range
+# accepted by danger_search_control/cmd_mux.
+base_global_planner: navfn/NavfnROS
+base_local_planner: base_local_planner/TrajectoryPlannerROS
+
+planner_frequency: 1.0
+controller_frequency: 10.0
+planner_patience: 5.0
+controller_patience: 5.0
+max_planning_retries: 3
+oscillation_timeout: 8.0
+oscillation_distance: 0.10
+shutdown_costmaps: false
+recovery_behavior_enabled: true
+clearing_rotation_allowed: true
+make_plan_clear_costmap: false
+make_plan_add_unreachable_goal: false
+
+recovery_behaviors:
+  - {name: conservative_reset, type: clear_costmap_recovery/ClearCostmapRecovery}
+  - {name: rotate_recovery, type: rotate_recovery/RotateRecovery}
+  - {name: aggressive_reset, type: clear_costmap_recovery/ClearCostmapRecovery}
+
+# Clear only short-lived scan observations.  The static map is never cleared.
+conservative_reset:
+  reset_distance: 1.0
+  affected_maps: both
+  layer_names: [obstacles]
+  force_updating: true
+
+rotate_recovery:
+  sim_granularity: 0.025
+  frequency: 10.0
+  yaw_goal_tolerance: 0.20
+  acc_lim_th: 0.80
+  max_rotational_vel: 0.80
+  min_rotational_vel: 0.80
+
+aggressive_reset:
+  reset_distance: 0.0
+  affected_maps: both
+  layer_names: [obstacles]
+  force_updating: true
+
+NavfnROS:
+  allow_unknown: false
+  default_tolerance: 0.0
+

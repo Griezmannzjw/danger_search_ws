@@ -11,7 +11,10 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 
 from danger_search_common.msg import LocalizationStatus
-from danger_search_localization.adapter_node import LocalizationAdapterNode
+from danger_search_localization.adapter_node import (
+    LocalizationAdapterNode,
+    LocalVelocityEstimator,
+)
 from danger_search_localization.config import AdapterConfig
 from danger_search_localization.vertical_estimation import quaternion_to_rpy
 
@@ -45,6 +48,40 @@ class TestLocalizationAdapter(unittest.TestCase):
                 pose.pose.covariance[index],
                 self.adapter.config.fallback_unobserved_variance,
             )
+
+    def test_local_velocity_is_expressed_in_base_frame(self):
+        estimator = LocalVelocityEstimator(max_dt_s=0.5)
+        estimator.update(1.0, SimpleNamespace(x=0.0, y=0.0, yaw=math.pi / 2.0))
+
+        velocity, degraded = estimator.update(
+            1.2, SimpleNamespace(x=0.0, y=0.10, yaw=math.pi / 2.0)
+        )
+
+        self.assertFalse(degraded)
+        self.assertAlmostEqual(velocity[0], 0.5, places=6)
+        self.assertAlmostEqual(velocity[1], 0.0, places=6)
+        self.assertAlmostEqual(velocity[2], 0.0, places=6)
+
+    def test_local_velocity_rejects_nonincreasing_and_stale_intervals(self):
+        estimator = LocalVelocityEstimator(max_dt_s=0.5)
+        pose = SimpleNamespace(x=0.0, y=0.0, yaw=0.0)
+        estimator.update(2.0, pose)
+
+        velocity, degraded = estimator.update(2.0, pose)
+        self.assertTrue(degraded)
+        self.assertEqual(velocity, (0.0, 0.0, 0.0))
+
+        velocity, degraded = estimator.update(
+            3.0, SimpleNamespace(x=0.5, y=0.0, yaw=0.0)
+        )
+        self.assertTrue(degraded)
+        self.assertEqual(velocity, (0.0, 0.0, 0.0))
+
+        velocity, degraded = estimator.update(
+            3.2, SimpleNamespace(x=0.6, y=0.0, yaw=0.0)
+        )
+        self.assertFalse(degraded)
+        self.assertAlmostEqual(velocity[0], 0.5, places=6)
 
     def test_backend_covariance_can_be_enabled_explicitly(self):
         self.adapter.config = AdapterConfig(use_backend_covariance=True)
