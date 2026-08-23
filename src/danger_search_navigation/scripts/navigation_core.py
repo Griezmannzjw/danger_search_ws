@@ -137,6 +137,83 @@ def path_lengths(path):
     return lengths
 
 
+def project_to_polyline(point, path, lengths=None, start_segment=0):
+    """Project ``point`` onto a polyline.
+
+    Returns ``(distance, arc_length, segment_index, projected_xy, tangent)``.
+    Unlike a nearest-waypoint lookup this stays continuous on a 5 cm A* path,
+    which is essential for a velocity controller not to steer left/right at
+    every cell corner.
+    """
+    if not path:
+        return float("inf"), 0.0, 0, (0.0, 0.0), 0.0
+    if len(path) == 1:
+        dx, dy = float(point[0]) - path[0][0], float(point[1]) - path[0][1]
+        return math.hypot(dx, dy), 0.0, 0, tuple(path[0]), 0.0
+    lengths = path_lengths(path) if lengths is None else lengths
+    begin = min(max(0, int(start_segment)), len(path) - 2)
+    best = None
+    px, py = float(point[0]), float(point[1])
+    for index in range(begin, len(path) - 1):
+        ax, ay = path[index]
+        bx, by = path[index + 1]
+        dx, dy = bx - ax, by - ay
+        squared = dx * dx + dy * dy
+        if squared <= 1e-12:
+            fraction = 0.0
+        else:
+            fraction = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / squared))
+        qx, qy = ax + fraction * dx, ay + fraction * dy
+        distance = math.hypot(px - qx, py - qy)
+        candidate = (
+            distance, lengths[index] + fraction * math.sqrt(squared), index,
+            (qx, qy), math.atan2(dy, dx) if squared > 1e-12 else 0.0,
+        )
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+    return best
+
+
+def point_at_path_progress(path, lengths, progress):
+    """Interpolate a point and tangent at a cumulative path distance."""
+    if not path:
+        return (0.0, 0.0), 0.0
+    if len(path) == 1:
+        return tuple(path[0]), 0.0
+    progress = max(0.0, min(float(progress), float(lengths[-1])))
+    for index in range(len(path) - 1):
+        start, end = lengths[index], lengths[index + 1]
+        if progress <= end or index == len(path) - 2:
+            span = max(end - start, 1e-12)
+            fraction = max(0.0, min(1.0, (progress - start) / span))
+            ax, ay = path[index]
+            bx, by = path[index + 1]
+            return (
+                (ax + fraction * (bx - ax), ay + fraction * (by - ay)),
+                math.atan2(by - ay, bx - ax),
+            )
+    return tuple(path[-1]), 0.0
+
+
+def remove_collinear_path_points(path, epsilon=1e-6):
+    """Remove only collinear, forward-going A* grid points; keep endpoints."""
+    if len(path) <= 2:
+        return list(path)
+    result = [tuple(path[0])]
+    for index in range(1, len(path) - 1):
+        ax, ay = result[-1]
+        bx, by = path[index]
+        cx, cy = path[index + 1]
+        abx, aby = bx - ax, by - ay
+        bcx, bcy = cx - bx, cy - by
+        cross = abx * bcy - aby * bcx
+        if abs(cross) <= epsilon and abx * bcx + aby * bcy >= -epsilon:
+            continue
+        result.append((bx, by))
+    result.append(tuple(path[-1]))
+    return result
+
+
 def path_progress(lengths, waypoint_index):
     """按已到达路径长度计算 0.0..1.0 的进度。"""
     if not lengths or lengths[-1] <= 1e-9:
@@ -769,13 +846,19 @@ class InflatedOccupancyGrid:
             return False, 0.0, {(-1, -1)}, set()
         dynamic_cells = set(dynamic_cells)
         blacklist_cells = set(blacklist_cells)
+        # Static occupancy and distance queries dominate trajectory scoring.
+        # Query the immutable grid in one NumPy gather instead of a Python
+        # lookup per footprint cell; dynamic/blacklist policy remains exact.
+        ordered_cells = tuple(cells)
+        cell_x = np.fromiter((cell[0] for cell in ordered_cells), dtype=np.intp)
+        cell_y = np.fromiter((cell[1] for cell in ordered_cells), dtype=np.intp)
+        static_blocked = self._base_blocked_mask[cell_y, cell_x]
         physical = {
-            cell for cell in cells
-            if self._base_blocked_mask[cell[1], cell[0]]
-            or cell in dynamic_cells
+            cell for cell, blocked in zip(ordered_cells, static_blocked)
+            if blocked or cell in dynamic_cells
         }
         blacklist = cells & blacklist_cells
-        min_clearance = min(self.clearance_at_cell(cell) for cell in cells)
+        min_clearance = float(np.min(self.clearance_m[cell_y, cell_x]))
         return not physical and not blacklist, min_clearance, physical, blacklist
 
     def footprint_blacklist_overlap(self, pose, footprint, blacklist_cells=()):

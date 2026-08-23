@@ -5,6 +5,7 @@ map_frame: map
 base_frame: base
 lidar_frame: laser_livox
 nav_cmd_topic: /danger_search/nav_cmd_vel
+sent_cmd_topic: /danger_search/cmd_vel_sent
 pose_topic: /localization/pose
 map_topic: /map
 mapping_status_topic: /mapping/status
@@ -59,13 +60,13 @@ obstacle_footprint_max_x: 0.30
 obstacle_footprint_min_y: -0.15
 obstacle_footprint_max_y: 0.15
 # 规划 footprint 从 URDF 腿部 TF 动态生成；以下参数控制短时步态扫掠和保底外扩。
-footprint_padding: 0.02
+footprint_padding: 0.04
 footprint_history_seconds: 0.40
 footprint_timeout: 0.50
 # A* 在硬膨胀外继续惩罚低净空单元，把路线推向通道中央。
-clearance_soft_margin: 0.05
+clearance_soft_margin: 0.15
 clearance_cost_weight: 1.0
-dynamic_stop_distance: 0.45
+dynamic_stop_distance: 0.60
 dynamic_front_half_angle: 0.52
 # A* 只接收最近 3 个不同 /scan 时间戳中至少出现 2 次的动态栅格。
 # 已确认栅格在最后一次观测后保留 0.50 s；这不是点云新鲜度 timeout。
@@ -79,7 +80,7 @@ goal_projection_step: 0.05
 # 投影终点仅用于内部跟踪；Action 仍需满足原始目标容差。
 projection_tracking_tolerance: 0.10
 
-# 非完整底盘的路径跟踪、最终朝向和事件触发重规划。
+# DWA/DWB 式直行优先路径跟踪、最终朝向和事件触发重规划。
 control_rate: 20.0
 health_rate: 5.0
 goal_timeout: 120.0
@@ -104,7 +105,32 @@ blocked_recovery_timeout: 5.00
 
 # 全向局部轨迹与有限次卡死恢复。
 local_rollout_time: 0.80
-local_lateral_speed: 0.15
+# 正常跟踪先只采样 vy=0；以下值只用于 LATERAL_AVOID，recovery 不受此限制。
+local_lateral_speed: 0.08
+path_align_enter_angle: 0.45
+path_align_exit_angle: 0.20
+path_align_max_angular_speed: 0.35
+track_lateral_enter_distance: 0.10
+track_lateral_exit_distance: 0.05
+track_lateral_recover_cycles: 3
+track_lateral_blocked_cycles: 2
+# 控制计算与 20 Hz 发布分离；已验证命令超过该 TTL 立即停车。
+local_command_ttl: 0.20
+# DWA 动态窗口由 /danger_search/cmd_vel_sent 的实际限幅后速度生成。
+local_linear_accel: 1.0
+local_lateral_accel: 1.0
+local_angular_accel: 2.0
+path_distance_weight: 3.0
+path_align_weight: 1.5
+path_progress_weight: -2.0
+clearance_weight: -0.5
+command_change_weight: 0.8
+lateral_penalty_weight: 1.0
+twirling_penalty_weight: 0.3
+oscillation_reset_distance: 0.05
+oscillation_reset_angle: 0.20
+# 贪心捷径只接受比原 A* 区段少不超过此值的最小净空。
+path_shortcut_clearance_loss: 0.02
 recovery_max_attempts: 2
 recovery_speed: 0.15
 recovery_target_distance: 0.40

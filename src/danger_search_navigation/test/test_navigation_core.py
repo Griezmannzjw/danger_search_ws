@@ -31,6 +31,9 @@ from navigation_core import (
     goal_reached,
     path_lengths,
     path_progress,
+    point_at_path_progress,
+    project_to_polyline,
+    remove_collinear_path_points,
 )
 from nav_controller import NavController, UrdfFootprintProvider
 
@@ -506,10 +509,10 @@ class NavigationStateTest(unittest.TestCase):
         self.assertAlmostEqual(config["dynamic_obstacle_ttl"], 0.50)
         self.assertAlmostEqual(config["inflation_padding"], 0.0)
         self.assertAlmostEqual(config["dynamic_inflation_radius"], 0.15)
-        self.assertAlmostEqual(config["footprint_padding"], 0.02)
-        self.assertAlmostEqual(config["clearance_soft_margin"], 0.05)
+        self.assertAlmostEqual(config["footprint_padding"], 0.04)
+        self.assertAlmostEqual(config["clearance_soft_margin"], 0.15)
         self.assertAlmostEqual(config["clearance_cost_weight"], 1.0)
-        self.assertAlmostEqual(config["dynamic_stop_distance"], 0.45)
+        self.assertAlmostEqual(config["dynamic_stop_distance"], 0.60)
         self.assertEqual(config["cruise_speed"], 0.35)
         self.assertEqual(config["max_linear_speed"], 0.35)
         self.assertAlmostEqual(config["lidar_pitch"], 0.0)
@@ -924,6 +927,46 @@ class NavigationPathTrackingTest(unittest.TestCase):
         self.assertAlmostEqual(linear_x, 0.35 * math.cos(heading))
         self.assertGreater(angular_z, 0.0)
         self.assertLess(linear_x, 0.40)
+
+    def test_polyline_projection_is_continuous_not_nearest_grid_point(self):
+        path = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+        distance, progress, segment, point, tangent = project_to_polyline(
+            (0.62, 0.12), path, path_lengths(path)
+        )
+        self.assertAlmostEqual(distance, 0.12)
+        self.assertAlmostEqual(progress, 0.62)
+        self.assertEqual(segment, 0)
+        self.assertEqual(point, (0.62, 0.0))
+        self.assertAlmostEqual(tangent, 0.0)
+
+    def test_forward_point_uses_arc_length_across_corner(self):
+        path = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+        point, tangent = point_at_path_progress(path, path_lengths(path), 1.25)
+        self.assertEqual(point, (1.0, 0.25))
+        self.assertAlmostEqual(tangent, math.pi / 2.0)
+
+    def test_collinear_cell_points_are_removed_without_cutting_corner(self):
+        path = [(0.0, 0.0), (0.05, 0.0), (0.10, 0.0), (0.10, 0.05)]
+        self.assertEqual(
+            remove_collinear_path_points(path),
+            [(0.0, 0.0), (0.10, 0.0), (0.10, 0.05)],
+        )
+
+    def test_dynamic_window_starts_from_post_mux_velocity(self):
+        self.controller.control_rate = 20.0
+        self.controller.sent_command = (0.20, 0.0, 0.10)
+        self.controller.sent_command_stamp = rospy.Time.from_sec(10.0)
+        self.controller.local_linear_accel = 1.0
+        self.controller.local_lateral_accel = 1.0
+        self.controller.local_angular_accel = 2.0
+        self.controller.max_linear_speed = 0.35
+        self.controller.local_lateral_speed = 0.08
+        self.controller.path_align_max_angular_speed = 0.35
+        window = self.controller._dynamic_window(rospy.Time.from_sec(10.05))
+        self.assertAlmostEqual(window[0], 0.15)
+        self.assertAlmostEqual(window[1], 0.25)
+        self.assertAlmostEqual(window[4], 0.0)
+        self.assertAlmostEqual(window[5], 0.20)
 
 
 class NavigationGoalProjectionTest(unittest.TestCase):

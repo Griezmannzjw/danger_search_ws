@@ -52,6 +52,9 @@ from navigation_core import (
     normalize_angle,
     path_lengths,
     path_progress,
+    point_at_path_progress,
+    project_to_polyline,
+    remove_collinear_path_points,
 )
 
 
@@ -232,6 +235,7 @@ class NavController:
         self.map_frame = rospy.get_param("~map_frame", "map")
         self.base_frame = rospy.get_param("~base_frame", "base")
         self.nav_cmd_topic = rospy.get_param("~nav_cmd_topic", "/danger_search/nav_cmd_vel")
+        self.sent_cmd_topic = rospy.get_param("~sent_cmd_topic", "/danger_search/cmd_vel_sent")
         self.pose_topic = rospy.get_param("~pose_topic", "/localization/pose")
         self.map_topic = rospy.get_param("~map_topic", "/map")
         self.mapping_status_topic = rospy.get_param("~mapping_status_topic", "/mapping/status")
@@ -281,18 +285,18 @@ class NavController:
         self.obstacle_footprint_max_y = float(
             rospy.get_param("~obstacle_footprint_max_y", 0.15)
         )
-        self.footprint_padding = float(rospy.get_param("~footprint_padding", 0.02))
+        self.footprint_padding = float(rospy.get_param("~footprint_padding", 0.04))
         self.footprint_history_seconds = float(
             rospy.get_param("~footprint_history_seconds", 0.40)
         )
         self.footprint_timeout = float(rospy.get_param("~footprint_timeout", 0.50))
         self.clearance_soft_margin = float(
-            rospy.get_param("~clearance_soft_margin", 0.05)
+            rospy.get_param("~clearance_soft_margin", 0.15)
         )
         self.clearance_cost_weight = float(
             rospy.get_param("~clearance_cost_weight", 1.0)
         )
-        self.dynamic_stop_distance = float(rospy.get_param("~dynamic_stop_distance", 0.45))
+        self.dynamic_stop_distance = float(rospy.get_param("~dynamic_stop_distance", 0.60))
         self.dynamic_front_half_angle = float(rospy.get_param("~dynamic_front_half_angle", 0.52))
         self.dynamic_confirmation_frames = int(
             rospy.get_param("~dynamic_confirmation_frames", 3)
@@ -344,7 +348,30 @@ class NavController:
             rospy.get_param("~recovery_progress_distance", 0.01)
         )
         self.local_rollout_time = float(rospy.get_param("~local_rollout_time", 0.80))
-        self.local_lateral_speed = float(rospy.get_param("~local_lateral_speed", 0.15))
+        self.local_lateral_speed = float(rospy.get_param("~local_lateral_speed", 0.08))
+        # DWA/DWB-derived tracking limits.  The values below deliberately
+        # expose the critic semantics rather than hiding them in constants.
+        self.path_align_enter_angle = float(rospy.get_param("~path_align_enter_angle", 0.45))
+        self.path_align_exit_angle = float(rospy.get_param("~path_align_exit_angle", 0.20))
+        self.path_align_max_angular_speed = float(rospy.get_param("~path_align_max_angular_speed", 0.35))
+        self.track_lateral_enter_distance = float(rospy.get_param("~track_lateral_enter_distance", 0.10))
+        self.track_lateral_exit_distance = float(rospy.get_param("~track_lateral_exit_distance", 0.05))
+        self.track_lateral_recover_cycles = int(rospy.get_param("~track_lateral_recover_cycles", 3))
+        self.track_lateral_blocked_cycles = int(rospy.get_param("~track_lateral_blocked_cycles", 2))
+        self.local_command_ttl = float(rospy.get_param("~local_command_ttl", 0.20))
+        self.local_linear_accel = float(rospy.get_param("~local_linear_accel", 1.0))
+        self.local_lateral_accel = float(rospy.get_param("~local_lateral_accel", 1.0))
+        self.local_angular_accel = float(rospy.get_param("~local_angular_accel", 2.0))
+        self.path_distance_weight = float(rospy.get_param("~path_distance_weight", 3.0))
+        self.path_align_weight = float(rospy.get_param("~path_align_weight", 1.5))
+        self.path_progress_weight = float(rospy.get_param("~path_progress_weight", -2.0))
+        self.clearance_weight = float(rospy.get_param("~clearance_weight", -0.5))
+        self.command_change_weight = float(rospy.get_param("~command_change_weight", 0.8))
+        self.lateral_penalty_weight = float(rospy.get_param("~lateral_penalty_weight", 1.0))
+        self.twirling_penalty_weight = float(rospy.get_param("~twirling_penalty_weight", 0.3))
+        self.oscillation_reset_distance = float(rospy.get_param("~oscillation_reset_distance", 0.05))
+        self.oscillation_reset_angle = float(rospy.get_param("~oscillation_reset_angle", 0.20))
+        self.path_shortcut_clearance_loss = float(rospy.get_param("~path_shortcut_clearance_loss", 0.02))
         self.goal_projection_max_radius = float(
             rospy.get_param("~goal_projection_max_radius", 0.40)
         )
@@ -434,6 +461,17 @@ class NavController:
         self.planning_active = False
         self.planning_failure_since = None
         self.last_cmd_time = rospy.Time(0)
+        self.sent_command = (0.0, 0.0, 0.0)
+        self.sent_command_stamp = rospy.Time(0)
+        self.cached_command = (0.0, 0.0, 0.0)
+        self.cached_command_stamp = rospy.Time(0)
+        self.tracking_mode = "ALIGN_PATH"
+        self.forward_blocked_cycles = 0
+        self.forward_recovered_cycles = 0
+        self.oscillation_pose = None
+        self.oscillation_lateral_sign = 0
+        self.oscillation_yaw_sign = 0
+        self.control_compute_started = rospy.Time(0)
         self.active_tracking_target = None
         self.goal_projected = False
 
@@ -472,6 +510,9 @@ class NavController:
         )
         self.safety_stop_sub = rospy.Subscriber(
             self.safety_stop_topic, Bool, self.safety_stop_callback
+        )
+        self.sent_cmd_sub = rospy.Subscriber(
+            self.sent_cmd_topic, Twist, self.sent_cmd_callback, queue_size=10
         )
 
         self.action_server = actionlib.SimpleActionServer(
@@ -520,6 +561,11 @@ class NavController:
             self.recovery_time_allowance, self.recovery_no_progress_timeout,
             self.recovery_progress_distance,
             self.local_rollout_time, self.local_lateral_speed,
+            self.path_align_enter_angle, self.path_align_exit_angle,
+            self.path_align_max_angular_speed, self.local_command_ttl,
+            self.local_linear_accel, self.local_lateral_accel,
+            self.local_angular_accel, self.oscillation_reset_distance,
+            self.oscillation_reset_angle,
         )
         if any(not math.isfinite(value) or value <= 0.0 for value in positive_values):
             raise rospy.ROSInitException("导航正数参数无效")
@@ -572,6 +618,12 @@ class NavController:
             raise rospy.ROSInitException("投影跟踪容差必须位于 0 和目标容差之间")
         if not 1 <= self.occupied_threshold <= 100:
             raise rospy.ROSInitException("占据阈值必须位于 1..100")
+        if (self.path_align_exit_angle >= self.path_align_enter_angle
+                or self.track_lateral_exit_distance >= self.track_lateral_enter_distance
+                or self.track_lateral_recover_cycles < 1
+                or self.track_lateral_blocked_cycles < 1
+                or self.path_shortcut_clearance_loss < 0.0):
+            raise rospy.ROSInitException("路径对齐、横移滞回或路径简化参数无效")
 
     def pose_callback(self, msg):
         """仅保存时间、帧、数值和四元数均合法的 map 位姿。"""
@@ -583,6 +635,15 @@ class NavController:
             active = self.goal_state.active
         if not valid and active:
             self._stop_robot()
+
+    def sent_cmd_callback(self, msg):
+        """Use cmd_mux's post-limit command as DWA's current velocity state."""
+        values = (msg.linear.x, msg.linear.y, msg.angular.z)
+        if not self._finite(*values):
+            return
+        with self.lock:
+            self.sent_command = tuple(float(value) for value in values)
+            self.sent_command_stamp = rospy.Time.now()
 
     def map_callback(self, msg):
         """校验地图并原子替换 planner，重复内容只更新时间戳。"""
@@ -933,6 +994,7 @@ class NavController:
         route, _, _ = self._plan_goal_path(
             start_xy, goal, dynamic_cells, dynamic_clear_world
         )
+        route = self._simplify_route(route, goal[2], dynamic_cells, initial_yaw)
         return route if self._route_is_swept_safe(
             route, goal[2], dynamic_cells, initial_yaw=initial_yaw
         ) else None
@@ -988,6 +1050,13 @@ class NavController:
                 route, tracking_target[2] if tracking_target is not None else None,
                 dynamic_cells, initial_yaw=current[2]):
             return None, None, False
+        if route is not None:
+            route = self._simplify_route(
+                route,
+                tracking_target[2] if tracking_target is not None else None,
+                dynamic_cells,
+                current[2],
+            )
         return route, tracking_target, projected
 
     def _footprint_snapshot(self):
@@ -1038,6 +1107,66 @@ class NavController:
             allow_blacklist_escape=allow_blacklist_escape,
         )
         return safe
+
+    def _swept_clearance(self, route, final_yaw, dynamic_cells, initial_yaw):
+        """Return exact swept-footprint safety and clearance for one polyline."""
+        if not route:
+            return False, 0.0
+        with self.lock:
+            planner = self.planner
+            blacklist = set(self.trap_blacklist_cells)
+        if planner is None:
+            return False, 0.0
+        start_yaw = float(initial_yaw) if initial_yaw is not None else 0.0
+        allow_escape = planner.footprint_blacklist_overlap(
+            (route[0][0], route[0][1], start_yaw), self._footprint_snapshot(), blacklist
+        ) > 0.0
+        return planner.swept_path_metrics(
+            route, self._footprint_snapshot(), dynamic_cells=dynamic_cells,
+            blacklist_cells=blacklist, final_yaw=final_yaw,
+            initial_yaw=initial_yaw, allow_blacklist_escape=allow_escape,
+        )
+
+    def _simplify_route(self, route, final_yaw, dynamic_cells=(), initial_yaw=None):
+        """Greedily shortcut an A* polyline, but only after exact sweep checks.
+
+        A* still determines free-space topology.  This merely removes its 5 cm
+        stair-steps when the straight segment is equally safe; it can never
+        take a visually tempting shortcut across a furniture corner.
+        """
+        if not route or len(route) <= 2:
+            return route
+        route = remove_collinear_path_points(route)
+        if len(route) <= 2:
+            return route
+        simplified = [route[0]]
+        anchor = 0
+        heading = initial_yaw
+        while anchor < len(route) - 1:
+            selected = anchor + 1
+            for candidate in range(len(route) - 1, anchor, -1):
+                segment = [route[anchor], route[candidate]]
+                segment_yaw = (
+                    final_yaw if candidate == len(route) - 1 else
+                    math.atan2(segment[-1][1] - segment[0][1], segment[-1][0] - segment[0][0])
+                )
+                safe, clearance = self._swept_clearance(
+                    segment, segment_yaw, dynamic_cells, heading
+                )
+                _, original_clearance = self._swept_clearance(
+                    route[anchor:candidate + 1], segment_yaw, dynamic_cells, heading
+                )
+                if safe and clearance + self.path_shortcut_clearance_loss >= original_clearance:
+                    selected = candidate
+                    break
+            simplified.append(route[selected])
+            if selected > anchor:
+                heading = math.atan2(
+                    route[selected][1] - route[anchor][1],
+                    route[selected][0] - route[anchor][0],
+                )
+            anchor = selected
+        return simplified
 
     def _planning_elapsed(self, now):
         with self.lock:
@@ -1555,7 +1684,8 @@ class NavController:
                 command, rotation_safe = self._safe_final_rotation_command(
                     current, yaw_error, now
                 )
-                self._publish_velocity(0.0, command[2])
+                self.tracking_mode = "FINAL_ALIGN"
+                self._cache_safe_command(command, now)
                 recovery_reason = self._recovery_should_start(
                     current, command, rotation_safe, now
                 )
@@ -1590,9 +1720,7 @@ class NavController:
                 if route_blocked:
                     command = (0.0, 0.0, 0.0)
                     motion_available = False
-                self._publish_velocity(
-                    command[0], command[2], linear_y=command[1]
-                )
+                self._cache_safe_command(command, now)
                 command_has_motion = (
                     math.hypot(command[0], command[1]) >= self.stuck_command_speed
                     or abs(command[2]) >= 0.05
@@ -1651,6 +1779,8 @@ class NavController:
             self.recovery_active = False
             self.recovery_attempt = 0
             self.blocked_since = None
+            self.cached_command = (0.0, 0.0, 0.0)
+            self.cached_command_stamp = rospy.Time(0)
             self.progress_checker.reset()
             self.failure_code = code
             self.failure_detail = detail
@@ -1675,16 +1805,35 @@ class NavController:
         self._stop_robot()
 
     def control_loop(self, _event):
-        """无活动目标或规划中持续发送零速度，消除旧命令残留。"""
+        """20 Hz publisher for the last checked command; never reuse it past TTL."""
         with self.lock:
             active = self.goal_state.active
             planning = self.planning_active
+            recovering = getattr(self, "recovery_active", False)
+            cached = getattr(self, "cached_command", (0.0, 0.0, 0.0))
+            cached_stamp = getattr(self, "cached_command_stamp", rospy.Time(0))
         if not active or planning:
             if planning:
                 checker = getattr(self, "progress_checker", None)
                 if checker is not None:
                     checker.pause(rospy.Time.now().to_sec())
             self._stop_robot()
+            return
+        if recovering:
+            # Recovery owns its own closed-loop safety checks and publishes
+            # every iteration. Do not overwrite that maneuver with tracking.
+            return
+        now = rospy.Time.now()
+        if cached_stamp.is_zero() or (now - cached_stamp).to_sec() > self.local_command_ttl:
+            self._stop_robot()
+            return
+        self._publish_velocity(cached[0], cached[2], linear_y=cached[1])
+
+    def _cache_safe_command(self, command, stamp):
+        """Atomically hand a fully swept-safe tracking command to the 20 Hz timer."""
+        with self.lock:
+            self.cached_command = tuple(float(value) for value in command)
+            self.cached_command_stamp = stamp
 
     def _mark_stuck(self):
         with self.lock:
@@ -1713,8 +1862,13 @@ class NavController:
         return cells
 
     def _safe_tracking_command(self, current, route, front_clearance, now):
-        """Score a compact holonomic velocity set with full swept-footprint checks."""
-        nominal_x, nominal_yaw = self._path_tracking_command(current, route)
+        """DWA/DWB-style local tracking with a strict straight-first policy.
+
+        The first pass is deliberately 3 vx x 3 wz (vy=0).  Only when it has
+        no forward solution, or when the continuous cross-track error is large,
+        do we expand to the small lateral-avoidance set.
+        """
+        compute_started = time.monotonic()
         if not route:
             return (0.0, 0.0, 0.0), False, 0.0
         with self.lock:
@@ -1728,66 +1882,192 @@ class NavController:
         )
         allow_blacklist_escape = initial_blacklist_overlap > 0
         raw_cells = self._raw_obstacle_cells(now)
-        lateral = min(self.local_lateral_speed, 0.25)
-        yaw_values = {
-            self._clamp(nominal_yaw + delta, -self.max_angular_speed, self.max_angular_speed)
-            for delta in (-0.25, 0.0, 0.25)
-        }
-        forward_values = {
-            0.0,
-            min(nominal_x, 0.12),
-            nominal_x,
-        }
-        candidates = []
-        for forward in forward_values:
-            for side in (-lateral, 0.0, lateral):
-                for angular in yaw_values:
-                    if (front_clearance <= self.dynamic_stop_distance
-                            and forward > 0.0):
-                        continue
-                    command = (forward, side, angular)
-                    safe, clearance = planner.command_is_safe(
-                        current,
-                        command,
-                        self.local_rollout_time,
-                        footprint,
-                        dynamic_cells=raw_cells,
-                        blacklist_cells=blacklist,
-                        allow_blacklist_escape=allow_blacklist_escape,
-                    )
-                    if not safe:
-                        continue
-                    poses = planner.rollout_pose(
-                        current, command, self.local_rollout_time
-                    )
-                    endpoint = poses[-1]
-                    endpoint_blacklist_overlap = planner.footprint_blacklist_overlap(
-                        endpoint, footprint, blacklist
-                    )
-                    path_deviation = self._path_deviation(endpoint[:2], route)
-                    goal_distance = math.hypot(
-                        endpoint[0] - route[-1][0], endpoint[1] - route[-1][1]
-                    )
-                    score = (
-                        2.0 * path_deviation
-                        + 0.6 * goal_distance
-                        + 0.45 * abs(side)
-                        + 0.15 * abs(angular - nominal_yaw)
-                        + 0.35 * endpoint_blacklist_overlap
-                        - 0.35 * forward
-                        - 0.10 * min(clearance, 1.0)
-                    )
-                    candidates.append((score, command, clearance, poses))
+        projection = self._path_projection(current[:2], route)
+        cross_track, arc_length, _, _, tangent = projection
+        heading_error = normalize_angle(tangent - current[2])
+        if self.tracking_mode == "ALIGN_PATH":
+            if abs(heading_error) <= self.path_align_exit_angle:
+                self.tracking_mode = "TRACK_PATH"
+            else:
+                command, safe = self._safe_path_alignment_command(current, heading_error, now)
+                self._record_control_compute_time(compute_started)
+                return command, safe, 0.0
+        elif abs(heading_error) >= self.path_align_enter_angle:
+            self.tracking_mode = "ALIGN_PATH"
+            command, safe = self._safe_path_alignment_command(current, heading_error, now)
+            self._record_control_compute_time(compute_started)
+            return command, safe, 0.0
+
+        nominal_x, nominal_yaw = self._path_tracking_command(current, route)
+        window = self._dynamic_window(now)
+        yaw_values = self._sample_window(nominal_yaw, window[4], window[5], 3)
+        # Six normal candidates (2 vx x 3 wz) leave margin below the
+        # DWA-style <=9 budget while retaining a low/high reachable speed.
+        forward_values = self._sample_window(nominal_x, window[0], window[1], 2)
+        forward_values = [value for value in forward_values if value > 1e-4]
+
+        def score_candidates(sides, forwards=forward_values):
+            candidates = []
+            for forward in forwards:
+                if front_clearance <= self.dynamic_stop_distance:
+                    continue
+                for side in sides:
+                    for angular in yaw_values:
+                        command = (forward, side, angular)
+                        if self._oscillation_rejected(current, command):
+                            continue
+                        safe, clearance = planner.command_is_safe(
+                            current, command, self.local_rollout_time, footprint,
+                            dynamic_cells=raw_cells, blacklist_cells=blacklist,
+                            allow_blacklist_escape=allow_blacklist_escape,
+                        )
+                        if not safe:
+                            continue
+                        poses = planner.rollout_pose(current, command, self.local_rollout_time)
+                        endpoint = poses[-1]
+                        end_projection = self._path_projection(endpoint[:2], route)
+                        path_error = end_projection[0] / max(self.track_lateral_enter_distance, 1e-6)
+                        align_error = abs(normalize_angle(end_projection[4] - endpoint[2])) / math.pi
+                        progress = max(0.0, end_projection[1] - arc_length) / max(self.lookahead_distance, 1e-6)
+                        with self.lock:
+                            previous = self.sent_command
+                        command_delta = (
+                            abs(command[0] - previous[0]) / max(self.max_linear_speed, 1e-6)
+                            + abs(command[1] - previous[1]) / max(self.local_lateral_speed, 1e-6)
+                            + abs(command[2] - previous[2]) / max(self.max_angular_speed, 1e-6)
+                        )
+                        lateral_cost = abs(side) / max(self.local_lateral_speed, 1e-6)
+                        twirling = abs(angular) / max(self.max_angular_speed, 1e-6) * (1.0 - min(1.0, forward / max(self.cruise_speed, 1e-6)))
+                        score = (
+                            self.path_distance_weight * path_error
+                            + self.path_align_weight * align_error
+                            + self.path_progress_weight * progress
+                            + self.clearance_weight * min(clearance, 1.0)
+                            + self.command_change_weight * command_delta
+                            + self.lateral_penalty_weight * lateral_cost
+                            + self.twirling_penalty_weight * twirling
+                        )
+                        candidates.append((score, command, clearance, poses))
+            return candidates
+
+        straight_candidates = score_candidates((0.0,))
+        lateral_needed = (
+            cross_track > self.track_lateral_enter_distance
+            or (not straight_candidates and self.forward_blocked_cycles + 1 >= self.track_lateral_blocked_cycles)
+        )
+        if straight_candidates and not lateral_needed:
+            self.forward_blocked_cycles = 0
+            self.forward_recovered_cycles += 1
+            if self.tracking_mode == "LATERAL_AVOID" and (
+                    cross_track <= self.track_lateral_exit_distance
+                    and self.forward_recovered_cycles >= self.track_lateral_recover_cycles):
+                self.tracking_mode = "TRACK_PATH"
+            candidates = straight_candidates
+        else:
+            self.forward_blocked_cycles += 1
+            self.forward_recovered_cycles = 0
+            self.tracking_mode = "LATERAL_AVOID"
+            lateral_values = self._sample_window(
+                0.0, window[2], window[3], 3
+            )
+            lateral_values = [value for value in lateral_values if abs(value) > 1e-4]
+            # A blocked front must be able to choose a pure sidestep.  Keeping
+            # vx=0 also preserves the hard 0.60 m forward-stop contract.
+            candidates = score_candidates(tuple(lateral_values), (0.0,))
         if not candidates:
+            self._record_control_compute_time(compute_started)
             return (0.0, 0.0, 0.0), False, 0.0
         _, command, clearance, poses = min(candidates, key=lambda item: item[0])
+        self._record_oscillation_command(current, command)
         self._publish_path(
             self.local_trajectory_pub,
             [(pose[0], pose[1]) for pose in poses],
             now,
             [pose[2] for pose in poses],
         )
+        self._record_control_compute_time(compute_started)
         return command, True, clearance
+
+    @staticmethod
+    def _record_control_compute_time(started):
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        if elapsed_ms > 50.0:
+            rospy.logwarn_throttle(
+                2.0, "[navigation] local trajectory scoring %.1f ms (target p95 < 50 ms)",
+                elapsed_ms,
+            )
+
+    def _path_projection(self, point, route):
+        lengths = path_lengths(route)
+        with self.lock:
+            start = max(0, min(self.waypoint_index, len(route) - 2))
+        result = project_to_polyline(point, route, lengths, start)
+        with self.lock:
+            self.waypoint_index = max(self.waypoint_index, result[2])
+        return result
+
+    @staticmethod
+    def _sample_window(nominal, minimum, maximum, count):
+        minimum, maximum = float(minimum), float(maximum)
+        if maximum < minimum:
+            return []
+        values = [minimum + (maximum - minimum) * index / max(1, count - 1)
+                  for index in range(count)]
+        values.append(max(minimum, min(maximum, float(nominal))))
+        return sorted({round(value, 5) for value in values})
+
+    def _dynamic_window(self, now):
+        with self.lock:
+            actual = self.sent_command
+            stamp = self.sent_command_stamp
+        dt = 1.0 / self.control_rate
+        if not stamp.is_zero():
+            dt = max(dt, min(0.20, (now - stamp).to_sec()))
+        return (
+            max(0.0, actual[0] - self.local_linear_accel * dt),
+            min(self.max_linear_speed, actual[0] + self.local_linear_accel * dt),
+            max(-self.local_lateral_speed, actual[1] - self.local_lateral_accel * dt),
+            min(self.local_lateral_speed, actual[1] + self.local_lateral_accel * dt),
+            max(-self.path_align_max_angular_speed, actual[2] - self.local_angular_accel * dt),
+            min(self.path_align_max_angular_speed, actual[2] + self.local_angular_accel * dt),
+        )
+
+    def _safe_path_alignment_command(self, current, heading_error, now):
+        """Rotation-shim equivalent: zero translation, acceleration-limited yaw."""
+        _, _, _, _, minimum_yaw, maximum_yaw = self._dynamic_window(now)
+        angular = self._clamp(
+            self.rotate_in_place_gain * heading_error,
+            minimum_yaw, maximum_yaw,
+        )
+        if abs(angular) < 1e-4:
+            return (0.0, 0.0, 0.0), False
+        command, safe = self._safe_final_rotation_command(current, heading_error, now, angular)
+        if safe:
+            self._record_oscillation_command(current, command)
+        return command, safe
+
+    def _oscillation_rejected(self, current, command):
+        if self.oscillation_pose is not None:
+            moved = math.hypot(current[0] - self.oscillation_pose[0], current[1] - self.oscillation_pose[1])
+            turned = abs(normalize_angle(current[2] - self.oscillation_pose[2]))
+            if moved >= self.oscillation_reset_distance or turned >= self.oscillation_reset_angle:
+                self.oscillation_lateral_sign = 0
+                self.oscillation_yaw_sign = 0
+                self.oscillation_pose = current
+        side_sign = 1 if command[1] > 1e-4 else -1 if command[1] < -1e-4 else 0
+        yaw_sign = 1 if command[2] > 1e-4 else -1 if command[2] < -1e-4 else 0
+        return bool(
+            (side_sign and self.oscillation_lateral_sign and side_sign != self.oscillation_lateral_sign)
+            or (yaw_sign and self.oscillation_yaw_sign and yaw_sign != self.oscillation_yaw_sign)
+        )
+
+    def _record_oscillation_command(self, current, command):
+        if self.oscillation_pose is None:
+            self.oscillation_pose = current
+        if abs(command[1]) > 1e-4:
+            self.oscillation_lateral_sign = 1 if command[1] > 0.0 else -1
+        if abs(command[2]) > 1e-4:
+            self.oscillation_yaw_sign = 1 if command[2] > 0.0 else -1
 
     def _recovery_should_start(self, current, command, motion_available, now):
         """Return a precise recovery trigger reason, or ``None``."""
@@ -1805,10 +2085,10 @@ class NavController:
             return "NO_POSE_PROGRESS"
         return None
 
-    def _safe_final_rotation_command(self, current, yaw_error, now):
+    def _safe_final_rotation_command(self, current, yaw_error, now, angular_override=None):
         """Check the complete footprint before any goal-facing rotation."""
         angular = self._clamp(
-            self.final_yaw_gain * yaw_error,
+            self.final_yaw_gain * yaw_error if angular_override is None else angular_override,
             -self.max_angular_speed,
             self.max_angular_speed,
         )
@@ -2102,36 +2382,35 @@ class NavController:
         publisher.publish(message)
 
     def _path_tracking_command(self, current, route):
-        """跟踪路径前视点；大偏航时先原地旋转。"""
+        """Continuous pure-pursuit nominal command from a polyline projection."""
         if not route:
             return 0.0, 0.0
         current_x, current_y, current_yaw = current
-        index = self._closest_path_index(current_x, current_y, route)
-        target_x, target_y = route[-1]
-        for point_x, point_y in route[index:]:
-            if math.hypot(point_x - current_x, point_y - current_y) >= self.lookahead_distance:
-                target_x, target_y = point_x, point_y
-                break
-        heading_error = normalize_angle(
-            math.atan2(target_y - current_y, target_x - current_x) - current_yaw
+        _, progress, _, _, tangent = self._path_projection((current_x, current_y), route)
+        (target_x, target_y), _ = point_at_path_progress(
+            route, path_lengths(route), progress + self.lookahead_distance
         )
-        if abs(heading_error) >= self.rotate_in_place_angle:
-            return 0.0, self.rotate_in_place_gain * heading_error
+        heading_error = normalize_angle(
+            tangent - current_yaw
+        )
         distance_to_goal = math.hypot(route[-1][0] - current_x, route[-1][1] - current_y)
         linear_x = min(self.cruise_speed, self.max_linear_speed, distance_to_goal)
         linear_x *= max(0.0, math.cos(heading_error))
-        angular_z = linear_x * 2.0 * math.sin(heading_error) / self.lookahead_distance
+        target_error = normalize_angle(
+            math.atan2(target_y - current_y, target_x - current_x) - current_yaw
+        )
+        angular_z = linear_x * 2.0 * math.sin(target_error) / self.lookahead_distance
         return linear_x, angular_z
 
     def _closest_path_index(self, current_x, current_y, route):
-        with self.lock:
-            start_index = min(self.waypoint_index, max(0, len(route) - 1))
-        best_index = start_index
-        best_distance = float("inf")
-        for index in range(start_index, len(route)):
-            distance = math.hypot(route[index][0] - current_x, route[index][1] - current_y)
-            if distance < best_distance:
-                best_index, best_distance = index, distance
+        if not route:
+            return 0
+        if len(route) == 1:
+            return 0
+        _, _, segment_index, _, _ = self._path_projection((current_x, current_y), route)
+        # Remaining-route consumers need the *next* vertex, while the
+        # controller itself works from the continuous segment projection.
+        best_index = min(len(route) - 1, segment_index + 1)
         with self.lock:
             self.waypoint_index = max(self.waypoint_index, best_index)
         return best_index
@@ -2139,7 +2418,7 @@ class NavController:
     def _path_deviation(self, current_xy, route):
         if not route:
             return float("inf")
-        return min(math.hypot(current_xy[0] - point[0], current_xy[1] - point[1]) for point in route)
+        return self._path_projection(current_xy, route)[0]
 
     def _publish_velocity(self, linear_x, angular_z, linear_y=0.0):
         """发布受速度上限约束的导航命令，并在发布前重新确认安全门。"""
