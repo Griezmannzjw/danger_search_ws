@@ -129,6 +129,10 @@ class OccupancyMapperCore:
                 cell_x = center[0] + offset_x
                 cell_y = center[1] + offset_y
                 if 0 <= cell_x < self.config.size and 0 <= cell_y < self.config.size:
+                    # 不擦穿已确认的墙：清障半径(0.5m) > 导航膨胀(0.33m)时，
+                    # 机器人贴墙会把 0.18m 薄外墙擦穿导致冲出楼栋。已确认占据的格不清。
+                    if self.scores[cell_y, cell_x] >= self.config.occupied_score:
+                        continue
                     self.scores[cell_y, cell_x] = self.config.min_score
                     self.observed[cell_y, cell_x] = True
 
