@@ -20,8 +20,15 @@ from danger_search_common.msg import (
 
 from .color_detector import RedCandidateDetector
 from .confidence import observation_confidence
-from .config import ColorDetectionConfig, GeometryConfig, PipelineConfig
+from .config import (
+    ColorDetectionConfig,
+    GeometryConfig,
+    PipelineConfig,
+    TrackingConfig,
+)
 from .depth_geometry import DepthGeometryValidator
+from .floor_context import FloorHeightClassifier, MappingGate
+from .tracking import DetectionObservation, MultiFrameDangerTracker
 
 
 class DangerDetectorNode:
@@ -42,8 +49,11 @@ class DangerDetectorNode:
         self.detections_topic = rospy.get_param(
             "~detections_topic", "/danger_detector/detections"
         )
-        map_frame = rospy.get_param("~map_frame", "map")
-        self.target_frame = rospy.get_param("~target_frame", map_frame)
+        self.map_frame = rospy.get_param("~map_frame", "map")
+        self.target_frame = rospy.get_param(
+            "~target_frame", self.map_frame
+        )
+        self.base_frame = rospy.get_param("~base_frame", "base")
         self.status_topic = rospy.get_param(
             "~status_topic", "/danger_detector/status"
         )
@@ -52,6 +62,30 @@ class DangerDetectorNode:
         self.floor_lock = threading.Lock()
         self.mapping_status_topic = rospy.get_param(
             "~mapping_status_topic", "/mapping/status"
+        )
+        self.require_stable_mapping = bool(
+            rospy.get_param(
+                "~require_stable_mapping",
+                self.target_frame == self.map_frame,
+            )
+        )
+        self.mapping_status_timeout_s = float(
+            rospy.get_param("~mapping_status_timeout_s", 1.5)
+        )
+        self.verify_floor_height = bool(
+            rospy.get_param(
+                "~verify_floor_height",
+                self.require_stable_mapping
+                and self.target_frame == self.map_frame,
+            )
+        )
+        self.floor_height_classifier = FloorHeightClassifier(
+            rospy.get_param("~floor_heights", [0.0, 2.6, 5.2]),
+            rospy.get_param("~floor_height_tolerance_m", 0.45),
+        )
+        self.mapping_gate = MappingGate(
+            self.mapping_status_timeout_s,
+            fallback_floor_id=self.floor_id,
         )
         self.input_fresh_timeout_s = float(
             rospy.get_param("~input_fresh_timeout_s", 1.0)
@@ -65,6 +99,14 @@ class DangerDetectorNode:
         self.color_config = self._load_color_config()
         self.geometry_config = self._load_geometry_config()
         self.pipeline_config = self._load_pipeline_config()
+        self.tracking_enabled = bool(
+            rospy.get_param("~tracking_enabled", True)
+        )
+        self.tracking_config = self._load_tracking_config()
+        self.tracker = (
+            MultiFrameDangerTracker(self.tracking_config)
+            if self.tracking_enabled else None
+        )
         self.color_detector = RedCandidateDetector(self.color_config)
         self.geometry_validator = DepthGeometryValidator(
             self.geometry_config
@@ -80,6 +122,9 @@ class DangerDetectorNode:
         self.has_synchronized_input = False
         self.last_tf_available = False
         self.last_camera_valid = False
+        self.last_floor_context_valid = not self.verify_floor_height
+        self.last_floor_context_epoch = -1
+        self.last_floor_context_reason = "WAITING_FOR_FLOOR_CONTEXT"
         self.state_lock = threading.Lock()
 
         self.detections_pub = rospy.Publisher(
@@ -112,12 +157,14 @@ class DangerDetectorNode:
 
         rospy.loginfo(
             "[perception] danger_detector started: RGB=%s depth=%s "
-            "detections=%s status=%s frame=%s",
+            "detections=%s status=%s frame=%s tracking=%s map_gate=%s",
             self.rgb_topic,
             self.depth_topic,
             self.detections_topic,
             self.status_topic,
             self.target_frame,
+            self.tracking_enabled,
+            self.require_stable_mapping,
         )
 
     def _sensor_callback(self, rgb_msg, depth_msg, camera_info_msg):
@@ -126,10 +173,23 @@ class DangerDetectorNode:
             self.last_input_stamp = rgb_msg.header.stamp
             self.last_detection_count = 0
             self.last_camera_valid = False
+            self.last_floor_context_valid = not self.verify_floor_height
+            self.last_floor_context_reason = "WAITING_FOR_FLOOR_CONTEXT"
 
         output = DangerSourceArray()
         output.header.stamp = rgb_msg.header.stamp
         output.header.frame_id = self.target_frame
+
+        mapping_snapshot = self.mapping_gate.snapshot(
+            rospy.Time.now().to_sec(),
+            required=self.require_stable_mapping,
+        )
+        if not mapping_snapshot.allowed:
+            self._set_floor_context(
+                False, mapping_snapshot.epoch, mapping_snapshot.reason
+            )
+            self._publish(output)
+            return
 
         images = self._convert_images(rgb_msg, depth_msg)
         if images is None:
@@ -171,9 +231,49 @@ class DangerDetectorNode:
                 self.last_tf_available = False
             self._publish(output)
             return
+
+        # RGB/depth, intrinsics and the target-frame transform are valid at
+        # this point.  Record that before the independent floor-height gate so
+        # a rejected floor is not misreported as an invalid camera input.
         with self.state_lock:
             self.last_camera_valid = True
             self.last_tf_available = True
+
+        if self.verify_floor_height:
+            base_transform = self._lookup_transform(
+                self.base_frame, rgb_msg.header.stamp
+            )
+            if base_transform is None:
+                with self.state_lock:
+                    self.last_tf_available = False
+                self._set_floor_context(
+                    False,
+                    mapping_snapshot.epoch,
+                    "FLOOR_HEIGHT_TF_UNAVAILABLE",
+                )
+                self._publish(output)
+                return
+            base_height = float(base_transform.transform.translation.z)
+            classified_floor = self.floor_height_classifier.classify(
+                base_height
+            )
+            if classified_floor != mapping_snapshot.floor_id:
+                rospy.logwarn_throttle(
+                    1.0,
+                    "[perception] sensor-time floor mismatch: status=%d "
+                    "base_z=%.3f classified=%s",
+                    mapping_snapshot.floor_id,
+                    base_height,
+                    str(classified_floor),
+                )
+                self._set_floor_context(
+                    False,
+                    mapping_snapshot.epoch,
+                    "FLOOR_HEIGHT_MISMATCH",
+                )
+                self._publish(output)
+                return
+        self._set_floor_context(True, mapping_snapshot.epoch, "OK")
 
         _, candidates = self.color_detector.detect(bgr)
         for candidate_index, candidate in enumerate(candidates):
@@ -198,10 +298,24 @@ class DangerDetectorNode:
 
             danger = self._to_danger_message(
                 geometry, confidence, camera_frame, rgb_msg.header.stamp,
-                transform, candidate_index
+                transform, candidate_index, mapping_snapshot.floor_id
             )
             if danger is not None:
                 output.dangers.append(danger)
+
+        if not self.mapping_gate.is_current(
+            mapping_snapshot,
+            rospy.Time.now().to_sec(),
+            required=self.require_stable_mapping,
+        ):
+            output.dangers = []
+            self._set_floor_context(
+                False,
+                mapping_snapshot.epoch,
+                "MAPPING_CHANGED_DURING_FRAME",
+            )
+        elif self.tracker is not None and output.dangers:
+            self._annotate_tracks(output.dangers, rgb_msg.header.stamp)
 
         with self.state_lock:
             self.last_detection_count = len(output.dangers)
@@ -225,7 +339,7 @@ class DangerDetectorNode:
 
     def _to_danger_message(
         self, geometry, confidence, camera_frame, stamp, transform,
-        candidate_index
+        candidate_index, floor_id=None
     ):
         point_camera = PointStamped()
         point_camera.header.stamp = stamp
@@ -251,28 +365,76 @@ class DangerDetectorNode:
         )
         danger.class_id = DangerSource.CLASS_DANGER_RED_SPHERE
         danger.position = point_target
-        with self.floor_lock:
-            danger.floor_id = self.current_floor
+        if floor_id is None:
+            with self.floor_lock:
+                floor_id = self.current_floor
+        danger.floor_id = int(floor_id)
         danger.confidence = float(confidence)
         danger.source_time = stamp
         return danger
 
     def _mapping_status_callback(self, message):
+        self.mapping_gate.update(
+            message.ready,
+            message.stable,
+            message.lost,
+            message.current_floor,
+            rospy.Time.now().to_sec(),
+        )
         if message.current_floor < 0:
             rospy.logwarn_throttle(
                 2.0,
-                "[perception] ignoring invalid floor id %d",
+                "[perception] blocking invalid floor id %d",
                 message.current_floor,
             )
             return
         with self.floor_lock:
             self.current_floor = int(message.current_floor)
 
-    def _lookup_transform(self, camera_frame, stamp):
+    def _annotate_tracks(self, dangers, stamp):
+        observations = [
+            DetectionObservation(
+                detection_id=danger.detection_id,
+                floor_id=danger.floor_id,
+                position=(
+                    danger.position.point.x,
+                    danger.position.point.y,
+                    danger.position.point.z,
+                ),
+                confidence=danger.confidence,
+                stamp_s=stamp.to_sec(),
+            )
+            for danger in dangers
+        ]
+        assignments = self.tracker.update(observations)
+        for danger, assignment in zip(dangers, assignments):
+            danger.track_id = assignment.track_id
+            danger.position.point.x = assignment.position[0]
+            danger.position.point.y = assignment.position[1]
+            danger.position.point.z = assignment.position[2]
+            danger.position_covariance = list(
+                assignment.position_covariance
+            )
+            danger.confirmed = assignment.confirmed
+            danger.verification_required = (
+                not assignment.confirmed
+                or bool(assignment.possible_duplicate_track_ids)
+            )
+            danger.possible_duplicate_track_ids = list(
+                assignment.possible_duplicate_track_ids
+            )
+
+    def _set_floor_context(self, valid, epoch, reason):
+        with self.state_lock:
+            self.last_floor_context_valid = bool(valid)
+            self.last_floor_context_epoch = int(epoch)
+            self.last_floor_context_reason = str(reason)
+
+    def _lookup_transform(self, source_frame, stamp):
         try:
             return self.tf_buffer.lookup_transform(
                 self.target_frame,
-                camera_frame,
+                source_frame,
                 stamp,
                 rospy.Duration(self.pipeline_config.tf_timeout_s),
             )
@@ -285,7 +447,7 @@ class DangerDetectorNode:
                 1.0,
                 "[perception] TF %s <- %s unavailable: %s",
                 self.target_frame,
-                camera_frame,
+                source_frame,
                 str(exc),
             )
             return None
@@ -306,6 +468,20 @@ class DangerDetectorNode:
             last_tf_available = self.last_tf_available
             last_camera_valid = self.last_camera_valid
             last_detection_count = self.last_detection_count
+            last_floor_context_valid = self.last_floor_context_valid
+            last_floor_context_epoch = self.last_floor_context_epoch
+            last_floor_context_reason = self.last_floor_context_reason
+
+        mapping_snapshot = self.mapping_gate.snapshot(
+            now.to_sec(), required=self.require_stable_mapping
+        )
+        floor_context_current = (
+            not self.verify_floor_height
+            or (
+                last_floor_context_valid
+                and last_floor_context_epoch == mapping_snapshot.epoch
+            )
+        )
 
         input_age_s = float("inf")
         if last_input_stamp != rospy.Time(0):
@@ -316,7 +492,11 @@ class DangerDetectorNode:
             and input_age_s < self.input_fresh_timeout_s
         )
         status.ready = (
-            status.input_fresh and last_camera_valid and last_tf_available
+            status.input_fresh
+            and mapping_snapshot.allowed
+            and last_camera_valid
+            and last_tf_available
+            and floor_context_current
         )
         status.input_latency_ms = (
             float(input_age_s * 1000.0)
@@ -324,19 +504,35 @@ class DangerDetectorNode:
             else -1.0
         )
         status.total_detections = last_detection_count
-        # P0 confirmation and de-duplication are owned by mission.
-        status.confirmed_count = 0
-        status.pending_verification = 0
+        if self.tracker is not None:
+            confirmed_count, tentative_count = self.tracker.counts(
+                now.to_sec()
+            )
+        else:
+            confirmed_count, tentative_count = 0, 0
+        status.confirmed_count = confirmed_count
+        status.pending_verification = tentative_count
         status.capability_version = self.capability_version
 
         if not has_synchronized_input:
             status.status_reason = "WAITING_FOR_SYNCHRONIZED_INPUT"
         elif not status.input_fresh:
             status.status_reason = "INPUT_STALE"
+        elif not mapping_snapshot.allowed:
+            status.status_reason = mapping_snapshot.reason
+        elif (
+            self.verify_floor_height
+            and last_floor_context_epoch == mapping_snapshot.epoch
+            and not last_floor_context_valid
+            and last_floor_context_reason.startswith("FLOOR_")
+        ):
+            status.status_reason = last_floor_context_reason
         elif not last_camera_valid:
             status.status_reason = "CAMERA_INPUT_INVALID"
         elif not last_tf_available:
             status.status_reason = "TARGET_FRAME_TF_UNAVAILABLE"
+        elif not floor_context_current:
+            status.status_reason = last_floor_context_reason
         else:
             status.status_reason = "OK"
 
@@ -393,6 +589,16 @@ class DangerDetectorNode:
         return PipelineConfig(
             **{
                 name: rospy.get_param("~" + name, value)
+                for name, value in vars(defaults).items()
+            }
+        )
+
+    @staticmethod
+    def _load_tracking_config():
+        defaults = TrackingConfig()
+        return TrackingConfig(
+            **{
+                name: rospy.get_param("~track_" + name, value)
                 for name, value in vars(defaults).items()
             }
         )

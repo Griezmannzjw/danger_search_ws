@@ -20,7 +20,15 @@ backend_pose_topic: /localization/hector_pose
 gicp_pose_topic: /localization/raw_pose
 validated_gicp_pose_topic: /localization/validated_pose
 raw_map_topic: /localization/raw_map
+raw_floor_map_topic: /localization/raw_floor_map
+current_floor_topic: /mapping/current_floor
+floor_map_topic_prefix: /mapping/floors
 use_hector_correction: false
+
+# 分楼层地图由 launch 在 gazebo_truth 联调模式下自动开启。正式 GICP
+# 模式保持关闭，直到生产定位后端能够提供经过验证的连续高度。
+multifloor_enabled: false
+floor_map_assignment_tolerance_m: 0.45
 
 # SimEnv integration-test truth source. Production launch defaults to GICP.
 gazebo_link_states_topic: /gazebo/link_states
@@ -204,6 +212,6 @@ vertical_max_abs_roll_rad: 0.26
 vertical_max_abs_pitch_rad: 0.26
 vertical_velocity_damping_per_s: 2.0
 vertical_acceleration_deadband_mps2: 0.15
-floor_heights: [0.0, 2.6, 5.2]
+floor_heights: [0.0, 2.6, 5.2]  # SimEnv 楼板标高（相对任务起点）
 floor_switch_hysteresis_m: 0.20
 floor_snap_tolerance_m: 0.35

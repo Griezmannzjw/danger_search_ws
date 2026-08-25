@@ -6,6 +6,7 @@ from danger_search_perception.config import (
     ColorDetectionConfig,
     GeometryConfig,
     PipelineConfig,
+    TrackingConfig,
 )
 
 
@@ -14,6 +15,7 @@ class TestPerceptionConfig(unittest.TestCase):
         ColorDetectionConfig()
         GeometryConfig()
         PipelineConfig()
+        TrackingConfig()
 
     def test_reversed_depth_range_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -30,6 +32,16 @@ class TestPerceptionConfig(unittest.TestCase):
         self.assertFalse(config.is_reliable_range((0.1, 0.0, 0.0)))
         self.assertTrue(config.is_reliable_range((1.0, 2.0, 0.0)))
         self.assertFalse(config.is_reliable_range((3.1, 0.0, 0.0)))
+
+    def test_invalid_tracking_config_is_rejected(self):
+        with self.assertRaises(ValueError):
+            TrackingConfig(confirmation_hits=0)
+        with self.assertRaises(ValueError):
+            TrackingConfig(association_distance_m=0.0)
+        with self.assertRaises(ValueError):
+            TrackingConfig(confirmation_hits=2.5)
+        with self.assertRaises(ValueError):
+            TrackingConfig(association_distance_m=float("inf"))
 
 
 if __name__ == "__main__":

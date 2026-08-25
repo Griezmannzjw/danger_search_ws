@@ -1,6 +1,7 @@
 """Typed configuration objects for the perception pipeline."""
 
 from dataclasses import dataclass
+import math
 
 
 def _require(condition, message):
@@ -139,4 +140,52 @@ class PipelineConfig:
             self.reliable_min_range ** 2
             <= squared_range
             <= self.reliable_max_range ** 2
+        )
+
+
+@dataclass(frozen=True)
+class TrackingConfig:
+    """Association and lifetime policy for static danger-source tracks."""
+
+    association_distance_m: float = 0.40
+    confirmation_hits: int = 3
+    tentative_timeout_s: float = 1.0
+    # Zero keeps confirmed tracks for the lifetime of the detector process.
+    confirmed_timeout_s: float = 0.0
+    initial_position_variance_m2: float = 0.0064
+    minimum_position_variance_m2: float = 0.0004
+
+    def __post_init__(self):
+        _require(
+            math.isfinite(float(self.association_distance_m))
+            and self.association_distance_m > 0.0,
+            "association_distance_m must be positive and finite",
+        )
+        _require(
+            isinstance(self.confirmation_hits, int)
+            and not isinstance(self.confirmation_hits, bool)
+            and self.confirmation_hits >= 1,
+            "confirmation_hits must be a positive integer",
+        )
+        _require(
+            math.isfinite(float(self.tentative_timeout_s))
+            and self.tentative_timeout_s > 0.0,
+            "tentative_timeout_s must be positive and finite",
+        )
+        _require(
+            math.isfinite(float(self.confirmed_timeout_s))
+            and self.confirmed_timeout_s >= 0.0,
+            "confirmed_timeout_s must be finite and cannot be negative",
+        )
+        _require(
+            math.isfinite(float(self.initial_position_variance_m2))
+            and self.initial_position_variance_m2 > 0.0,
+            "initial_position_variance_m2 must be positive and finite",
+        )
+        _require(
+            math.isfinite(float(self.minimum_position_variance_m2))
+            and 0.0 < self.minimum_position_variance_m2
+            <= self.initial_position_variance_m2,
+            "minimum_position_variance_m2 must be positive and no greater "
+            "than initial_position_variance_m2",
         )

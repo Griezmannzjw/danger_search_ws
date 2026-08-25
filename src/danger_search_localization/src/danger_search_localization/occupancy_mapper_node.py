@@ -5,12 +5,17 @@ import math
 import threading
 
 import rospy
+from danger_search_common.msg import FloorOccupancyGrid
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Empty, EmptyResponse
 
 from .occupancy_mapping import OccupancyMapperCore, OccupancyMappingConfig
+from .floor_mapping import (
+    FloorHeightClassifier,
+    MultiFloorOccupancyStore,
+)
 
 
 class OccupancyMapperNode:
@@ -27,6 +32,15 @@ class OccupancyMapperNode:
         )
         self.map_topic = rospy.get_param(
             "~raw_map_topic", "/localization/raw_map"
+        )
+        self.raw_floor_map_topic = rospy.get_param(
+            "~raw_floor_map_topic", "/localization/raw_floor_map"
+        )
+        self.floor_map_topic_prefix = rospy.get_param(
+            "~floor_map_topic_prefix", "/mapping/floors"
+        ).rstrip("/")
+        self.multifloor_enabled = bool(
+            rospy.get_param("~multifloor_enabled", False)
         )
         self.reset_map_service = rospy.get_param(
             "~reset_map_service", "/localization/reset_map"
@@ -56,17 +70,54 @@ class OccupancyMapperNode:
         )
         if self.publish_period <= 0.0:
             raise ValueError("map publication period must be positive")
-        self.core = OccupancyMapperCore(self.config)
+        self.initial_floor = int(rospy.get_param("~current_floor", 0))
+        self.floor_heights = tuple(
+            float(value) for value in rospy.get_param(
+                "~floor_heights", [0.0, 2.6, 5.2]
+            )
+        )
+        self.floor_classifier = FloorHeightClassifier(
+            self.floor_heights,
+            float(rospy.get_param("~floor_map_assignment_tolerance_m", 0.45)),
+        )
+        self.floor_store = MultiFloorOccupancyStore(
+            self.config,
+            range(len(self.floor_heights)),
+            initial_floor=self.initial_floor,
+        )
+        self.current_floor = self.initial_floor
+        self.core = self.floor_store.core(self.current_floor)
         self.lock = threading.RLock()
         self.pose_cache = {}
         self.scan_cache = {}
         self.last_scan_stamp = rospy.Time(0)
         self.map_dirty = False
         self.map_load_time = rospy.Time.now()
+        self.map_load_times = {self.current_floor: self.map_load_time}
+        self.last_scan_stamps = {self.current_floor: self.last_scan_stamp}
+        self.latest_floor_key = None
 
         self.publisher = rospy.Publisher(
             self.map_topic, OccupancyGrid, queue_size=1, latch=True
         )
+        self.floor_publisher = None
+        self.floor_publishers = {}
+        if self.multifloor_enabled:
+            self.floor_publisher = rospy.Publisher(
+                self.raw_floor_map_topic,
+                FloorOccupancyGrid,
+                queue_size=1,
+                latch=True,
+            )
+            self.floor_publishers = {
+                floor_id: rospy.Publisher(
+                    "%s/%d/map" % (self.floor_map_topic_prefix, floor_id),
+                    OccupancyGrid,
+                    queue_size=1,
+                    latch=True,
+                )
+                for floor_id in range(len(self.floor_heights))
+            }
         self.pose_subscriber = rospy.Subscriber(
             self.pose_topic,
             PoseWithCovarianceStamped,
@@ -83,10 +134,12 @@ class OccupancyMapperNode:
             rospy.Duration(self.publish_period), self._publish_map
         )
         rospy.loginfo(
-            "[localization] canonical occupancy mapper: %s + %s -> %s",
+            "[localization] canonical occupancy mapper: %s + %s -> %s "
+            "(multifloor=%s)",
             self.pose_topic,
             self.scan_topic,
             self.map_topic,
+            self.multifloor_enabled,
         )
 
     @staticmethod
@@ -119,10 +172,21 @@ class OccupancyMapperNode:
         )
         position = message.pose.pose.position
         pose = (float(position.x), float(position.y), float(yaw))
-        if not all(math.isfinite(value) for value in pose):
+        height = float(position.z)
+        if not all(math.isfinite(value) for value in (*pose, height)):
             return
+        assignment = (
+            self.floor_classifier.classify(height)
+            if self.multifloor_enabled
+            else None
+        )
+        floor_id = (
+            assignment.floor_id
+            if assignment is not None
+            else (None if self.multifloor_enabled else self.initial_floor)
+        )
         with self.lock:
-            self.pose_cache[self._key(message.header.stamp)] = pose
+            self.pose_cache[self._key(message.header.stamp)] = (pose, floor_id)
             self._consume(self._key(message.header.stamp))
             self._prune_caches()
 
@@ -135,22 +199,37 @@ class OccupancyMapperNode:
             self._prune_caches()
 
     def _consume(self, key):
-        pose = self.pose_cache.get(key)
-        scan = self.scan_cache.get(key)
-        if pose is None or scan is None:
+        if key not in self.pose_cache or key not in self.scan_cache:
             return
+        pose, floor_id = self.pose_cache.pop(key)
+        scan = self.scan_cache.pop(key)
+        if floor_id is None:
+            rospy.loginfo_throttle(
+                1.0,
+                "[localization] dropping mapping scan while between floors",
+            )
+            return
+        self._ensure_floor_runtime(floor_id)
         try:
-            updated = self.core.update(pose, scan)
+            updated = self.floor_store.update(floor_id, pose, scan)
         except ValueError as exc:
             rospy.logwarn_throttle(
                 1.0, "[localization] occupancy update rejected: %s", str(exc)
             )
             updated = False
         if updated:
-            self.last_scan_stamp = scan.header.stamp
+            self.last_scan_stamps[floor_id] = scan.header.stamp
+            if self.latest_floor_key is None or key >= self.latest_floor_key:
+                if floor_id != self.current_floor:
+                    rospy.loginfo(
+                        "[localization] occupancy map switched floor %d -> %d",
+                        self.current_floor,
+                        floor_id,
+                    )
+                self.current_floor = floor_id
+                self.latest_floor_key = key
+                self._sync_current_floor_compatibility()
             self.map_dirty = True
-        self.pose_cache.pop(key, None)
-        self.scan_cache.pop(key, None)
 
     def _prune_caches(self):
         for cache in (self.pose_cache, self.scan_cache):
@@ -163,11 +242,17 @@ class OccupancyMapperNode:
         with self.lock:
             if self.core.update_count == 0:
                 return
-            message = self._map_message_locked(self.last_scan_stamp)
+            floor_id = self.current_floor
+            message = self._map_message_locked(
+                self.last_scan_stamps[floor_id], floor_id
+            )
+            version = self.floor_store.version(floor_id)
             self.map_dirty = False
-        self.publisher.publish(message)
+        self._publish_floor_messages(floor_id, version, message)
 
     def _reset_map_callback(self, _request):
+        if getattr(self, "multifloor_enabled", False):
+            return self._reset_all_floor_maps()
         now = rospy.Time.now()
         with self.lock:
             if now <= self.map_load_time:
@@ -183,18 +268,93 @@ class OccupancyMapperNode:
         rospy.logwarn("[localization] occupancy map reset by service request")
         return EmptyResponse()
 
-    def _map_message_locked(self, stamp):
+    def _reset_all_floor_maps(self):
+        now = rospy.Time.now()
+        with self.lock:
+            known_floors = self.floor_store.floor_ids
+            latest_load_time = max(
+                self.map_load_times.values(), default=rospy.Time(0)
+            )
+            if now <= latest_load_time:
+                now = latest_load_time + rospy.Duration.from_sec(1e-9)
+            self.floor_store.reset_all()
+            self.pose_cache.clear()
+            self.scan_cache.clear()
+            self.map_load_times = {floor_id: now for floor_id in known_floors}
+            self.last_scan_stamps = {floor_id: now for floor_id in known_floors}
+            self.latest_floor_key = None
+            self.map_dirty = False
+            self._sync_current_floor_compatibility()
+            messages = {
+                floor_id: self._map_message_locked(now, floor_id)
+                for floor_id in known_floors
+            }
+        # Publish every reset epoch through the atomic envelope so the adapter
+        # also clears metadata for floors that are not currently selected.
+        for floor_id, message in messages.items():
+            archive_publisher = self.floor_publishers.get(floor_id)
+            if archive_publisher is not None:
+                archive_publisher.publish(message)
+            self._publish_floor_envelope(floor_id, 0, message)
+        current_message = messages[self.current_floor]
+        self._publish_floor_messages(self.current_floor, 0, current_message)
+        rospy.logwarn("[localization] all per-floor occupancy maps reset")
+        return EmptyResponse()
+
+    def _ensure_floor_runtime(self, floor_id):
+        self.floor_store.core(floor_id)
+        if floor_id not in self.map_load_times:
+            self.map_load_times[floor_id] = rospy.Time.now()
+        self.last_scan_stamps.setdefault(floor_id, rospy.Time(0))
+
+    def _sync_current_floor_compatibility(self):
+        self._ensure_floor_runtime(self.current_floor)
+        self.core = self.floor_store.core(self.current_floor)
+        self.map_load_time = self.map_load_times[self.current_floor]
+        self.last_scan_stamp = self.last_scan_stamps[self.current_floor]
+
+    def _publish_floor_messages(self, floor_id, version, message):
+        self.publisher.publish(message)
+        if not getattr(self, "multifloor_enabled", False):
+            return
+        self._publish_floor_envelope(floor_id, version, message)
+        self.floor_publishers[floor_id].publish(message)
+
+    def _publish_floor_envelope(self, floor_id, version, message):
+        envelope = FloorOccupancyGrid()
+        envelope.header = message.header
+        envelope.floor_id = int(floor_id)
+        envelope.map_version = int(version)
+        envelope.occupancy_grid = message
+        self.floor_publisher.publish(envelope)
+
+    def _map_message_locked(self, stamp, floor_id=None):
+        floor_id = (
+            getattr(self, "current_floor", 0)
+            if floor_id is None
+            else int(floor_id)
+        )
+        core = (
+            self.floor_store.core(floor_id)
+            if hasattr(self, "floor_store")
+            else self.core
+        )
+        map_load_time = (
+            self.map_load_times[floor_id]
+            if hasattr(self, "map_load_times")
+            else self.map_load_time
+        )
         message = OccupancyGrid()
         message.header.stamp = stamp
         message.header.frame_id = self.map_frame
-        message.info.map_load_time = self.map_load_time
+        message.info.map_load_time = map_load_time
         message.info.resolution = self.config.resolution
         message.info.width = self.config.size
         message.info.height = self.config.size
-        message.info.origin.position.x = self.core.origin_x
-        message.info.origin.position.y = self.core.origin_y
+        message.info.origin.position.x = core.origin_x
+        message.info.origin.position.y = core.origin_y
         message.info.origin.orientation.w = 1.0
-        message.data = self.core.occupancy_data()
+        message.data = core.occupancy_data()
         return message
 
     @staticmethod

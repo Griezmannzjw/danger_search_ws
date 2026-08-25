@@ -104,6 +104,7 @@ class GazeboTruthOdometry:
                     pose.position.x,
                     pose.position.y,
                     yaw,
+                    pose.position.z,
                 )
         except ValueError as exc:
             rospy.logwarn_throttle(1.0, "[localization] invalid Gazebo truth: %s", exc)
@@ -114,7 +115,7 @@ class GazeboTruthOdometry:
             rospy.logwarn_throttle(2.0, "[localization] /scan has a zero timestamp")
             return
         with self.lock:
-            pose = self.core.pose_at(stamp.to_sec())
+            pose = self.core.pose_with_height_at(stamp.to_sec())
         if pose is None:
             rospy.logwarn_throttle(
                 1.0, "[localization] no fresh Gazebo truth for scan timestamp"
@@ -125,8 +126,9 @@ class GazeboTruthOdometry:
         output.header.frame_id = self.odom_frame
         output.pose.pose.position.x = pose[0]
         output.pose.pose.position.y = pose[1]
-        output.pose.pose.orientation.z = math.sin(0.5 * pose[2])
-        output.pose.pose.orientation.w = math.cos(0.5 * pose[2])
+        output.pose.pose.position.z = pose[2]
+        output.pose.pose.orientation.z = math.sin(0.5 * pose[3])
+        output.pose.pose.orientation.w = math.cos(0.5 * pose[3])
         output.pose.covariance[0] = self.xy_variance
         output.pose.covariance[7] = self.xy_variance
         output.pose.covariance[14] = self.xy_variance

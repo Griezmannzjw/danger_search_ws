@@ -1,4 +1,4 @@
-"""ROS-independent planar pose handling for the Gazebo truth test source."""
+"""ROS-independent pose handling for the Gazebo truth integration source."""
 
 from collections import deque
 from dataclasses import dataclass
@@ -51,6 +51,7 @@ class TruthSample:
     stamp_s: float
     x: float
     y: float
+    z: float
     yaw: float
 
 
@@ -75,17 +76,17 @@ class GazeboTruthCore:
         self.latest = None
         self.history.clear()
 
-    def update(self, stamp_s, x, y, yaw):
-        values = tuple(float(value) for value in (stamp_s, x, y, yaw))
+    def update(self, stamp_s, x, y, yaw, z=0.0):
+        values = tuple(float(value) for value in (stamp_s, x, y, z, yaw))
         if not all(math.isfinite(value) for value in values):
             raise ValueError("truth sample must be finite")
-        stamp_s, x, y, yaw = values
+        stamp_s, x, y, z, yaw = values
         if self.latest is not None and stamp_s < self.latest.stamp_s:
             self.reset()
         yaw = normalize_angle(yaw)
         if self.origin is None:
-            self.origin = (x, y, yaw)
-        sample = TruthSample(stamp_s, x, y, yaw)
+            self.origin = (x, y, z, yaw)
+        sample = TruthSample(stamp_s, x, y, z, yaw)
         if self.history and abs(stamp_s - self.history[-1].stamp_s) <= 1e-9:
             self.history[-1] = sample
         else:
@@ -93,6 +94,14 @@ class GazeboTruthCore:
         self.latest = sample
 
     def pose_at(self, stamp_s):
+        pose = self.pose_with_height_at(stamp_s)
+        if pose is None:
+            return None
+        return pose[0], pose[1], pose[3]
+
+    def pose_with_height_at(self, stamp_s):
+        """Return mission-relative ``x, y, z, yaw`` at a sensor timestamp."""
+
         stamp_s = float(stamp_s)
         if (not math.isfinite(stamp_s) or self.latest is None
                 or self.origin is None or not self.history):
@@ -106,9 +115,9 @@ class GazeboTruthCore:
             return None
 
         if stamp_s <= oldest.stamp_s + epsilon:
-            selected = (oldest.x, oldest.y, oldest.yaw)
+            selected = (oldest.x, oldest.y, oldest.z, oldest.yaw)
         elif stamp_s >= latest.stamp_s - epsilon:
-            selected = (latest.x, latest.y, latest.yaw)
+            selected = (latest.x, latest.y, latest.z, latest.yaw)
         else:
             selected = None
             previous = oldest
@@ -118,16 +127,28 @@ class GazeboTruthCore:
                     ratio = 0.0 if span <= epsilon else (
                         stamp_s - previous.stamp_s
                     ) / span
-                    selected = interpolate_planar_pose(
+                    planar = interpolate_planar_pose(
                         (previous.x, previous.y, previous.yaw),
                         (following.x, following.y, following.yaw),
                         ratio,
+                    )
+                    selected = (
+                        planar[0],
+                        planar[1],
+                        previous.z + (following.z - previous.z) * ratio,
+                        planar[2],
                     )
                     break
                 previous = following
             if selected is None:
                 return None
-        return relative_planar_pose(
-            self.origin,
-            selected,
+        relative_xy_yaw = relative_planar_pose(
+            (self.origin[0], self.origin[1], self.origin[3]),
+            (selected[0], selected[1], selected[3]),
+        )
+        return (
+            relative_xy_yaw[0],
+            relative_xy_yaw[1],
+            selected[2] - self.origin[2],
+            relative_xy_yaw[2],
         )

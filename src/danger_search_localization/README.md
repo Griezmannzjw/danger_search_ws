@@ -8,7 +8,7 @@
 
 为隔离验证 navigation、exploration、perception 和 mission，可显式启用 Gazebo 真值
 定位。该模式读取 `/gazebo/link_states` 中的 `a1_gazebo::base`，将首次有效位姿定义为
-`(0,0,0)`，并只替代内部 `/localization/raw_pose` 来源。位姿守卫、传感器建图、公共
+`(x,y,z,yaw)=(0,0,0,0)`，并只替代内部 `/localization/raw_pose` 来源。位姿守卫、传感器建图、公共
 状态和 `map -> odom -> base` TF 仍使用正常数据链，adapter 仍是唯一 TF 发布者。
 `LinkStates` 没有消息时间戳，因此节点用接收时的仿真时间保存最近 1000 个 truth
 位姿，并复用扫描投影模块的 SE(2) 插值按 `/scan.header.stamp` 配对；ROS 回调乱序时
@@ -23,6 +23,13 @@ roslaunch danger_search_bringup competition.launch \
 ground-truth TF；同时开启 referee odom 会造成重复 TF 发布。默认
 `localization_source:=gicp` 保持不变。
 
+真值联调模式会自动开启分楼层地图。SimEnv 的楼板相对高度由
+`floor_heights: [0.0, 2.6, 5.2]` 配置；机器人位于楼层附近时，扫描只更新该层地图，
+位于电梯运行区间等层间高度时扫描直接丢弃。每个访问过的楼层都有独立的地图核心，
+因此换层不会把墙体投影进上一层，返航到旧楼层时会恢复旧图并继续增加该层版本。
+地图在一次任务进程内保存在内存中；新随机场景或显式调用
+`/localization/reset_map` 时会清空所有楼层，避免跨场景复用旧图。
+
 ## 当前数据链
 
 ```text
@@ -34,7 +41,9 @@ ground-truth TF；同时开启 referee odom 会造成重复 TF 发布。默认
             +-> /localization/validated_pose (odom，仅健康帧)
             |    +-> scan_projector.py -> /localization/scan（局部避障，持续）
             |          +-> /localization/mapping_scan（长期建图，旋转安全时）
-            |               +-> local_occupancy_mapper -> /localization/raw_map
+            |               +-> local_occupancy_mapper
+            |                    +-> /localization/raw_floor_map（楼层+版本+地图原子消息）
+            |                    +-> /mapping/floors/<floor_id>/map（各层留存图）
             +-> /localization/pose、/map、状态和 map -> odom -> base TF
 
 导航和建图都不直接消费 `/localization/raw_pose`；投影、长期建图和 TF 使用同一份
@@ -92,8 +101,10 @@ GICP 位姿和地图更新建立后，`/mapping/status` 应变为 `ready: True`�
 |---|---|---|
 | `/tf`、`/tf_static` | TF | `map -> odom -> base` |
 | `/localization/pose` | `geometry_msgs/PoseWithCovarianceStamped` | `map` 中的当前位姿 |
-| `/map` | `nav_msgs/OccupancyGrid` | 当前单楼层二维占据地图 |
-| `/localization/reset_map` | `std_srvs/Empty` | 任务停止后清空自定义占据图并发布全未知地图 |
+| `/map` | `nav_msgs/OccupancyGrid` | 当前楼层二维占据地图；换层稳定前暂停更新 |
+| `/mapping/current_floor` | `std_msgs/Int32` | 当前确认楼层，编号从 0 开始 |
+| `/mapping/floors/<id>/map` | `nav_msgs/OccupancyGrid` | 已访问楼层的独立、latched 地图 |
+| `/localization/reset_map` | `std_srvs/Empty` | 任务停止后清空所有分楼层占据图并发布全未知地图 |
 | `/mapping/status` | `danger_search_common/MappingStatus` | 地图就绪、稳定、丢失、楼层和版本 |
 | `/localization/status` | `danger_search_common/LocalizationStatus` | 定位跟踪和协方差状态 |
 
@@ -117,6 +128,11 @@ Hector 模式正常时才显示 `TRACKING_FUSED_GICP_ODOMETRY_WITH_BOUNDED_HECTO
 反复 GICP 失败、位姿门控拒绝或 Hector 修正被拒绝时状态先变为 `DEGRADED`，navigation 会安全停车；
 持续局部里程计失败才会进入 `LOST`，有效数据恢复后自动回到 `TRACKING`。
 
+换层期间 `/mapping/status` 明确发布 `stable=false`，原因为
+`FLOOR_TRANSITION_WAITING_FOR_CURRENT_MAP`。确认新楼层并积累至少
+`min_map_updates_for_stable` 次新扫描后，`/map` 才切换到该层；
+`floor_maps[]` 同时保留所有已访问楼层各自的版本与最后更新时间。
+
 ## 编译与启动
 
 安装运行依赖后：
@@ -134,22 +150,34 @@ roslaunch danger_search_localization localization.launch
 
 ```bash
 rostopic echo /mapping/status
+rostopic echo /mapping/current_floor
 rostopic echo /localization/pose
 rostopic echo /map --noarr
+rostopic echo /mapping/floors/0/map --noarr
 rosrun tf tf_echo map base
 # 仅在任务停止且导航目标已取消后调用
 rosservice call /localization/reset_map "{}"
 ```
 
+无需启动 SimEnv 的确定性分层回归测试：
+
+```bash
+rostest danger_search_localization multifloor_pipeline.test
+```
+
+该测试发布合成位姿和扫描，验证 `0 -> 1 -> 0` 换层、层间扫描拒绝、地图互不
+污染以及返层恢复；它不替代后续真实电梯和完整 P1 闭环测试。
+
 ## 目前边界与升级项
 
-- navigation 当前使用可靠性优先的二维 `x/y/yaw`，`z=0`；未经验证的 IMU 双积分
-  默认关闭；
-- 当前只维护 `current_floor=0`，尚未实现换层检测和分楼层地图；
+- 默认正式 GICP 模式仍使用可靠性优先的二维 `x/y/yaw`，未经验证的 IMU 双积分
+  默认关闭；当前分楼层能力只在显式 Gazebo 真值联调模式中自动启用；
+- 已实现当前层 `/map`、所有已访问层地图留存、换层隔离和返层恢复；电梯调用、
+  跨层目标调度和全楼层结束条件属于 mission/exploration 的后续工作；
 - 2D 投影不能保留楼梯、门槛和坡面的完整高度信息；
 - GICP 以最近可信扫描组成的有限局部子地图配准，长时间弱特征运动仍可能降级；可选
   Hector 只以受限 `map -> odom` 修正长期漂移；
 - GICP 位姿门控或可选 Hector 被判定为异常时会冻结公共地图，保证不会给 navigation 同时提供错误地图和
   正常状态；连续异常需要停车等待恢复，而不是冒险继续探索；
-- 下一阶段应接入 Livox + IMU 的 LIO，并增加表面点云、可通行性和楼层管理；
+- 下一阶段应让正式 LIO 提供可靠高度，再为导航/探索接入电梯状态机和跨层调度；
 - 后端升级时保持本 README 中的公共输出不变，探索、导航和感知无需跟着改。

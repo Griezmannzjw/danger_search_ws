@@ -1,0 +1,29 @@
+<launch>
+  <node name="test_local_occupancy_mapper"
+        pkg="danger_search_localization"
+        type="occupancy_mapper.py"
+        output="screen">
+    <rosparam command="load" file="$(find danger_search_localization)/config/default.yaml" />
+    <param name="multifloor_enabled" value="true" />
+    <param name="map_size" value="64" />
+    <param name="map_resolution" value="0.10" />
+    <param name="map_pub_period" value="0.10" />
+  </node>
+
+  <node name="test_localization_adapter"
+        pkg="danger_search_localization"
+        type="pose_estimator.py"
+        output="screen">
+    <rosparam command="load" file="$(find danger_search_localization)/config/default.yaml" />
+    <param name="localization_source" value="gazebo_truth" />
+    <param name="multifloor_enabled" value="true" />
+    <param name="pose_stabilizer_mode" value="trusted_passthrough" />
+    <param name="status_publish_rate_hz" value="10.0" />
+    <param name="tf_publish_future_tolerance_s" value="0.0" />
+  </node>
+
+  <test test-name="multifloor_pipeline"
+        pkg="danger_search_localization"
+        type="multifloor_pipeline_test.py"
+        time-limit="30.0" />
+</launch>

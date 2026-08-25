@@ -5,6 +5,7 @@ find_package(catkin REQUIRED COMPONENTS
   message_generation
   std_msgs
   geometry_msgs
+  nav_msgs
 )
 
 ## Generate messages in the 'msg' folder
@@ -17,6 +18,7 @@ add_message_files(
   DetectionStatus.msg
   LocalizationStatus.msg
   FloorMapInfo.msg
+  FloorOccupancyGrid.msg
   MappingStatus.msg
   NavigationHealth.msg
   RecoveryEvent.msg
@@ -29,6 +31,7 @@ generate_messages(
   DEPENDENCIES
   std_msgs
   geometry_msgs
+  nav_msgs
 )
 
 catkin_package(
@@ -36,6 +39,7 @@ catkin_package(
   message_runtime
   std_msgs
   geometry_msgs
+  nav_msgs
 )
 
 include_directories(

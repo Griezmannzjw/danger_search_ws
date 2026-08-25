@@ -10,12 +10,13 @@ import rospy
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 
-from danger_search_common.msg import LocalizationStatus
+from danger_search_common.msg import FloorOccupancyGrid, LocalizationStatus
 from danger_search_localization.adapter_node import (
     LocalizationAdapterNode,
     LocalVelocityEstimator,
 )
 from danger_search_localization.config import AdapterConfig
+from danger_search_localization.floor_mapping import FloorHeightClassifier
 from danger_search_localization.vertical_estimation import quaternion_to_rpy
 
 
@@ -278,6 +279,101 @@ class TestLocalizationAdapter(unittest.TestCase):
             localization_source="gazebo_truth",
         )
         self.assertEqual(reason, "GAZEBO_TRUTH_POSE_STALE")
+
+    def test_floor_transition_has_explicit_degraded_reason(self):
+        pose = PoseWithCovarianceStamped()
+
+        reason = self.adapter._status_reason(
+            pose,
+            pose_fresh=True,
+            map_fresh=True,
+            stable=False,
+            localization_source="gazebo_truth",
+            floor_transition_active=True,
+        )
+
+        self.assertEqual(
+            reason, "FLOOR_TRANSITION_WAITING_FOR_CURRENT_MAP"
+        )
+
+    def test_height_transition_changes_floor_without_reusing_old_public_map(self):
+        self.adapter.multifloor_enabled = True
+        self.adapter.floor_classifier = FloorHeightClassifier(
+            [0.0, 2.6, 5.2], assignment_tolerance_m=0.45
+        )
+        self.adapter.lock = threading.RLock()
+        self.adapter.current_floor = 0
+        self.adapter.current_height = 0.0
+        self.adapter.floor_transition_active = False
+        self.adapter.floor_transition_baseline_version = 0
+        self.adapter.floor_map_versions = {0: 8}
+        self.adapter.map_update_count = 8
+        self.adapter.map_version = 8
+        self.adapter.last_map_stamp = rospy.Time.from_sec(1.0)
+        self.adapter.last_map_received = rospy.Time.from_sec(1.0)
+        self.adapter.last_public_map_published = rospy.Time.from_sec(1.0)
+        self.adapter.last_map_update = rospy.Time.from_sec(1.0)
+        self.adapter.latest_raw_map = OccupancyGrid()
+        self.adapter.current_floor_pub = mock.Mock()
+
+        self.adapter._observe_floor_height(1.3)
+        self.assertTrue(self.adapter.floor_transition_active)
+        self.assertEqual(self.adapter.current_floor, 0)
+        self.adapter._observe_floor_height(2.6)
+
+        self.assertEqual(self.adapter.current_floor, 1)
+        self.assertIsNone(self.adapter.latest_raw_map)
+        self.assertEqual(self.adapter.map_update_count, 0)
+        self.adapter.current_floor_pub.publish.assert_called_once()
+        published = self.adapter.current_floor_pub.publish.call_args.args[0]
+        self.assertEqual(published.data, 1)
+
+    def test_floor_map_restores_only_after_fresh_updates(self):
+        self.adapter.config = AdapterConfig(min_map_updates_for_stable=2)
+        self.adapter.multifloor_enabled = True
+        self.adapter.lock = threading.RLock()
+        self.adapter.map_frame = "map"
+        self.adapter.current_floor = 1
+        self.adapter.floor_transition_active = True
+        self.adapter.floor_transition_baseline_version = 5
+        self.adapter.floor_map_versions = {0: 8, 1: 5}
+        self.adapter.floor_map_last_updates = {
+            0: rospy.Time.from_sec(8.0)
+        }
+        self.adapter.floor_last_seen_versions = {0: 8, 1: 5}
+        self.adapter.floor_map_load_times = {}
+        self.adapter.last_map_received = rospy.Time(0)
+        self.adapter.last_map_load_time = rospy.Time(0)
+        self.adapter.latest_raw_map = None
+        self.adapter.map_version = 5
+        self.adapter.map_update_count = 0
+        self.adapter.last_map_update = rospy.Time(0)
+
+        def envelope(version, stamp):
+            message = FloorOccupancyGrid()
+            message.floor_id = 1
+            message.map_version = version
+            message.occupancy_grid.header.frame_id = "map"
+            message.occupancy_grid.header.stamp = rospy.Time.from_sec(stamp)
+            message.occupancy_grid.info.map_load_time = rospy.Time.from_sec(1.0)
+            return message
+
+        with mock.patch.object(
+            rospy.Time, "now", return_value=rospy.Time.from_sec(20.0)
+        ), mock.patch.object(
+            self.adapter, "_publish_cached_map_if_safe"
+        ) as publish:
+            self.adapter._floor_map_callback(envelope(6, 10.0))
+            self.assertTrue(self.adapter.floor_transition_active)
+            self.assertEqual(self.adapter.map_update_count, 1)
+
+            self.adapter._floor_map_callback(envelope(7, 11.0))
+
+        self.assertFalse(self.adapter.floor_transition_active)
+        self.assertEqual(self.adapter.map_update_count, 2)
+        self.assertEqual(self.adapter.floor_map_versions[0], 8)
+        self.assertEqual(self.adapter.floor_map_versions[1], 7)
+        self.assertEqual(publish.call_count, 2)
 
     def test_vertical_state_adds_z_and_tilt_without_replacing_slam_yaw(self):
         self.adapter.config = AdapterConfig(vertical_estimation_enabled=True)

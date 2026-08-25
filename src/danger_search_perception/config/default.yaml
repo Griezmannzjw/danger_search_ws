@@ -4,8 +4,16 @@
 # 坐标系与当前楼层
 map_frame: map
 target_frame: map
+base_frame: base
 floor_id: 0
 mapping_status_topic: /mapping/status
+# 正式 map 输出只有在当前楼层地图健康稳定时才允许发布。
+require_stable_mapping: true
+mapping_status_timeout_s: 1.5
+# 用图像采集时刻的 map->base 高度复核楼层，避免换层瞬间错标。
+verify_floor_height: true
+floor_heights: [0.0, 2.6, 5.2]
+floor_height_tolerance_m: 0.45
 
 # 话题
 rgb_topic: /real_sense/rgb/image_raw
@@ -23,6 +31,16 @@ reliable_min_range: 0.4
 reliable_max_range: 5.0
 input_fresh_timeout_s: 1.0
 capability_version: 1
+
+# 同楼层三维跨帧关联。暂定轨迹短时过期；确认轨迹在本次节点进程中保留，
+# 返回旧楼层时仍可沿用原 track_id。
+tracking_enabled: true
+track_association_distance_m: 0.40
+track_confirmation_hits: 3
+track_tentative_timeout_s: 1.0
+track_confirmed_timeout_s: 0.0
+track_initial_position_variance_m2: 0.0064
+track_minimum_position_variance_m2: 0.0004
 
 # HSV 红色双区间
 red_h_low_1: 0

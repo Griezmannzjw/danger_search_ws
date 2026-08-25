@@ -10,10 +10,13 @@
 3. 通过深度点、球面拟合和投影半径验证红色球体；
 4. 使用平面残差排除红色方块干扰；
 5. 通过 TF 将球心转换到目标坐标系；
-6. 发布基础检测和检测器健康状态。
+6. 根据建图健康状态和采集时刻的机器人高度校验当前楼层；
+7. 在同一楼层内进行三维跨帧关联、位置平滑和有限确认；
+8. 发布检测和检测器健康状态。
 
-P0 阶段的跨帧汇总、空间去重和最终结果写入由
-`danger_search_mission` 负责。
+perception 负责短时/跨楼层返回后的观测身份和位置平滑；任务全程的最终空间去重、
+结果冻结和文件写入仍由 `danger_search_mission` 负责。两层职责使用同一检测消息，
+不会改变现有 mission 输入接口。
 
 ## ROS 接口
 
@@ -24,6 +27,7 @@ P0 阶段的跨帧汇总、空间去重和最终结果写入由
 | `/real_sense/rgb/image_raw` | `sensor_msgs/Image` | RGB 图像 |
 | `/real_sense/depth/image_raw` | `sensor_msgs/Image` | 深度图像 |
 | `/real_sense/rgb/camera_info` | `sensor_msgs/CameraInfo` | RGB 相机内参 |
+| `/mapping/status` | `danger_search_common/MappingStatus` | 当前楼层及地图健康状态 |
 
 三个输入使用近似时间同步。话题名称均可通过私有 ROS 参数修改。
 
@@ -39,12 +43,24 @@ P0 阶段的跨帧汇总、空间去重和最终结果写入由
 - `detection_id`：由图像时间戳与帧内候选序号生成；
 - `class_id=CLASS_DANGER_RED_SPHERE`；
 - `position`：包含采集时间和实际目标坐标系；
-- `floor_id`：P0 默认为 `0`；
+- `floor_id`：来自稳定的当前楼层，编号从 `0` 开始；
 - `confidence`：二维与三维验证的综合置信度；
+- `track_id`：同楼层三维跨帧轨迹 ID；
+- `confirmed`：轨迹达到配置的连续命中次数后为 `true`；
+- `position_covariance`：由轨迹观测离散度和保守先验生成；
 - `source_time`：原始 RGB 图像时间。
 
-P0 规范允许 `track_id`、位置协方差、确认、复核、疑似重复和定位修正版本
-保留默认值。检测数组为空只表示当前帧没有通过验证的红色球体。
+`localization_correction_version` 仍保留默认值，等待正式定位后端提供修正版本。
+检测数组为空可能表示当前帧没有通过验证的红色球体，也可能表示正在换层或地图不稳定；
+具体原因由 `/danger_detector/status.status_reason` 给出。
+
+### 多楼层发布门控
+
+完整系统默认要求 `/mapping/status` 新鲜且满足
+`ready && stable && !lost`。节点还会按 RGB 采集时间查询 `map -> base`，将机器人相对
+高度与 `floor_heights: [0.0, 2.6, 5.2]` 复核。两者不一致时整帧丢弃，因此电梯换层
+期间不会把二层目标错标为一层。确认轨迹按 `floor_id` 隔离；不同楼层相同 XY 不会
+合并。确认轨迹在本次节点进程内保留，返回旧楼层后可以恢复原 `track_id`。
 
 ### TF
 
@@ -67,6 +83,8 @@ map -> odom -> base -> camera
 - [x] 已知半径约束的球心估计
 - [x] 球面残差、平面残差和投影半径联合验证
 - [x] 按图像时间戳查询 TF
+- [x] 建图稳定性和传感器时刻楼层高度双重门控
+- [x] 同楼层三维跨帧关联、轨迹确认和位置协方差
 - [x] `DangerSourceArray` 和 `DetectionStatus` 发布
 
 当前传统视觉实现是无需训练数据的可运行基线。阈值仍需使用多个随机场景继续
@@ -108,6 +126,15 @@ roslaunch danger_search_perception danger_detector.launch
 
 ```bash
 rosrun danger_search_perception danger_detector.py _target_frame:=base
+```
+
+该命令没有全局建图输入，节点会自动关闭正式 map 门控。也可显式写为：
+
+```bash
+rosrun danger_search_perception danger_detector.py \
+  _target_frame:=base \
+  _require_stable_mapping:=false \
+  _verify_floor_height:=false
 ```
 
 总系统也会通过 `danger_search_bringup/launch/competition.launch` 启动本节点，

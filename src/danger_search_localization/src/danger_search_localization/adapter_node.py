@@ -9,15 +9,17 @@ import tf2_ros
 from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import Imu
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Int32
 
 from danger_search_common.msg import (
+    FloorOccupancyGrid,
     FloorMapInfo,
     LocalizationStatus,
     MappingStatus,
 )
 
 from .config import AdapterConfig
+from .floor_mapping import FloorHeightClassifier
 from .pose_filter import PoseStabilizer
 from .pose_fusion import compose, HectorGicpFusion, Pose2D
 from .vertical_estimation import (
@@ -95,6 +97,12 @@ class LocalizationAdapterNode:
         self.raw_map_topic = rospy.get_param(
             "~raw_map_topic", "/localization/raw_map"
         )
+        self.raw_floor_map_topic = rospy.get_param(
+            "~raw_floor_map_topic", "/localization/raw_floor_map"
+        )
+        self.current_floor_topic = rospy.get_param(
+            "~current_floor_topic", "/mapping/current_floor"
+        )
         self.mapping_pause_topic = rospy.get_param(
             "~mapping_pause_topic", "/localization/mapping_pause"
         )
@@ -119,9 +127,20 @@ class LocalizationAdapterNode:
                 "~localization_source must be 'gicp' or 'gazebo_truth'"
             )
         self.config = self._load_config()
+        self.multifloor_enabled = bool(
+            rospy.get_param("~multifloor_enabled", False)
+        )
+        self.floor_classifier = FloorHeightClassifier(
+            self.config.floor_heights,
+            float(rospy.get_param("~floor_map_assignment_tolerance_m", 0.45)),
+        )
         self.use_hector_correction = bool(
             rospy.get_param("~use_hector_correction", False)
         )
+        if self.multifloor_enabled and self.use_hector_correction:
+            raise rospy.ROSInitException(
+                "multifloor maps currently require the odometry-driven mapper"
+            )
         self.pose_fusion = HectorGicpFusion(self.config)
         self.pose_stabilizer = PoseStabilizer(self.config)
         self.vertical_estimator = VerticalEstimator(self.config)
@@ -166,6 +185,16 @@ class LocalizationAdapterNode:
         self.map_update_count = 0
         self.last_map_stamp = rospy.Time(0)
         self.latest_raw_map = None
+        self.current_floor = int(self.config.current_floor)
+        self.current_height = float(
+            self.config.floor_heights[self.current_floor]
+        )
+        self.floor_transition_active = False
+        self.floor_transition_baseline_version = 0
+        self.floor_map_versions = {}
+        self.floor_map_last_updates = {}
+        self.floor_last_seen_versions = {}
+        self.floor_map_load_times = {}
         self.ever_ready = False
         self.base_from_imu_quaternion = None
         self.latest_local_pose = None
@@ -202,6 +231,9 @@ class LocalizationAdapterNode:
         self.mapping_status_pub = rospy.Publisher(
             self.mapping_status_topic, MappingStatus, queue_size=5, latch=True
         )
+        self.current_floor_pub = rospy.Publisher(
+            self.current_floor_topic, Int32, queue_size=2, latch=True
+        )
         self.localization_status_pub = rospy.Publisher(
             self.localization_status_topic,
             LocalizationStatus,
@@ -222,12 +254,20 @@ class LocalizationAdapterNode:
             self._gicp_pose_callback,
             queue_size=10,
         )
-        self.map_sub = rospy.Subscriber(
-            self.raw_map_topic,
-            OccupancyGrid,
-            self._map_callback,
-            queue_size=1,
-        )
+        if self.multifloor_enabled:
+            self.map_sub = rospy.Subscriber(
+                self.raw_floor_map_topic,
+                FloorOccupancyGrid,
+                self._floor_map_callback,
+                queue_size=1,
+            )
+        else:
+            self.map_sub = rospy.Subscriber(
+                self.raw_map_topic,
+                OccupancyGrid,
+                self._map_callback,
+                queue_size=1,
+            )
         self.mapping_pause_sub = rospy.Subscriber(
             self.mapping_pause_topic, Header, self._mapping_pause_callback,
             queue_size=10,
@@ -247,8 +287,10 @@ class LocalizationAdapterNode:
             rospy.Duration(1.0 / self.config.status_publish_rate_hz),
             self._publish_status,
         )
+        self.current_floor_pub.publish(Int32(data=self.current_floor))
         rospy.loginfo(
-            "[localization] adapter started: backend=%s gicp=%s pose=%s map=%s",
+            "[localization] adapter started: backend=%s gicp=%s pose=%s map=%s "
+            "(multifloor=%s)",
             (
                 "gazebo_truth"
                 if self.localization_source == "gazebo_truth"
@@ -261,6 +303,7 @@ class LocalizationAdapterNode:
             self.gicp_pose_topic,
             self.pose_topic,
             self.map_topic,
+            self.multifloor_enabled,
         )
 
     def _backend_pose_callback(self, message):
@@ -376,6 +419,13 @@ class LocalizationAdapterNode:
             guarded.pose.yaw,
         )
         raw_position = message.pose.pose.position
+        raw_height = float(raw_position.z)
+        if not math.isfinite(raw_height):
+            rospy.logwarn_throttle(
+                1.0, "[localization] rejecting pose with invalid height"
+            )
+            return
+        self._observe_floor_height(raw_height)
         raw_delta_xy = math.hypot(
             local_pose.x - float(raw_position.x),
             local_pose.y - float(raw_position.y),
@@ -420,7 +470,9 @@ class LocalizationAdapterNode:
         validated_pose.header.frame_id = self.odom_frame
         validated_pose.pose.pose.position.x = local_pose.x
         validated_pose.pose.pose.position.y = local_pose.y
-        validated_pose.pose.pose.position.z = 0.0
+        validated_pose.pose.pose.position.z = (
+            raw_height if self.multifloor_enabled else 0.0
+        )
         local_qx, local_qy, local_qz, local_qw = quaternion_from_rpy(
             0.0, 0.0, local_pose.yaw
         )
@@ -433,7 +485,9 @@ class LocalizationAdapterNode:
         pose.header.frame_id = self.map_frame
         pose.pose.pose.position.x = fused_pose.x
         pose.pose.pose.position.y = fused_pose.y
-        pose.pose.pose.position.z = 0.0
+        pose.pose.pose.position.z = (
+            raw_height if self.multifloor_enabled else 0.0
+        )
         qx, qy, qz, qw = quaternion_from_rpy(0.0, 0.0, fused_pose.yaw)
         pose.pose.pose.orientation.x = qx
         pose.pose.pose.orientation.y = qy
@@ -478,6 +532,47 @@ class LocalizationAdapterNode:
         if pending_hector_pose is not None:
             self._backend_pose_callback(pending_hector_pose)
 
+    def _observe_floor_height(self, height):
+        if not getattr(self, "multifloor_enabled", False):
+            return
+        assignment = self.floor_classifier.classify(height)
+        publish_floor = None
+        with self.lock:
+            self.current_height = float(height)
+            if assignment is None:
+                if not self.floor_transition_active:
+                    self.floor_transition_active = True
+                    self.floor_transition_baseline_version = int(
+                        self.floor_map_versions.get(self.current_floor, 0)
+                    )
+                    self.map_update_count = 0
+                return
+            floor_id = int(assignment.floor_id)
+            if floor_id != self.current_floor:
+                previous_floor = self.current_floor
+                self.current_floor = floor_id
+                self.floor_transition_active = True
+                self.floor_transition_baseline_version = int(
+                    self.floor_map_versions.get(floor_id, 0)
+                )
+                self.map_version = self.floor_transition_baseline_version
+                self.map_update_count = 0
+                self.last_map_stamp = rospy.Time(0)
+                self.last_map_received = rospy.Time(0)
+                self.last_public_map_published = rospy.Time(0)
+                self.last_map_update = rospy.Time(0)
+                self.latest_raw_map = None
+                publish_floor = floor_id
+                rospy.loginfo(
+                    "[localization] confirmed floor transition %d -> %d "
+                    "at relative z=%.3f m",
+                    previous_floor,
+                    floor_id,
+                    height,
+                )
+        if publish_floor is not None:
+            self.current_floor_pub.publish(Int32(data=publish_floor))
+
     def _map_callback(self, message):
         if message.header.frame_id != self.map_frame:
             rospy.logwarn_throttle(
@@ -508,6 +603,92 @@ class LocalizationAdapterNode:
             self.latest_raw_map = message
         self._publish_cached_map_if_safe()
 
+    def _floor_map_callback(self, envelope):
+        floor_id = int(envelope.floor_id)
+        if floor_id < 0 or floor_id >= len(self.config.floor_heights):
+            rospy.logwarn_throttle(
+                2.0, "[localization] rejecting invalid floor id %d", floor_id
+            )
+            return
+        message = envelope.occupancy_grid
+        if message.header.frame_id != self.map_frame:
+            rospy.logwarn_throttle(
+                2.0,
+                "[localization] rejecting floor %d map in frame '%s'",
+                floor_id,
+                message.header.frame_id,
+            )
+            return
+        version = int(envelope.map_version)
+        now = rospy.Time.now()
+        publish_current = False
+        with self.lock:
+            load_time = message.info.map_load_time
+            previous_load_time = self.floor_map_load_times.get(
+                floor_id, rospy.Time(0)
+            )
+            reset_epoch = (
+                previous_load_time != rospy.Time(0)
+                and load_time != rospy.Time(0)
+                and load_time != previous_load_time
+            )
+            self.floor_map_load_times[floor_id] = load_time
+            if reset_epoch:
+                self.floor_last_seen_versions[floor_id] = 0
+                if floor_id == self.current_floor:
+                    self.floor_transition_baseline_version = 0
+                    self.floor_transition_active = True
+                    self.map_update_count = 0
+
+            previous_version = int(
+                self.floor_last_seen_versions.get(floor_id, 0)
+            )
+            if version < previous_version and not reset_epoch:
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[localization] rejecting regressed floor %d map version "
+                    "%d < %d",
+                    floor_id,
+                    version,
+                    previous_version,
+                )
+                return
+            self.floor_last_seen_versions[floor_id] = version
+            self.floor_map_versions[floor_id] = version
+            self.floor_map_last_updates[floor_id] = (
+                message.header.stamp
+                if message.header.stamp != rospy.Time(0)
+                else now
+            )
+            if floor_id != self.current_floor:
+                return
+
+            self.last_map_received = now
+            self.last_map_load_time = load_time
+            self.latest_raw_map = message
+            self.map_version = version
+            if self.floor_transition_active:
+                self.map_update_count = max(
+                    0, version - self.floor_transition_baseline_version
+                )
+                if (
+                    self.map_update_count
+                    >= self.config.min_map_updates_for_stable
+                ):
+                    self.floor_transition_active = False
+                    rospy.loginfo(
+                        "[localization] floor %d map restored and refreshed "
+                        "at version %d",
+                        floor_id,
+                        version,
+                    )
+            else:
+                self.map_update_count += max(0, version - previous_version)
+            self.last_map_update = self.floor_map_last_updates[floor_id]
+            publish_current = True
+        if publish_current:
+            self._publish_cached_map_if_safe()
+
     def _mapping_pause_callback(self, _message):
         with self.lock:
             self.last_mapping_pause_received = rospy.Time.now()
@@ -529,6 +710,15 @@ class LocalizationAdapterNode:
                 <= self.config.gicp_healthy_fresh_timeout_s
             )
             message = self.latest_raw_map
+            floor_transition_active = getattr(
+                self, "floor_transition_active", False
+            )
+        if floor_transition_active:
+            rospy.loginfo_throttle(
+                1.0,
+                "[localization] withholding /map during floor transition",
+            )
+            return
         if not map_correction_healthy or not gicp_healthy:
             rospy.logwarn_throttle(
                 1.0,
@@ -541,11 +731,12 @@ class LocalizationAdapterNode:
                 stamp = message.header.stamp
                 if stamp != self.last_map_stamp:
                     self.last_map_stamp = stamp
-                    self.map_version += 1
-                    if self.map_reset_pending:
-                        self.map_reset_pending = False
-                    else:
-                        self.map_update_count += 1
+                    if not getattr(self, "multifloor_enabled", False):
+                        self.map_version += 1
+                        if self.map_reset_pending:
+                            self.map_reset_pending = False
+                        else:
+                            self.map_update_count += 1
                     self.last_map_update = stamp or rospy.Time.now()
                     self.last_public_map_published = now
             self.map_pub.publish(message)
@@ -635,6 +826,7 @@ class LocalizationAdapterNode:
             local_velocity = self.latest_local_velocity
             velocity_degraded = self.latest_local_velocity_degraded
             velocity_received = self.last_local_velocity_received
+            current_height = self.current_height
         if pose is None:
             return
         # The cached GICP measurement may be older than the adapter timer.
@@ -671,6 +863,7 @@ class LocalizationAdapterNode:
             vertical,
             (0.0, 0.0, 0.0) if velocity_stale else local_velocity,
             velocity_degraded or velocity_stale,
+            current_height,
         )
         # Hector and perception query TF at sensor timestamps that can lead the
         # adapter timer under simulation load. A short, bounded future stamp is
@@ -698,7 +891,12 @@ class LocalizationAdapterNode:
         odom_to_base.child_frame_id = self.base_frame
         odom_to_base.transform.translation.x = local_pose.x
         odom_to_base.transform.translation.y = local_pose.y
-        if self.config.vertical_estimation_enabled and vertical.initialized:
+        if getattr(self, "multifloor_enabled", False):
+            odom_to_base.transform.translation.z = current_height
+            qx, qy, qz, qw = quaternion_from_rpy(
+                0.0, 0.0, local_pose.yaw
+            )
+        elif self.config.vertical_estimation_enabled and vertical.initialized:
             odom_to_base.transform.translation.z = vertical.z
             qx, qy, qz, qw = quaternion_from_rpy(
                 vertical.roll, vertical.pitch, local_pose.yaw
@@ -711,14 +909,23 @@ class LocalizationAdapterNode:
         odom_to_base.transform.rotation.w = qw
         self.tf_broadcaster.sendTransform([map_to_odom, odom_to_base])
 
-    def _publish_odometry(self, stamp, local_pose, vertical, velocity, degraded):
+    def _publish_odometry(
+        self, stamp, local_pose, vertical, velocity, degraded, current_height=None
+    ):
         message = Odometry()
         message.header.stamp = stamp
         message.header.frame_id = self.odom_frame
         message.child_frame_id = self.base_frame
         message.pose.pose.position.x = local_pose.x
         message.pose.pose.position.y = local_pose.y
-        if self.config.vertical_estimation_enabled and vertical.initialized:
+        if getattr(self, "multifloor_enabled", False):
+            message.pose.pose.position.z = float(
+                0.0 if current_height is None else current_height
+            )
+            qx, qy, qz, qw = quaternion_from_rpy(
+                0.0, 0.0, local_pose.yaw
+            )
+        elif self.config.vertical_estimation_enabled and vertical.initialized:
             message.pose.pose.position.z = vertical.z
             qx, qy, qz, qw = quaternion_from_rpy(
                 vertical.roll, vertical.pitch, local_pose.yaw
@@ -771,6 +978,26 @@ class LocalizationAdapterNode:
             pose_guard_rejections = self.pose_stabilizer.consecutive_rejections
             pose_guard_reason = self.pose_stabilizer.last_reason
 
+            multifloor_enabled = getattr(self, "multifloor_enabled", False)
+            floor_transition_active = getattr(
+                self, "floor_transition_active", False
+            )
+            current_floor = (
+                int(self.current_floor)
+                if multifloor_enabled
+                else (
+                    int(vertical.current_floor)
+                    if vertical.initialized
+                    else int(self.config.current_floor)
+                )
+            )
+            floor_map_versions = dict(
+                getattr(self, "floor_map_versions", {})
+            )
+            floor_map_last_updates = dict(
+                getattr(self, "floor_map_last_updates", {})
+            )
+
         pose_fresh = pose_age <= self.config.pose_fresh_timeout_s
         mapping_paused = (
             self._age(now, mapping_pause_received)
@@ -805,6 +1032,7 @@ class LocalizationAdapterNode:
             and map_fresh
             and fusion_initialized
             and not gicp_lost
+            and not floor_transition_active
         )
         stable = (
             ready
@@ -839,11 +1067,7 @@ class LocalizationAdapterNode:
             pose_guard_reason,
             mapping_paused,
             self.localization_source,
-        )
-        current_floor = (
-            vertical.current_floor
-            if vertical.initialized
-            else self.config.current_floor
+            floor_transition_active,
         )
 
         mapping = MappingStatus()
@@ -853,7 +1077,16 @@ class LocalizationAdapterNode:
         mapping.stable = stable
         mapping.lost = lost
         mapping.current_floor = current_floor
-        if map_version > 0:
+        if multifloor_enabled:
+            for floor_id in sorted(floor_map_versions):
+                floor = FloorMapInfo()
+                floor.floor_id = int(floor_id)
+                floor.map_version = int(floor_map_versions[floor_id])
+                floor.last_update = floor_map_last_updates.get(
+                    floor_id, rospy.Time(0)
+                )
+                mapping.floor_maps.append(floor)
+        elif map_version > 0:
             floor = FloorMapInfo()
             floor.floor_id = current_floor
             floor.map_version = map_version
@@ -867,8 +1100,12 @@ class LocalizationAdapterNode:
         localization.tracking_state = self._tracking_state(
             pose,
             pose_fresh,
-            map_fresh and fusion_initialized,
-            degraded=gicp_degraded or hector_degraded,
+            map_fresh and fusion_initialized and not floor_transition_active,
+            degraded=(
+                gicp_degraded
+                or hector_degraded
+                or floor_transition_active
+            ),
             lost=gicp_lost,
         )
         covariance_trace = self._covariance_trace(pose)
@@ -922,6 +1159,10 @@ class LocalizationAdapterNode:
         pose.pose.covariance = covariance
 
     def _apply_vertical_state(self, pose, vertical):
+        if getattr(self, "multifloor_enabled", False):
+            with self.lock:
+                pose.pose.pose.position.z = self.current_height
+            return
         if not self.config.vertical_estimation_enabled or not vertical.initialized:
             return
         _, _, yaw = quaternion_to_rpy(
@@ -976,6 +1217,7 @@ class LocalizationAdapterNode:
         pose_guard_reason="",
         mapping_paused=False,
         localization_source="gicp",
+        floor_transition_active=False,
     ):
         using_gazebo_truth = localization_source == "gazebo_truth"
         if pose is None:
@@ -1009,6 +1251,8 @@ class LocalizationAdapterNode:
             )
         if hector_degraded:
             return "HECTOR_CORRECTION_DEGRADED:" + hector_fusion_reason
+        if floor_transition_active:
+            return "FLOOR_TRANSITION_WAITING_FOR_CURRENT_MAP"
         if not map_fresh:
             return "MAP_STALE"
         if mapping_paused:

@@ -68,6 +68,19 @@ class TestGazeboTruth(unittest.TestCase):
         self.assertAlmostEqual(y, 0.0)
         self.assertAlmostEqual(yaw, 0.05)
 
+    def test_height_is_relative_to_start_and_interpolated(self):
+        core = GazeboTruthCore(max_age_s=0.2, max_future_s=0.05)
+        core.update(10.0, 0.0, 0.0, 0.0, z=0.6)
+        core.update(10.1, 0.0, 0.0, 0.0, z=3.2)
+
+        x, y, z, yaw = core.pose_with_height_at(10.05)
+
+        self.assertAlmostEqual(x, 0.0)
+        self.assertAlmostEqual(y, 0.0)
+        self.assertAlmostEqual(z, 1.3)
+        self.assertAlmostEqual(yaw, 0.0)
+        self.assertEqual(core.pose_at(10.05), (0.0, 0.0, 0.0))
+
     def test_time_rollback_reanchors_pose(self):
         core = GazeboTruthCore()
         core.update(10.0, 1.0, 2.0, 0.3)

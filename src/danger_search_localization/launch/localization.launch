@@ -3,6 +3,9 @@
   <arg name="use_hector_correction" default="false" />
   <arg name="localization_source" default="gicp" />
   <arg name="gazebo_base_link" default="a1_gazebo::base" />
+  <!-- 真值联调时可验证分层任务；正式模式需生产定位后端先提供可靠高度。 -->
+  <arg name="enable_multifloor_maps"
+       default="$(eval arg('localization_source') == 'gazebo_truth')" />
 
   <!-- 只读取官方原始 /scan；不读取 /Odometry_gazebo 或真值变换后的点云。 -->
   <node name="local_scan_projector"
@@ -39,6 +42,7 @@
           type="occupancy_mapper.py"
           output="screen">
       <rosparam command="load" file="$(arg config_file)" />
+      <param name="multifloor_enabled" value="$(arg enable_multifloor_maps)" />
     </node>
   </group>
 
@@ -65,6 +69,7 @@
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
     <param name="localization_source" value="$(arg localization_source)" />
+    <param name="multifloor_enabled" value="$(arg enable_multifloor_maps)" />
     <!-- Truth scans and poses share timestamps; do not extrapolate TF into the future. -->
     <param name="tf_publish_future_tolerance_s"
            value="$(eval 0.0 if arg('localization_source') == 'gazebo_truth' else 0.5)" />

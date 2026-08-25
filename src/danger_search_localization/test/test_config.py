@@ -128,6 +128,7 @@ class TestLocalizationConfig(unittest.TestCase):
         }
         self.assertEqual(arguments["localization_source"], "gicp")
         self.assertEqual(arguments["gazebo_base_link"], "a1_gazebo::base")
+        self.assertIn("gazebo_truth", arguments["enable_multifloor_maps"])
 
         source = launch_path.read_text()
         self.assertIn("localization_source') == 'gicp'", source)
@@ -150,6 +151,22 @@ class TestLocalizationConfig(unittest.TestCase):
         self.assertEqual(
             adapter_parameters["localization_source"],
             "$(arg localization_source)",
+        )
+        self.assertEqual(
+            adapter_parameters["multifloor_enabled"],
+            "$(arg enable_multifloor_maps)",
+        )
+        mapper_node = next(
+            node for node in root.findall(".//node")
+            if node.attrib["name"] == "local_occupancy_mapper"
+        )
+        mapper_parameters = {
+            parameter.attrib["name"]: parameter.attrib["value"]
+            for parameter in mapper_node.findall("param")
+        }
+        self.assertEqual(
+            mapper_parameters["multifloor_enabled"],
+            "$(arg enable_multifloor_maps)",
         )
 
         truth_script = (

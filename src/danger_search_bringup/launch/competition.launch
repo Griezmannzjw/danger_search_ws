@@ -11,6 +11,8 @@
   <arg name="use_hector_correction" default="false" />
   <arg name="localization_source" default="gicp" />
   <arg name="gazebo_base_link" default="a1_gazebo::base" />
+  <arg name="enable_multifloor_maps"
+       default="$(eval arg('localization_source') == 'gazebo_truth')" />
 
   <!-- 加载全局参数到根命名空间 -->
   <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
@@ -20,6 +22,7 @@
     <arg name="use_hector_correction" value="$(arg use_hector_correction)" />
     <arg name="localization_source" value="$(arg localization_source)" />
     <arg name="gazebo_base_link" value="$(arg gazebo_base_link)" />
+    <arg name="enable_multifloor_maps" value="$(arg enable_multifloor_maps)" />
   </include>
 
   <!-- 入口门配置只声明了 initial_open；此节点调用官方服务把状态实际应用到 Gazebo。 -->
