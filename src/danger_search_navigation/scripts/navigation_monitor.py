@@ -18,6 +18,7 @@ from move_base_msgs.msg import (
 )
 from nav_msgs.msg import OccupancyGrid, Path
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Bool
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
@@ -26,6 +27,7 @@ if _SCRIPT_DIR not in sys.path:
 from navigation_monitor_core import (
     classify_terminal_status,
     polyline_progress,
+    recovery_has_translation_progress,
     recovery_maneuver,
 )
 
@@ -39,6 +41,7 @@ class NavigationMonitor:
         self.input_timeout = self._positive("~input_timeout", 2.0)
         self.scan_timeout = self._positive("~scan_timeout", 1.0)
         self.command_timeout = self._positive("~command_timeout", 0.50)
+        self.config_timeout = self._positive("~config_timeout", 2.0)
         self.recovery_success_distance = self._positive(
             "~recovery_success_distance", 0.05
         )
@@ -51,6 +54,7 @@ class NavigationMonitor:
         self.mapping_ready = False
         self.mapping_stable = False
         self.mapping_lost = True
+        self.config_ready = False
         self.last_pose = rospy.Time(0)
         self.last_map = rospy.Time(0)
         self.last_scan = rospy.Time(0)
@@ -58,11 +62,14 @@ class NavigationMonitor:
         self.last_status = rospy.Time(0)
         self.last_nav_cmd = rospy.Time(0)
         self.last_sent_cmd = rospy.Time(0)
+        self.last_config_ready = rospy.Time(0)
         self.last_sent_moving = False
+        self.last_sent_translation = False
         self.failure_code = "NONE"
         self.failure_detail = ""
         self.recovery_event_id = 0
         self.recovery = None
+        self.plan_generation = 0
 
         self.health_pub = rospy.Publisher(
             rospy.get_param("~health_topic", "/navigation/health"),
@@ -114,6 +121,12 @@ class NavigationMonitor:
             Twist,
             self._sent_cmd_callback,
             queue_size=20,
+        )
+        rospy.Subscriber(
+            rospy.get_param("~config_ready_topic", "/navigation/config_ready"),
+            Bool,
+            self._config_ready_callback,
+            queue_size=1,
         )
         rospy.Subscriber(
             rospy.get_param("~move_base_status_topic", "/move_base/status"),
@@ -203,13 +216,20 @@ class NavigationMonitor:
             self.last_nav_cmd = rospy.Time.now()
 
     def _sent_cmd_callback(self, message):
+        translation = math.hypot(message.linear.x, message.linear.y) > 0.02
         moving = (
-            math.hypot(message.linear.x, message.linear.y) > 0.02
+            translation
             or abs(message.angular.z) > 0.05
         )
         with self.lock:
             self.last_sent_cmd = rospy.Time.now()
             self.last_sent_moving = moving
+            self.last_sent_translation = translation
+
+    def _config_ready_callback(self, message):
+        with self.lock:
+            self.config_ready = bool(message.data)
+            self.last_config_ready = rospy.Time.now()
 
     def _goal_callback(self, message):
         with self.lock:
@@ -245,6 +265,8 @@ class NavigationMonitor:
         ]
         with self.lock:
             self.path = points
+            if len(points) >= 2:
+                self.plan_generation += 1
 
     def _result_callback(self, message):
         event = None
@@ -281,6 +303,7 @@ class NavigationMonitor:
                 "attempt": int(message.current_recovery_number) + 1,
                 "stuck_pose": stuck_pose,
                 "goal_pose": copy.deepcopy(self.goal_pose),
+                "plan_generation": self.plan_generation,
             }
             triggered = self._recovery_message_locked(
                 RecoveryEvent.PHASE_TRIGGERED, 0.0
@@ -293,7 +316,6 @@ class NavigationMonitor:
         event = None
         with self.lock:
             if (self.recovery is not None and self.pose is not None
-                    and self.last_sent_moving
                     and self._fresh(
                         rospy.Time.now(), self.last_sent_cmd, self.command_timeout
                     )):
@@ -301,7 +323,11 @@ class NavigationMonitor:
                 achieved = math.hypot(
                     self.pose[0] - stuck[0], self.pose[1] - stuck[1]
                 )
-                if achieved >= self.recovery_success_distance:
+                if recovery_has_translation_progress(
+                        achieved, self.recovery_success_distance,
+                        self.plan_generation,
+                        self.recovery["plan_generation"],
+                        self.last_sent_translation):
                     event = self._finish_recovery_locked(True)
         if event is not None:
             self.recovery_pub.publish(event)
@@ -369,6 +395,8 @@ class NavigationMonitor:
                 and self._fresh(now, self.last_scan, self.scan_timeout)
                 and self._fresh(now, self.last_mapping, self.input_timeout)
                 and self._fresh(now, self.last_status, self.input_timeout)
+                and self._fresh(now, self.last_config_ready, self.config_timeout)
+                and self.config_ready
                 and self.mapping_ready
                 and self.mapping_stable
                 and not self.mapping_lost
@@ -397,6 +425,9 @@ class NavigationMonitor:
                          ))):
                 message.failure_code = "LOCALIZATION_LOST"
                 message.failure_detail = "standard move_base input is stale"
+            elif (self.has_active_goal and not self.config_ready):
+                message.failure_code = "CONTROL_FAILED"
+                message.failure_detail = "TrajectoryPlannerROS configuration is not verified"
             else:
                 message.failure_code = self.failure_code
                 message.failure_detail = self.failure_detail
@@ -411,4 +442,3 @@ if __name__ == "__main__":
         NavigationMonitor().run()
     except (rospy.ROSInterruptException, KeyboardInterrupt):
         pass
-

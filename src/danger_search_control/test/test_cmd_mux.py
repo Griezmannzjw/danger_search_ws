@@ -115,10 +115,11 @@ class FakeTime:
 
 class FakeRospy:
     Time = FakeTime
+    warnings = []
 
-    @staticmethod
-    def logwarn_throttle(*_args, **_kwargs):
-        pass
+    @classmethod
+    def logwarn_throttle(cls, *args, **kwargs):
+        cls.warnings.append((args, kwargs))
 
     @staticmethod
     def logwarn(*_args, **_kwargs):
@@ -232,6 +233,29 @@ class CmdMuxCoreTest(unittest.TestCase):
 
 
 class CmdMuxInterfaceTest(unittest.TestCase):
+    def test_timeout_only_warns_for_a_stale_nonzero_motion_command(self):
+        original_rospy = cmd_mux_module.rospy
+        cmd_mux_module.rospy = FakeRospy
+        try:
+            node = _callback_test_node()
+            FakeRospy.warnings = []
+            FakeTime.now_seconds = 0.0
+            node.nav_cmd_callback(_target_message())
+            FakeTime.now_seconds = 0.7
+            node.output_loop(None)
+            self.assertEqual(FakeRospy.warnings, [])
+            self.assertEqual(node.last_output.linear.x, 0.0)
+
+            FakeTime.now_seconds = 1.0
+            node.nav_cmd_callback(_target_message(x=0.3))
+            FakeTime.now_seconds = 1.7
+            node.output_loop(None)
+            self.assertEqual(len(FakeRospy.warnings), 1)
+            self.assertEqual(node.last_output.linear.x, 0.0)
+        finally:
+            FakeRospy.warnings = []
+            cmd_mux_module.rospy = original_rospy
+
     def test_unused_twist_axes_are_zero(self):
         output = CmdMux._message_from_velocity((0.1, -0.2, 0.3))
         self.assertEqual(output.linear.x, 0.1)

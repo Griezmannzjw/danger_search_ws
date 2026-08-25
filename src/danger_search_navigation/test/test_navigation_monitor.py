@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.abspath(SCRIPT_DIR))
 from navigation_monitor_core import (
     classify_terminal_status,
     polyline_progress,
+    recovery_has_translation_progress,
     recovery_maneuver,
 )
 
@@ -36,7 +37,12 @@ class NavigationMonitorCoreTest(unittest.TestCase):
         self.assertEqual(recovery_maneuver("rotate_recovery"), "ROTATE")
         self.assertEqual(recovery_maneuver("conservative_reset"), "NONE")
 
+    def test_recovery_requires_new_plan_translation_and_distance(self):
+        self.assertFalse(recovery_has_translation_progress(0.20, 0.10, 4, 4, True))
+        self.assertFalse(recovery_has_translation_progress(0.20, 0.10, 5, 4, False))
+        self.assertFalse(recovery_has_translation_progress(0.05, 0.10, 5, 4, True))
+        self.assertTrue(recovery_has_translation_progress(0.10, 0.10, 5, 4, True))
+
 
 if __name__ == "__main__":
     unittest.main()
-

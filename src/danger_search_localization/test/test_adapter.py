@@ -254,6 +254,31 @@ class TestLocalizationAdapter(unittest.TestCase):
             reason, "TRACKING_GICP_ODOMETRY_WITH_LOCAL_OCCUPANCY_MAP"
         )
 
+    def test_gazebo_truth_tracking_reason_does_not_claim_gicp(self):
+        pose = PoseWithCovarianceStamped()
+        reason = self.adapter._status_reason(
+            pose,
+            pose_fresh=True,
+            map_fresh=True,
+            stable=True,
+            use_hector_correction=False,
+            localization_source="gazebo_truth",
+        )
+        self.assertEqual(
+            reason, "TRACKING_GAZEBO_TRUTH_WITH_LOCAL_OCCUPANCY_MAP"
+        )
+
+    def test_gazebo_truth_stale_reason_does_not_claim_scan_matching(self):
+        pose = PoseWithCovarianceStamped()
+        reason = self.adapter._status_reason(
+            pose,
+            pose_fresh=False,
+            map_fresh=True,
+            stable=False,
+            localization_source="gazebo_truth",
+        )
+        self.assertEqual(reason, "GAZEBO_TRUTH_POSE_STALE")
+
     def test_vertical_state_adds_z_and_tilt_without_replacing_slam_yaw(self):
         self.adapter.config = AdapterConfig(vertical_estimation_enabled=True)
         pose = PoseWithCovarianceStamped()

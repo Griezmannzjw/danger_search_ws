@@ -2,7 +2,16 @@ TrajectoryPlannerROS:
   odom_topic: /localization/odom
 
   max_vel_x: 0.40
+  # Unitree's RL gait does not reliably leave its standing response at the
+  # generic 0.10 m/s ROS floor.  Keep the vendor TrajectoryPlannerROS floor;
+  # cmd_mux still ramps this target and caps it at 0.40 m/s.
   min_vel_x: 0.30
+  # This legacy spelling is read during plugin construction, before dynamic
+  # reconfigure owns max_vel_theta.
+  # Reuse the Unitree TrajectoryPlannerROS turning baseline, bounded by the
+  # cmd_mux angular-speed hard limit.  The RL policy needs a substantial yaw
+  # command to leave its standing response; 0.25 rad/s was ineffective.
+  max_rotational_vel: 0.80
   max_vel_theta: 0.80
   min_vel_theta: -0.80
   min_in_place_vel_theta: 0.80
@@ -13,7 +22,9 @@ TrajectoryPlannerROS:
   acc_lim_theta: 0.80
 
   holonomic_robot: true
-  y_vels: [-0.20, -0.10, 0.10, 0.20]
+  # BaseLocalPlannerConfig declares this as a comma-delimited string.  Keep a
+  # true straight candidate so a centered corridor does not require strafing.
+  y_vels: "-0.10, 0.0, 0.10"
   dwa: true
 
   xy_goal_tolerance: 0.40
@@ -27,8 +38,11 @@ TrajectoryPlannerROS:
   vtheta_samples: 40
 
   meter_scoring: true
-  path_distance_bias: 32.0
-  goal_distance_bias: 24.0
+  # BaseLocalPlannerConfig clamps both dynamic parameters to <= 5.0.
+  # Keeping the values within that official range lets the runtime guard prove
+  # that the requested scoring is actually active.
+  path_distance_bias: 5.0
+  goal_distance_bias: 5.0
   occdist_scale: 0.01
   heading_scoring: true
   heading_lookahead: 0.80
@@ -39,4 +53,3 @@ TrajectoryPlannerROS:
   prune_plan: true
   simple_attractor: false
   publish_cost_grid_pc: false
-

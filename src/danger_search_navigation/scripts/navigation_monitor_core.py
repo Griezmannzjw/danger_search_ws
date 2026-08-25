@@ -28,6 +28,21 @@ def recovery_maneuver(behavior_name):
     return "NONE"
 
 
+def recovery_has_translation_progress(
+    achieved_distance,
+    required_distance,
+    plan_generation,
+    recovery_plan_generation,
+    sent_translation,
+):
+    """Require post-recovery plan, command and measured XY progress."""
+    return (
+        sent_translation
+        and plan_generation > recovery_plan_generation
+        and achieved_distance >= required_distance
+    )
+
+
 def polyline_progress(points, position):
     """Return normalized progress of the nearest projection on a polyline."""
     if not points:
@@ -66,4 +81,3 @@ def polyline_progress(points, position):
             best_distance = distance
             best_progress = progress
     return max(0.0, min(1.0, best_progress / total))
-

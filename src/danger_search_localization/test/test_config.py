@@ -139,6 +139,19 @@ class TestLocalizationConfig(unittest.TestCase):
         self.assertEqual(source.count('name="lidar_odometry"'), 1)
         self.assertEqual(source.count('name="gazebo_truth_odometry"'), 1)
 
+        adapter_node = next(
+            node for node in root.findall(".//node")
+            if node.attrib["name"] == "localization_adapter"
+        )
+        adapter_parameters = {
+            parameter.attrib["name"]: parameter.attrib["value"]
+            for parameter in adapter_node.findall("param")
+        }
+        self.assertEqual(
+            adapter_parameters["localization_source"],
+            "$(arg localization_source)",
+        )
+
         truth_script = (
             self.package_dir / "scripts" / "gazebo_truth_odometry.py"
         ).read_text()

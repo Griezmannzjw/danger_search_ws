@@ -15,6 +15,12 @@ class StandardNavigationConfigTest(unittest.TestCase):
         with (PACKAGE / "config" / name).open() as stream:
             return yaml.safe_load(stream)
 
+    @staticmethod
+    def _control_config():
+        path = PACKAGE.parent / "danger_search_control" / "config" / "default.yaml"
+        with path.open() as stream:
+            return yaml.safe_load(stream)
+
     def test_launch_uses_standard_move_base_and_cmd_mux_input(self):
         root = ET.parse(PACKAGE / "launch" / "navigation.launch").getroot()
         move_base = next(
@@ -38,19 +44,47 @@ class StandardNavigationConfigTest(unittest.TestCase):
         )
         self.assertFalse(config["make_plan_clear_costmap"])
         self.assertFalse(config["make_plan_add_unreachable_goal"])
-        self.assertEqual(len(config["recovery_behaviors"]), 3)
+        self.assertFalse(config["clearing_rotation_allowed"])
+        self.assertEqual(len(config["recovery_behaviors"]), 2)
+        self.assertNotIn("rotate_recovery", {
+            behavior["name"] for behavior in config["recovery_behaviors"]
+        })
 
     def test_unitree_velocity_floor_and_supported_parameters(self):
         config = self._yaml("trajectory_planner.yaml")["TrajectoryPlannerROS"]
         self.assertEqual(config["odom_topic"], "/localization/odom")
         self.assertEqual(config["min_vel_x"], 0.30)
         self.assertEqual(config["escape_vel"], -0.30)
-        self.assertEqual(config["y_vels"], [-0.20, -0.10, 0.10, 0.20])
+        self.assertEqual(config["max_rotational_vel"], 0.80)
+        self.assertEqual(config["max_vel_theta"], 0.80)
+        self.assertEqual(config["min_vel_theta"], -0.80)
+        self.assertEqual(config["min_in_place_vel_theta"], 0.80)
+        self.assertEqual(config["acc_lim_theta"], 0.80)
+        self.assertEqual(config["path_distance_bias"], 5.0)
+        self.assertEqual(config["goal_distance_bias"], 5.0)
+        self.assertIsInstance(config["y_vels"], str)
+        self.assertIn("0.0", config["y_vels"])
         self.assertTrue(config["dwa"])
         self.assertTrue(config["holonomic_robot"])
         self.assertNotIn("min_vel_y", config)
         self.assertNotIn("max_vel_y", config)
         self.assertLessEqual(config["heading_scoring_timestep"], 1.0)
+
+    def test_rotation_limits_do_not_exceed_cmd_mux_hard_cap(self):
+        planner = self._yaml("trajectory_planner.yaml")["TrajectoryPlannerROS"]
+        mux = self._control_config()
+        limit = mux["max_angular_speed"]
+        self.assertEqual(planner["max_rotational_vel"], limit)
+        self.assertEqual(planner["max_vel_theta"], limit)
+        self.assertEqual(planner["min_in_place_vel_theta"], limit)
+        self.assertGreaterEqual(planner["min_vel_theta"], -limit)
+
+    def test_translation_floor_matches_unitree_and_cmd_mux_cap(self):
+        planner = self._yaml("trajectory_planner.yaml")["TrajectoryPlannerROS"]
+        mux = self._control_config()
+        self.assertEqual(planner["min_vel_x"], 0.30)
+        self.assertLessEqual(planner["min_vel_x"], planner["max_vel_x"])
+        self.assertLessEqual(planner["max_vel_x"], mux["max_linear_speed"])
 
     def test_costmaps_use_fixed_padded_footprint_and_scan(self):
         common = self._yaml("costmap_common.yaml")
@@ -72,4 +106,3 @@ class StandardNavigationConfigTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -39,6 +39,7 @@
   <exec_depend>costmap_2d</exec_depend>
   <exec_depend>clear_costmap_recovery</exec_depend>
   <exec_depend>rotate_recovery</exec_depend>
+  <exec_depend>dynamic_reconfigure</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
 

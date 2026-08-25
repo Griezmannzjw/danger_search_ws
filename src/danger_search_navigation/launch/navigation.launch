@@ -13,6 +13,15 @@
     <remap from="cmd_vel" to="/danger_search/nav_cmd_vel" />
   </node>
 
+  <!-- This only applies/validates the official dynamic-reconfigure settings;
+       it never participates in velocity control. -->
+  <node name="navigation_config_guard"
+        pkg="danger_search_navigation"
+        type="navigation_config_guard.py"
+        output="screen">
+    <rosparam command="load" file="$(arg config_dir)/trajectory_planner.yaml" />
+  </node>
+
   <!-- Compatibility only: converts standard action/recovery state to the
        existing mission and exploration health contract. -->
   <node name="navigation_monitor"

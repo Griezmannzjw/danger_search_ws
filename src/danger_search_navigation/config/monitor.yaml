@@ -5,6 +5,8 @@ scan_topic: /localization/scan
 mapping_status_topic: /mapping/status
 nav_cmd_topic: /danger_search/nav_cmd_vel
 sent_cmd_topic: /danger_search/cmd_vel_sent
+config_ready_topic: /navigation/config_ready
+config_timeout: 2.0
 health_topic: /navigation/health
 recovery_event_topic: /navigation/recovery_event
 move_base_status_topic: /move_base/status
@@ -16,5 +18,4 @@ health_rate: 5.0
 input_timeout: 2.0
 scan_timeout: 1.0
 command_timeout: 0.50
-recovery_success_distance: 0.05
-
+recovery_success_distance: 0.10

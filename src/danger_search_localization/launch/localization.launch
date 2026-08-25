@@ -64,6 +64,7 @@
         type="pose_estimator.py"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
+    <param name="localization_source" value="$(arg localization_source)" />
     <!-- Truth scans and poses share timestamps; do not extrapolate TF into the future. -->
     <param name="tf_publish_future_tolerance_s"
            value="$(eval 0.0 if arg('localization_source') == 'gazebo_truth' else 0.5)" />

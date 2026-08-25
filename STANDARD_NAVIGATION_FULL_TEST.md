@@ -145,6 +145,10 @@ source devel/setup.bash
 rosparam get /move_base/base_global_planner
 rosparam get /move_base/base_local_planner
 rosparam get /move_base/TrajectoryPlannerROS/odom_topic
+rosparam get /move_base/TrajectoryPlannerROS/min_vel_x
+rosparam get /move_base/TrajectoryPlannerROS/min_in_place_vel_theta
+rosparam get /move_base/TrajectoryPlannerROS/max_vel_theta
+rostopic echo -n 1 /navigation/config_ready
 ```
 
 预期输出：
@@ -153,6 +157,10 @@ rosparam get /move_base/TrajectoryPlannerROS/odom_topic
 navfn/NavfnROS
 base_local_planner/TrajectoryPlannerROS
 /localization/odom
+0.3
+0.8
+0.8
+data: True
 ```
 
 ### 3.2 检查定位、地图、导航和感知 readiness
@@ -168,6 +176,8 @@ rostopic echo -n 1 /danger_detector/status
 
 - `/localization/odom` 的 `header.frame_id` 为 `odom`，`child_frame_id` 为 `base`。
 - `/mapping/status`：`ready: True`、`stable: True`、`lost: False`。
+- 使用 `localization_source:=gazebo_truth` 时，正常 `status_reason` 应为
+  `TRACKING_GAZEBO_TRUTH_WITH_LOCAL_OCCUPANCY_MAP`，不得显示为 GICP tracking。
 - `/navigation/health`：`ready: True`。
 - `/danger_detector/status`：`ready: True`。
 
@@ -198,7 +208,63 @@ rostopic info /cmd_vel
 
 如果 `/cmd_vel` 没有 `/unitree_gazebo_servo` 订阅者，先不要启动任务，重新确认终端一中的 `2 -> 等待 -> 6` 和 Unitree 控制器状态。
 
-## 4. 终端三：通过 mission 启动完整任务
+## 4. 终端三：任务启动前运动预检
+
+预检期间 mission 尚未启动，因此可以单独向标准 `move_base` 发送短距离目标，验证导航到 RL 步态的完整执行链。预检必须在出生点附近的开放区域进行；如果 RViz 中目标方向有障碍物，不要发送目标。
+
+### 4.1 开放区直线预检
+
+当前测试模式以出生位姿作为局部 `map` 原点。发送前方约 `1 m` 的目标：
+
+```bash
+rostopic pub -1 /move_base_simple/goal geometry_msgs/PoseStamped \
+  "{header: {frame_id: map}, pose: {position: {x: 1.0, y: 0.0, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}}"
+```
+
+在两个终端分别观察：
+
+```bash
+rostopic echo /danger_search/nav_cmd_vel
+rostopic echo /cmd_vel
+```
+
+验收要求：
+
+- 路径跟踪阶段 `/danger_search/nav_cmd_vel.linear.x` 应达到 `0.30 m/s`。
+- `/cmd_vel.linear.x` 应受 cmd_mux 限加速度约束平滑上升，且不超过 `0.40 m/s`。
+- Gazebo 中机器人应在 `5 s` 内产生明显前进，真值位移至少 `0.10 m`。
+- 只统计 `/move_base/status` 为 `ACTIVE` 的控制区间：
+  `/danger_search/nav_cmd_vel` 最大间隔应小于 `0.30 s`，P95 应不超过
+  `0.15 s`。目标完成到下一目标发送之间的安全零速选点阶段不计入断流。
+
+如果 `/cmd_vel.linear.x` 已达到 `0.30`，但机器人 `5 s` 内仍完全不动，取消目标并停止预检；此时问题属于 Unitree RL policy 或关节执行层，不要继续提高导航速度。
+
+### 4.2 原地旋转预检
+
+直线预检目标结束后，向相同位置发送约 `90°` 的最终朝向。由于 `xy_goal_tolerance=0.40`，局部规划器会进入标准终点旋转控制：
+
+```bash
+rostopic pub -1 /move_base_simple/goal geometry_msgs/PoseStamped \
+  "{header: {frame_id: map}, pose: {position: {x: 1.0, y: 0.0, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: 0.7071068, w: 0.7071068}}}"
+```
+
+验收要求：
+
+- `/danger_search/nav_cmd_vel` 应出现 `|angular.z|=0.80 rad/s` 的原地旋转命令。
+- `/cmd_vel.angular.z` 平滑上升且不超过 `0.80 rad/s`。
+- Gazebo 真值 yaw 应在 `3 s` 内变化至少 `0.20 rad`。
+- 高速转向时长期建图可以暂停，但 `/localization/scan` 和局部 costmap 必须继续更新。
+
+完成预检后取消所有测试目标，并确认 `/cmd_vel` 已归零：
+
+```bash
+rostopic pub -1 /move_base/cancel actionlib_msgs/GoalID "{}"
+rostopic echo -n 1 /cmd_vel
+```
+
+只有直线和转向预检都通过后，才开始完整任务。
+
+## 5. 终端三：通过 mission 启动完整任务
 
 所有 readiness 检查通过后执行：
 
@@ -222,7 +288,7 @@ message: "Mission started"
 
 必须调用 `/danger_search/start`。不要直接调用 `/danger_search/start_exploration`，否则会绕过 mission 的任务生命周期、危险源确认和结果保存。
 
-## 5. 终端四：启动 RViz
+## 6. 终端四：启动 RViz
 
 ```bash
 cd /home/ruilinli/danger_search_ws
@@ -257,9 +323,9 @@ map
 
 如果局部 costmap 在 `odom` 坐标系，而 RViz Fixed Frame 为 `map`，这是正常的；TF 会负责变换。
 
-## 6. 终端五：运行期间监控与录包
+## 7. 终端五：运行期间监控与录包
 
-### 6.1 查看导航命令频率
+### 7.1 查看导航命令频率
 
 ```bash
 cd /home/ruilinli/danger_search_ws
@@ -269,7 +335,10 @@ source devel/setup.bash
 rostopic hz /danger_search/nav_cmd_vel
 ```
 
-活动控制阶段应接近 move_base 的 `10 Hz`，不得反复出现超过 `0.30 s` 的长时间断流。
+活动控制阶段应接近 move_base 的 `10 Hz`。统计时只保留
+`/move_base/status` 为 `ACTIVE` 的区间；这些区间内命令最大间隔应小于
+`0.30 s`、P95 应不超过 `0.15 s`。目标成功、取消、recovery 切换和下一个
+前沿选点期间本来就应安全输出零速，不算导航命令断流。
 
 可在另一个终端查看最终命令：
 
@@ -279,7 +348,7 @@ rostopic hz /cmd_vel
 
 `cmd_mux` 正常应接近 `50 Hz`。
 
-### 6.2 查看导航健康、标准 recovery 和兼容 recovery
+### 7.2 查看导航健康、标准 recovery 和兼容 recovery
 
 以下命令每次选择一个运行：
 
@@ -294,13 +363,12 @@ rostopic echo /move_base/status
 
 ```text
 conservative_reset
-rotate_recovery
 aggressive_reset
 ```
 
 恢复失败后 Action 应进入 `ABORTED`，不能无限清图、旋转或持续撞击。
 
-### 6.3 查看探索和危险源识别
+### 7.3 查看探索和危险源识别
 
 ```bash
 rostopic echo /exploration/status
@@ -309,7 +377,7 @@ rostopic echo /danger_detector/detections
 rostopic echo /mission/status
 ```
 
-### 6.4 建议录制诊断 rosbag
+### 7.4 建议录制诊断 rosbag
 
 开始任务前运行：
 
@@ -340,7 +408,7 @@ rosbag record \
 
 测试结束后在录包终端按 `Ctrl-C`，不要强制关闭后直接拔掉终端。
 
-## 7. 场景与验收项目
+## 8. 场景与验收项目
 
 让探索至少覆盖以下情况：
 
@@ -362,7 +430,7 @@ rosbag record \
 - localization 位姿与 Gazebo 中的实际运动方向一致。
 - 探索期间感知、建图、导航和 mission 同时保持运行。
 
-## 8. 检查危险源结果文件
+## 9. 检查危险源结果文件
 
 任务运行或结束后执行：
 
@@ -385,7 +453,7 @@ rostopic hz /real_sense/rgb/image_raw
 rostopic hz /real_sense/depth/image_raw
 ```
 
-## 9. 正确停止顺序
+## 10. 正确停止顺序
 
 1. 录包终端按 `Ctrl-C`。
 2. danger_search 的终端二按 `Ctrl-C`，等待所有节点退出。
@@ -394,7 +462,7 @@ rostopic hz /real_sense/depth/image_raw
 
 不要在 Gazebo 尚运行时再次执行第二份 `auto.sh`，也不要并行启动旧的 `nav_controller.py`、Unitree 自带 move_base 或第二个 cmd_mux。
 
-## 10. 常见失败定位
+## 11. 常见失败定位
 
 ### `/danger_search/start` 返回 `navigation_not_ready`
 
@@ -416,7 +484,11 @@ rostopic echo -n 5 /danger_search/nav_cmd_vel
 rostopic echo -n 5 /cmd_vel
 ```
 
-若导航命令存在但 `/cmd_vel` 为零，检查 cmd_mux 的安全门和看门狗；若 `/cmd_vel` 非零但机器人不动，重新在终端一按 `2`、等待站稳、再按 `6`。
+若导航命令存在但 `/cmd_vel` 为零，检查 cmd_mux 的安全门和看门狗。若 `/cmd_vel` 非零但机器人不动：
+
+1. 确认终端一已经明确显示 `[INFO] Entered RL /cmd_vel mode.`。
+2. 检查路径跟踪期间 `/cmd_vel.linear.x` 是否达到 `0.30 m/s`，不要只看低于步态下限的瞬时加速帧。
+3. 如果命令已稳定达到 `0.30` 但 Gazebo 真值仍无位移，将问题归入 RL policy/关节执行层，不要通过继续提高导航速度掩盖。
 
 ### 路径存在但 move_base 持续报 costmap 不可用
 

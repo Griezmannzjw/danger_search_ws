@@ -13,13 +13,12 @@ oscillation_timeout: 8.0
 oscillation_distance: 0.10
 shutdown_costmaps: false
 recovery_behavior_enabled: true
-clearing_rotation_allowed: true
+clearing_rotation_allowed: false
 make_plan_clear_costmap: false
 make_plan_add_unreachable_goal: false
 
 recovery_behaviors:
   - {name: conservative_reset, type: clear_costmap_recovery/ClearCostmapRecovery}
-  - {name: rotate_recovery, type: rotate_recovery/RotateRecovery}
   - {name: aggressive_reset, type: clear_costmap_recovery/ClearCostmapRecovery}
 
 # Clear only short-lived scan observations.  The static map is never cleared.
@@ -28,14 +27,6 @@ conservative_reset:
   affected_maps: both
   layer_names: [obstacles]
   force_updating: true
-
-rotate_recovery:
-  sim_granularity: 0.025
-  frequency: 10.0
-  yaw_goal_tolerance: 0.20
-  acc_lim_th: 0.80
-  max_rotational_vel: 0.80
-  min_rotational_vel: 0.80
 
 aggressive_reset:
   reset_distance: 0.0
@@ -46,4 +37,3 @@ aggressive_reset:
 NavfnROS:
   allow_unknown: false
   default_tolerance: 0.0
-

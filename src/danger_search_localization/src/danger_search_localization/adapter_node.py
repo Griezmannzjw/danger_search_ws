@@ -111,6 +111,13 @@ class LocalizationAdapterNode:
         self.localization_status_topic = rospy.get_param(
             "~localization_status_topic", "/localization/status"
         )
+        self.localization_source = rospy.get_param(
+            "~localization_source", "gicp"
+        )
+        if self.localization_source not in ("gicp", "gazebo_truth"):
+            raise rospy.ROSInitException(
+                "~localization_source must be 'gicp' or 'gazebo_truth'"
+            )
         self.config = self._load_config()
         self.use_hector_correction = bool(
             rospy.get_param("~use_hector_correction", False)
@@ -242,7 +249,15 @@ class LocalizationAdapterNode:
         )
         rospy.loginfo(
             "[localization] adapter started: backend=%s gicp=%s pose=%s map=%s",
-            "hector" if self.use_hector_correction else "gicp_occupancy",
+            (
+                "gazebo_truth"
+                if self.localization_source == "gazebo_truth"
+                else (
+                    "hector"
+                    if self.use_hector_correction
+                    else "gicp_occupancy"
+                )
+            ),
             self.gicp_pose_topic,
             self.pose_topic,
             self.map_topic,
@@ -823,6 +838,7 @@ class LocalizationAdapterNode:
             pose_guard_lost,
             pose_guard_reason,
             mapping_paused,
+            self.localization_source,
         )
         current_floor = (
             vertical.current_floor
@@ -959,19 +975,38 @@ class LocalizationAdapterNode:
         pose_guard_lost=False,
         pose_guard_reason="",
         mapping_paused=False,
+        localization_source="gicp",
     ):
+        using_gazebo_truth = localization_source == "gazebo_truth"
         if pose is None:
-            return "WAITING_FOR_SCAN_MATCHING_POSE"
+            return (
+                "WAITING_FOR_GAZEBO_TRUTH_POSE"
+                if using_gazebo_truth
+                else "WAITING_FOR_SCAN_MATCHING_POSE"
+            )
         if not pose_fresh:
-            return "SCAN_MATCHING_POSE_STALE"
+            return (
+                "GAZEBO_TRUTH_POSE_STALE"
+                if using_gazebo_truth
+                else "SCAN_MATCHING_POSE_STALE"
+            )
         if pose_guard_lost:
             return "POSE_GUARD_LOST:" + pose_guard_reason
         if pose_guard_degraded:
             return "POSE_GUARD_DEGRADED_HOLDING_LAST_POSE:" + pose_guard_reason
         if gicp_lost:
-            return "GICP_ODOMETRY_LOST:" + gicp_fusion_reason
+            prefix = (
+                "GAZEBO_TRUTH_LOST:"
+                if using_gazebo_truth
+                else "GICP_ODOMETRY_LOST:"
+            )
+            return prefix + gicp_fusion_reason
         if gicp_degraded:
-            return "GICP_ODOMETRY_DEGRADED_HOLDING_LAST_POSE"
+            return (
+                "GAZEBO_TRUTH_DEGRADED_HOLDING_LAST_POSE"
+                if using_gazebo_truth
+                else "GICP_ODOMETRY_DEGRADED_HOLDING_LAST_POSE"
+            )
         if hector_degraded:
             return "HECTOR_CORRECTION_DEGRADED:" + hector_fusion_reason
         if not map_fresh:
@@ -984,6 +1019,8 @@ class LocalizationAdapterNode:
             return "VERTICAL_IMU_STALE"
         if use_hector_correction:
             return "TRACKING_FUSED_GICP_ODOMETRY_WITH_BOUNDED_HECTOR_CORRECTION"
+        if using_gazebo_truth:
+            return "TRACKING_GAZEBO_TRUTH_WITH_LOCAL_OCCUPANCY_MAP"
         return "TRACKING_GICP_ODOMETRY_WITH_LOCAL_OCCUPANCY_MAP"
 
     @staticmethod

@@ -360,9 +360,15 @@ class CmdMux:
                     1.0, "[control] 导航速度非法，已输出零速度"
                 )
             elif reason == "timeout":
-                rospy.logwarn_throttle(
-                    1.0, "[control] 导航命令超时，已输出零速度"
-                )
+                # move_base reaches/cancels a goal by publishing zero once and
+                # then going quiet.  The watchdog must still keep the output
+                # at zero, but that normal idle transition is not a command
+                # stream failure.  Preserve the warning for stale non-zero
+                # motion commands only.
+                if any(abs(value) > 1e-9 for value in self._target_velocity):
+                    rospy.logwarn_throttle(
+                        1.0, "[control] 导航命令超时，已输出零速度"
+                    )
             elif reason == "no_valid_nav":
                 rospy.logwarn_throttle(
                     2.0, "[control] 尚未收到有效导航命令，持续输出零速度"
