@@ -30,7 +30,7 @@ from geometry_msgs.msg import Point, Pose, PoseArray, PoseStamped, PoseWithCovar
 from nav_msgs.msg import GridCells, OccupancyGrid
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from std_srvs.srv import Trigger, TriggerResponse
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Int32, String
 from nav_msgs.srv import GetPlan
 from danger_search_common.msg import MappingStatus, NavigationHealth, RecoveryEvent
 
@@ -114,6 +114,48 @@ class ExplorationPlanner:
         self.blacklist_clear_revisions = int(
             rospy.get_param("~blacklist_clear_revisions", 3)
         )
+
+        # ========== 多楼层探索 ==========
+        self.multifloor_enabled = bool(rospy.get_param("~multifloor_enabled", False))
+        self.current_floor_topic = rospy.get_param(
+            "~current_floor_topic", "/mapping/current_floor"
+        )
+        self.elevator_service = rospy.get_param("~elevator_service", "/call_elevator")
+        self.door_service = rospy.get_param("~door_service", "/set_door_state")
+        self.elevator_id = rospy.get_param("~elevator_id", "elevator_main")
+        self.elevator_door_prefix = rospy.get_param(
+            "~elevator_door_prefix", "elevator_floor"
+        )
+        self.shaft_min_area_m2 = float(rospy.get_param("~shaft_min_area_m2", 4.0))
+        self.shaft_max_area_m2 = float(rospy.get_param("~shaft_max_area_m2", 50.0))
+        self.door_gap_min_width_m = float(rospy.get_param("~door_gap_min_width_m", 0.8))
+        self.door_gap_max_width_m = float(rospy.get_param("~door_gap_max_width_m", 2.5))
+        self.elevator_hall_approach_m = float(
+            rospy.get_param("~elevator_hall_approach_m", 0.8)
+        )
+        self.elevator_car_target_m = float(
+            rospy.get_param("~elevator_car_target_m", 1.6)
+        )
+        self.elevator_service_timeout_s = float(
+            rospy.get_param("~elevator_service_timeout_s", 15.0)
+        )
+        self.elevator_max_retries = int(rospy.get_param("~elevator_max_retries", 3))
+        self.floor_change_timeout_s = float(
+            rospy.get_param("~floor_change_timeout_s", 90.0)
+        )
+        self.floor_map_stable_time_s = float(
+            rospy.get_param("~floor_map_stable_time_s", 8.0)
+        )
+        if not (
+                self.shaft_min_area_m2 > 0.0
+                and self.shaft_max_area_m2 >= self.shaft_min_area_m2
+                and 0.0 < self.door_gap_min_width_m <= self.door_gap_max_width_m
+                and self.elevator_hall_approach_m > 0.0
+                and self.elevator_service_timeout_s > 0.0
+                and self.elevator_max_retries >= 1
+                and self.floor_change_timeout_s > 0.0):
+            raise rospy.ROSInitException("多楼层电梯参数无效")
+
         if not (
                 0.0 < self.observation_min_distance
                 <= self.observation_target_distance
@@ -163,6 +205,27 @@ class ExplorationPlanner:
         self.goal_id = 0
         self.state_lock = threading.RLock()
 
+        # ========== 多楼层状态 ==========
+        self.current_floor = 0
+        self.visited_floors = set()
+        self.elevator_halls = []          # 候选电梯厅世界坐标 (x, y)
+        self.elevator_hall_index = 0      # 当前尝试的候选
+        self.elevator_hall_found = None   # 确认的电梯厅 (x, y, 门缝朝向 yaw)
+        self.floor_change_active = False
+        self.floor_change_step = None     # "to_hall" | "call_open" | "enter_car" | "call_floor" | "exit" | "wait_stable"
+        self.floor_change_target = None   # 目标楼层
+        self.floor_change_deadline = rospy.Time(0)
+        self.floor_change_retries = 0
+        self.floor_change_start_map_revision = 0
+        self.floor_change_hall_point = None
+        self.floor_change_car_point = None
+        self.floor_change_stable_since = rospy.Time(0)
+        self._floor_change_goal_succeeded = False
+        self.floor_change_gave_up_count = 0
+        self.floor_change_retry_after = rospy.Time(0)
+        self.elevator_client = None
+        self.door_client = None
+
         # ========== Action客户端 ==========
         self.move_base_client = actionlib.SimpleActionClient(
             self.move_base_action_name, MoveBaseAction
@@ -187,6 +250,10 @@ class ExplorationPlanner:
         self.recovery_sub = rospy.Subscriber(
             self.recovery_event_topic, RecoveryEvent, self.recovery_event_callback
         )
+        if self.multifloor_enabled:
+            self.current_floor_sub = rospy.Subscriber(
+                self.current_floor_topic, Int32, self._current_floor_callback, queue_size=2
+            )
 
         # ========== 服务 ==========
         self.start_srv = rospy.Service(
@@ -857,6 +924,13 @@ class ExplorationPlanner:
                     or not self.exploring):
                 return
             self.waiting_for_result = False
+            if self.floor_change_active:
+                # 换层流程内的导航目标：只记录成功与否，交 _advance_floor_change 推进。
+                self._floor_change_goal_succeeded_set(
+                    state == actionlib.GoalStatus.SUCCEEDED
+                )
+                self.current_goal = None
+                return
             if state == actionlib.GoalStatus.SUCCEEDED:
                 rospy.loginfo("[exploration] Goal succeeded")
                 self.retry_count = 0
@@ -902,6 +976,14 @@ class ExplorationPlanner:
             self.no_reachable_frontier_cycles = 0
             self.complete_published = False
             self.complete_pub.publish(Bool(data=False))
+            self.visited_floors = {self.current_floor}
+            self.floor_change_active = False
+            self.floor_change_step = None
+            self.floor_change_gave_up_count = 0
+            self.floor_change_retry_after = rospy.Time(0)
+            self.elevator_halls = []
+            self.elevator_hall_index = 0
+            self.elevator_hall_found = None
             self._set_state("WAITING", "waiting_for_inputs")
             return TriggerResponse(success=True, message="Exploration started; waiting for inputs")
 
@@ -927,6 +1009,11 @@ class ExplorationPlanner:
             return
 
         now = rospy.Time.now()
+        # 换层流程优先驱动：即使换层期间定位/建图短暂不稳定也要推进。
+        if self.floor_change_active:
+            self._advance_floor_change(now)
+            return
+
         healthy, reason = self._inputs_health(now)
         if not healthy:
             self.no_reachable_frontier_cycles = 0
@@ -989,13 +1076,311 @@ class ExplorationPlanner:
             no_active_goal = not self.waiting_for_result and not self.nav_has_active_goal
             if (self.no_reachable_frontier_cycles >= self.no_frontier_cycles_required
                     and map_stable and no_active_goal):
-                if not self.complete_published:
-                    self.complete_published = True
-                    self.complete_pub.publish(Bool(data=True))
-                    rospy.loginfo("[exploration] Exploration converged")
-                self._set_state("COMPLETE", selection_reason)
+                if (self.multifloor_enabled
+                        and self.floor_change_gave_up_count < self.elevator_max_retries
+                        and now > self.floor_change_retry_after):
+                    # 当前层探索完：尝试换到下一楼层，而不是直接结束任务。
+                    rospy.loginfo(
+                        "[exploration] floor %d exhausted, trying floor %d "
+                        "(give_up=%d/%d)",
+                        self.current_floor, self.current_floor + 1,
+                        self.floor_change_gave_up_count, self.elevator_max_retries,
+                    )
+                    self._begin_floor_change()
+                else:
+                    # 单楼层模式，或换层已耗尽重试次数 → 探索完成。
+                    self._complete_exploration(
+                        "all_floors_explored_or_unreachable"
+                        if self.multifloor_enabled else selection_reason
+                    )
             else:
                 self._set_state("WAITING", selection_reason)
+
+    # ========== 多楼层：电梯自主发现与换层 ==========
+
+    def _current_floor_callback(self, message):
+        floor = int(message.data)
+        if floor != self.current_floor:
+            rospy.loginfo("[exploration] current floor -> %d", floor)
+        self.current_floor = floor
+        self.visited_floors.add(floor)
+
+    def _elevator_door_id(self, floor):
+        return "%s_%d" % (self.elevator_door_prefix, floor)
+
+    def _ensure_service_clients(self):
+        import rosservice
+        if self.elevator_client is None:
+            service_type = rosservice.get_service_class_by_name(self.elevator_service)
+            if service_type is None:
+                return False
+            self.elevator_client = rospy.ServiceProxy(self.elevator_service, service_type)
+        if self.door_client is None:
+            service_type = rosservice.get_service_class_by_name(self.door_service)
+            if service_type is None:
+                return False
+            self.door_client = rospy.ServiceProxy(self.door_service, service_type)
+        return True
+
+    def _call_elevator(self, target_floor, open_doors):
+        """调用电梯服务，返回 (成功, 说明)。电梯会移动到 target_floor。"""
+        if not self._ensure_service_clients():
+            return False, "service_unavailable"
+        try:
+            request = self.elevator_client._request_class()
+            request.elevator_id = self.elevator_id
+            request.target_floor = int(target_floor)
+            request.open_doors = bool(open_doors)
+            response = self.elevator_client(request)
+            if response.accepted:
+                return True, "accepted:%s" % response.state
+            return False, "rejected:%s" % response.message
+        except Exception as exc:
+            rospy.logwarn_throttle(2.0, "[exploration] elevator call failed: %s", exc)
+            return False, str(exc)
+
+    def _set_elevator_door(self, floor, open_state):
+        if not self._ensure_service_clients():
+            return False
+        try:
+            request = self.door_client._request_class()
+            request.door_id = self._elevator_door_id(floor)
+            request.open = bool(open_state)
+            response = self.door_client(request)
+            return bool(response.accepted)
+        except Exception as exc:
+            rospy.logwarn_throttle(2.0, "[exploration] elevator door call failed: %s", exc)
+            return False
+
+    def _perimeter_door_gaps(self, component):
+        """在实心连通区域周界找门缝，返回 (外侧自由格x, 外侧格y, 朝向井道内的yaw)。"""
+        ys, xs = np.where(component)
+        if not len(xs):
+            return []
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        res = self.map_info.resolution
+        min_cells = max(1, int(math.ceil(self.door_gap_min_width_m / res)))
+        max_cells = int(math.ceil(self.door_gap_max_width_m / res))
+        gaps = []
+        edges = (
+            # edge, 边界行/列取值, 扫描起点, 朝井道内yaw
+            ("west",  lambda y: component[y, x0], y0, 0.0),
+            ("east",  lambda y: component[y, x1], y0, math.pi),
+            ("north", lambda x: component[y1, x], x0, -math.pi / 2.0),
+            ("south", lambda x: component[y0, x], x0, math.pi / 2.0),
+        )
+        for edge, boundary, along_start, into_yaw in edges:
+            cells = []
+            if edge in ("west", "east"):
+                cells = [not boundary(y) for y in range(y0, y1 + 1)]
+            else:
+                cells = [not boundary(x) for x in range(x0, x1 + 1)]
+            i = 0
+            while i < len(cells):
+                if not cells[i]:
+                    i += 1
+                    continue
+                j = i
+                while j < len(cells) and cells[j]:
+                    j += 1
+                width = j - i
+                if min_cells <= width <= max_cells:
+                    mid = (i + j) // 2
+                    if edge in ("west", "east"):
+                        gx = x0 - 1 if edge == "west" else x1 + 1
+                        gy = along_start + mid
+                    else:
+                        gx = along_start + mid
+                        gy = y1 + 1 if edge == "north" else y0 - 1
+                    if 0 <= gx < self.map_info.width and 0 <= gy < self.map_info.height:
+                        gaps.append((gx, gy, into_yaw))
+                i = j
+        return gaps
+
+    def _detect_elevator_halls(self):
+        """从当前层地图检测电梯井门缝候选，返回 (world_x, world_y, 朝井道内yaw) 列表。
+
+        电梯井/楼梯井是薄墙围成的"井道"：墙面积小但包围盒大（电梯井 ~2.4x2.7m）。
+        用包围盒面积识别井道形状，再在周界找门缝。
+        """
+        if self.map_data is None:
+            return []
+        occupied = (self.map_data >= self.connectivity_occupied_threshold).astype(np.uint8)
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(occupied, connectivity=8)
+        min_bbox_cells = self.shaft_min_area_m2 / (self.map_info.resolution ** 2)
+        max_bbox_cells = self.shaft_max_area_m2 / (self.map_info.resolution ** 2)
+        free = (self.map_data >= 0) & (self.map_data < self.free_threshold)
+        width, height = self.map_info.width, self.map_info.height
+        candidates = []
+        for index in range(1, num):
+            x, y, w, h, _area = stats[index]
+            bbox_area = w * h
+            if bbox_area < min_bbox_cells or bbox_area > max_bbox_cells:
+                continue
+            # 跳过贴地图边界的区域（密封楼外/世界墙等大面积伪影）
+            if x <= 0 or y <= 0 or x + w >= width - 1 or y + h >= height - 1:
+                continue
+            component = (labels == index)
+            for gx, gy, into_yaw in self._perimeter_door_gaps(component):
+                if not (0 <= gy < height and 0 <= gx < width):
+                    continue
+                if not free[gy, gx]:
+                    continue
+                wx, wy = self._map_to_world(gx, gy)
+                candidates.append((wx, wy, into_yaw))
+        return candidates
+
+    def _begin_floor_change(self):
+        """开始换层：找电梯、确定目标楼层、导航到电梯厅。"""
+        if self.current_pose is None or self.map_data is None:
+            return
+        target = self.current_floor + 1
+        self.floor_change_target = target
+        self.floor_change_active = True
+        self.floor_change_retries = 0
+        self.floor_change_deadline = rospy.Time.now() + rospy.Duration(
+            self.floor_change_timeout_s
+        )
+        self.elevator_halls = self._detect_elevator_halls()
+        if not self.elevator_halls:
+            self._floor_change_fail("elevator_not_found")
+            return
+        cx = self.current_pose.position.x
+        cy = self.current_pose.position.y
+        self.elevator_halls.sort(
+            key=lambda hall: math.hypot(hall[0] - cx, hall[1] - cy)
+        )
+        self.elevator_hall_index = 0
+        self.floor_change_step = "to_hall"
+        self._pick_elevator_hall_and_send()
+
+    def _pick_elevator_hall_and_send(self):
+        """导航到下一个电梯厅候选；候选耗尽则失败。"""
+        while self.elevator_hall_index < len(self.elevator_halls):
+            hx, hy, into_yaw = self.elevator_halls[self.elevator_hall_index]
+            self.elevator_hall_index += 1
+            self.floor_change_hall_point = (hx, hy, into_yaw)
+            # 轿厢点：门缝向井道内推进
+            self.floor_change_car_point = (
+                hx + self.elevator_car_target_m * math.cos(into_yaw),
+                hy + self.elevator_car_target_m * math.sin(into_yaw),
+            )
+            if self._send_goal(hx, hy):
+                self._set_state("FLOOR_CHANGE", "navigate_to_elevator_hall")
+                return
+        self._floor_change_fail("all_elevator_halls_unavailable")
+
+    def _floor_change_goal_succeeded_set(self, succeeded):
+        self._floor_change_goal_succeeded = bool(succeeded)
+
+    def _do_call_elevator_open(self):
+        ok, why = self._call_elevator(self.current_floor, True)
+        if not ok:
+            self._floor_change_fail("elevator_open_failed:" + why)
+            return
+        self.floor_change_step = "enter_car"
+        gx, gy = self.floor_change_car_point
+        if not self._send_goal(gx, gy):
+            self._floor_change_fail("enter_car_goal_failed")
+            return
+        self._set_state("FLOOR_CHANGE", "enter_elevator_car")
+
+    def _do_call_elevator_floor(self):
+        ok, why = self._call_elevator(self.floor_change_target, True)
+        if not ok:
+            # 目标楼层不存在（电梯拒绝，如 "floor N is not served"）→ 所有可达楼层已探索完，
+            # 正常结束任务。其他原因（服务异常）按换层失败重试处理。
+            if "not served" in why:
+                self.floor_change_active = False
+                self.floor_change_step = None
+                self._complete_exploration("all_floors_explored")
+            else:
+                self._floor_change_fail("elevator_call_floor_failed:" + why)
+            return
+        self.floor_change_step = "exit"
+        hx, hy, _ = self.floor_change_hall_point
+        if not self._send_goal(hx, hy):
+            self._floor_change_fail("exit_car_goal_failed")
+            return
+        self._set_state("FLOOR_CHANGE", "exit_elevator")
+
+    def _complete_exploration(self, reason):
+        """发布探索收敛事件并进入 COMPLETE（供多楼层结束时使用）。"""
+        if not self.complete_published:
+            self.complete_published = True
+            self.complete_pub.publish(Bool(data=True))
+            rospy.loginfo("[exploration] Exploration complete: %s", reason)
+        self._set_state("COMPLETE", reason)
+
+    def _advance_floor_change(self, now):
+        if now > self.floor_change_deadline:
+            self._floor_change_fail("floor_change_timeout")
+            return
+        step = self.floor_change_step
+        if step in ("to_hall", "enter_car", "exit"):
+            if self.waiting_for_result:
+                return
+            if not self._floor_change_goal_succeeded:
+                self._floor_change_fail("navigation_failed:" + str(step))
+                return
+            if step == "to_hall":
+                self._do_call_elevator_open()
+            elif step == "enter_car":
+                self._do_call_elevator_floor()
+            else:  # exit
+                self.floor_change_step = "wait_stable"
+                self.floor_change_stable_since = now
+                self._set_state("FLOOR_CHANGE", "wait_mapping_stable")
+            return
+        if step == "wait_stable":
+            floor_ok = (self.current_floor == self.floor_change_target)
+            stable_ok = (
+                self.mapping_ready and self.mapping_stable
+                and (now - self.floor_change_stable_since).to_sec()
+                >= self.floor_map_stable_time_s
+            )
+            if floor_ok and stable_ok:
+                self._floor_change_done()
+            return
+
+    def _floor_change_fail(self, reason):
+        if self.floor_change_retries < self.elevator_max_retries:
+            self.floor_change_retries += 1
+            self.floor_change_deadline = rospy.Time.now() + rospy.Duration(
+                self.floor_change_timeout_s
+            )
+            # 换候选电梯厅重试；候选耗尽则回退到继续探索当前层（若有前沿）
+            self.elevator_hall_index += 1
+            if self.elevator_hall_index < len(self.elevator_halls):
+                self.floor_change_step = "to_hall"
+                self._pick_elevator_hall_and_send()
+                return
+        rospy.logwarn("[exploration] floor change failed: %s", reason)
+        self.floor_change_active = False
+        self.floor_change_step = None
+        # 换层失败不结束任务：回到当前层继续探索（或进入收敛判定）。
+        # 限制换层重试总次数，避免无限尝试；退避一段时间后再试。
+        self.floor_change_gave_up_count += 1
+        self.floor_change_retry_after = rospy.Time.now() + rospy.Duration(
+            self.map_stable_time
+        )
+        self._set_state("WAITING", "floor_change_failed:" + reason)
+        self.last_goal_time = rospy.Time.now()
+
+    def _floor_change_done(self):
+        rospy.loginfo(
+            "[exploration] floor change to %d done; visited=%s",
+            self.floor_change_target, sorted(self.visited_floors),
+        )
+        self.floor_change_active = False
+        self.floor_change_step = None
+        self.elevator_halls = []
+        self.elevator_hall_found = None
+        self.no_reachable_frontier_cycles = 0
+        self.last_significant_map_change = rospy.Time.now()
+        self.retry_count = 0
+        self._set_state("EXPLORE_FLOOR", "new_floor_reached")
 
     def run(self):
         rospy.spin()

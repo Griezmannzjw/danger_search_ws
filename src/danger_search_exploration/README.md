@@ -102,3 +102,28 @@ roslaunch danger_search_exploration exploration.launch
 7. `known_grid_ratio` 仅在已观测栅格的最小包围盒内统计，不把固定地图消息的全部未知边界当成真实可通行总面积。
 
 后续 S1 才实现可靠前沿聚类、目标持久化、自动收敛和更完整恢复；S2 以后再实现房间可见性、多楼层与门梯能力。
+
+## 多楼层探索（multifloor_enabled）
+
+启用 `multifloor_enabled=true` 时，模块在当前层探索收敛（连续多轮无可达前沿且地图稳定）后，
+自动执行电梯换层，而不是直接结束任务：
+
+1. **电梯自主发现**：从当前层二维地图中找出大的实心连通区域（电梯井/楼梯井），
+   在其周界检测"门缝"（墙上 0.8~2.5 m 的自由缺口），作为电梯厅候选。
+   跳过贴地图边界或包围盒过大的区域，避免把密封楼外等伪影当作井道。
+2. **换层状态机**：
+   - 导航到电梯厅门缝前 → `/call_elevator` 呼梯到当前层并开门 → 进入轿厢
+   - `/call_elevator` 呼叫目标楼层（`current_floor+1`）→ 电梯移动并开门
+   - 出门 → 等待 `/mapping/current_floor` 变化且建图稳定 → 继续该层探索
+3. **结束条件**：所有可达楼层探索完（目标楼层被电梯拒绝 `not served`），
+   或换层连续失败达到 `elevator_max_retries` 后，才发布探索完成事件，交 mission 返航。
+4. 电梯/门服务类型运行时动态发现；电梯每次操作带超时，换层失败自动退避重试，
+   不无限循环。
+
+相关参数见 `config/default.yaml` 的"多楼层探索"段：
+`current_floor_topic`、`elevator_service`、`door_service`、`elevator_id`、
+`shaft_min_area_m2`、`shaft_max_area_m2`、`door_gap_min_width_m`、`door_gap_max_width_m`、
+`elevator_hall_approach_m`、`elevator_car_target_m`、`elevator_service_timeout_s`、
+`elevator_max_retries`、`floor_change_timeout_s`、`floor_map_stable_time_s`。
+
+单元测试 `test/test_multifloor.py` 覆盖电梯井门缝发现（含封闭无门缝井道不误检）。

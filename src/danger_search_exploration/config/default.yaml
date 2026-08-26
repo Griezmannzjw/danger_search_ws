@@ -51,3 +51,29 @@ path_clearance_weight: 0.15
 trap_blacklist_radius: 0.70
 trap_clearance_margin: 0.08
 blacklist_clear_revisions: 2
+
+# ========== 多楼层探索 ==========
+multifloor_enabled: true
+# 当前楼层话题（建图模块发布 Int32，从 0 开始）
+current_floor_topic: /mapping/current_floor
+# 电梯/门服务（类型由 simenv 动态生成，运行时发现）
+elevator_service: /call_elevator
+door_service: /set_door_state
+elevator_id: elevator_main
+# 电梯门 ID 前缀（各楼层为 elevator_floor_0/1/2）
+elevator_door_prefix: elevator_floor
+
+# 电梯自主发现：在地图上找大的实心连通区域（电梯井/楼梯井），在其周界找门缝
+shaft_min_area_m2: 4.0          # 候选井道包围盒最小面积
+shaft_max_area_m2: 50.0         # 候选井道包围盒最大面积（跳过密封楼外等巨型伪影）
+door_gap_min_width_m: 0.8       # 门缝宽度范围（按地图分辨率换算格数）
+door_gap_max_width_m: 2.5
+# 靠近电梯厅/轿厢的安全距离
+elevator_hall_approach_m: 0.8
+elevator_car_target_m: 1.6      # 进轿厢后停靠位置（门缝向井道内推进距离）
+
+# 电梯操作
+elevator_service_timeout_s: 15.0
+elevator_max_retries: 3
+elevator_floor_change_timeout_s: 90.0   # 一次换层总超时
+floor_map_stable_time_s: 8.0            # 换层后等待建图稳定
