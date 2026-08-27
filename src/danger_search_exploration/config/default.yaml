@@ -20,6 +20,7 @@ complete_topic: /exploration/complete
 # 探索参数
 goal_interval: 2.0
 max_retry: 3
+retry_backoff: 10.0
 min_frontier_length: 0.4
 # 已观测且占据概率低于该值的栅格可作为探索前沿。未知值 -1 始终不可达。
 free_threshold: 40
@@ -34,6 +35,7 @@ failed_goal_radius: 0.50
 dependency_check_timeout: 0.1
 input_timeout: 3.0
 no_frontier_cycles_required: 5
+floor_no_frontier_hold_s: 10.0
 map_stable_time: 8.0
 map_change_cell_threshold: 5
 
@@ -54,11 +56,19 @@ blacklist_clear_revisions: 2
 
 # ========== 多楼层探索 ==========
 multifloor_enabled: true
+# 只允许赛事公开合同，禁止读取 layout/building_config/scene_manifest。
+scene_info_file: ""
 # 当前楼层话题（建图模块发布 Int32，从 0 开始）
 current_floor_topic: /mapping/current_floor
-# 电梯/门服务（类型由 simenv 动态生成，运行时发现）
+# 电梯/门服务（强类型 building_generator_interfaces）
 elevator_service: /call_elevator
 door_service: /set_door_state
+switch_floor_service: /localization/switch_floor
+mapping_pause_topic: /localization/mapping_pause
+clear_costmaps_service: /move_base/clear_costmaps
+transit_floor_action_name: /danger_search/transit_floor
+elevator_cmd_topic: /danger_search/elevator_cmd_vel
+scan_topic: /localization/scan
 elevator_id: elevator_main
 # 电梯门 ID 前缀（各楼层为 elevator_floor_0/1/2）
 elevator_door_prefix: elevator_floor
@@ -73,7 +83,20 @@ elevator_hall_approach_m: 0.8
 elevator_car_target_m: 1.6      # 进轿厢后停靠位置（门缝向井道内推进距离）
 
 # 电梯操作
-elevator_service_timeout_s: 15.0
+elevator_service_timeout_s: 40.0
 elevator_max_retries: 3
-elevator_floor_change_timeout_s: 90.0   # 一次换层总超时
-floor_map_stable_time_s: 8.0            # 换层后等待建图稳定
+elevator_floor_change_timeout_s: 480.0  # 仅为总安全上限；各阶段有独立超时
+elevator_hall_navigation_max_s: 180.0
+elevator_hall_nominal_speed_mps: 0.25
+elevator_crossing_timeout_s: 20.0
+elevator_crossing_speed_mps: 0.20
+elevator_crossing_distance_m: 1.40
+elevator_crossing_min_progress_m: 0.80
+elevator_crossing_clearance_m: 0.32
+floor_map_stable_time_s: 15.0
+floor_min_new_map_versions: 2
+floor_height_m: 2.6
+hall_validation_required: true
+elevator_scan_settle_s: 0.75
+elevator_door_change_threshold_m: 0.20
+elevator_door_changed_fraction: 0.08

@@ -7,10 +7,13 @@
 import importlib.util
 import math
 import pathlib
+import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
+import yaml
 
 
 SCRIPT = pathlib.Path(__file__).parents[1] / "scripts" / "exploration_planner.py"
@@ -98,6 +101,202 @@ class ElevatorDetectionTest(unittest.TestCase):
                 grid[cy, cx] = 100
         planner = make_planner(grid)
         self.assertEqual(planner._detect_elevator_halls(), [])
+
+    def test_shaft_is_detected_when_wall_joins_building_wall(self):
+        grid = build_shaft_map(400)
+        # Join the north shaft wall to the map boundary. The original occupied
+        # component now has a huge bounding box and cannot pass the legacy
+        # isolated-component heuristic.
+        res = 0.10
+        half = 20.0
+        wall_y = int((3.9 + half) / res)
+        shaft_x = int((1.5 + half) / res)
+        grid[wall_y:wall_y + 3, :shaft_x + 1] = 100
+        planner = make_planner(grid)
+
+        halls = planner._detect_elevator_halls()
+
+        self.assertTrue(any(
+            math.hypot(hx - 1.5, hy - 2.5) < 1.0
+            for hx, hy, _yaw in halls
+        ))
+
+    def test_two_shafts_produce_distinct_candidates(self):
+        grid = build_shaft_map(500)
+        second = build_shaft_map(
+            500, shaft=(-8.0, -5.5, -4.0, -1.0), door=(-3.2, -2.0)
+        )
+        grid = np.maximum(grid, second)
+        planner = make_planner(grid)
+
+        halls = planner._detect_elevator_halls()
+
+        self.assertTrue(any(hx > 0.0 for hx, _hy, _yaw in halls))
+        self.assertTrue(any(hx < -4.0 for hx, _hy, _yaw in halls))
+
+    def test_wide_room_recess_is_not_a_door_candidate(self):
+        grid = np.zeros((300, 300), dtype=np.int8)
+        # Three-sided room recess with a 4 m opening, well beyond the public
+        # elevator-door contract.
+        grid[80:83, 80:160] = 100
+        grid[80:160, 80:83] = 100
+        grid[80:160, 157:160] = 100
+        planner = make_planner(grid)
+        self.assertEqual(planner._detect_elevator_halls(), [])
+
+
+class PublicTopologyTest(unittest.TestCase):
+    def setUp(self):
+        self.topology = {
+            "served_floors": [0, 1, 2, 3],
+            "elevators": [
+                {"id": "low", "served_floors": [0, 1, 2]},
+                {"id": "high", "served_floors": [2, 3]},
+            ],
+        }
+
+    def test_shortest_route_supports_transfer(self):
+        self.assertEqual(
+            MODULE.shortest_floor_route(self.topology, 0, 3),
+            [(2, "low"), (3, "high")],
+        )
+
+    def test_next_floor_is_not_current_plus_one(self):
+        selection = MODULE.select_next_floor_transition(
+            self.topology, current_floor=0, completed_floors={0, 1}
+        )
+        self.assertEqual(selection["final_target"], 2)
+        self.assertEqual(selection["next_floor"], 2)
+        self.assertEqual(selection["elevator_id"], "low")
+
+    def test_public_contract_parser_rejects_non_public_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "building_config.json"
+            path.write_text("{}", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                MODULE.load_public_scene_topology(str(path))
+
+    def test_door_animation_fits_independent_service_timeout(self):
+        config_path = pathlib.Path(__file__).parents[1] / "config" / "default.yaml"
+        with config_path.open(encoding="utf-8") as stream:
+            config = yaml.safe_load(stream)
+        self.assertGreaterEqual(config["elevator_service_timeout_s"], 40.0)
+        self.assertEqual(config["elevator_crossing_timeout_s"], 20.0)
+        self.assertEqual(config["floor_map_stable_time_s"], 15.0)
+
+
+class DoorScanValidationTest(unittest.TestCase):
+    def test_real_door_change_is_detected(self):
+        opened = np.full(40, 4.0, dtype=np.float32)
+        closed = opened.copy()
+        closed[15:25] = 0.8
+        self.assertTrue(MODULE.scan_door_changed(opened, closed))
+
+    def test_static_room_candidate_is_rejected(self):
+        opened = np.full(40, 2.0, dtype=np.float32)
+        closed = opened.copy()
+        closed[0] += 0.3
+        self.assertFalse(MODULE.scan_door_changed(opened, closed))
+
+
+class TransitStateMachineTest(unittest.TestCase):
+    class Future:
+        def __init__(self, value=None, done=True):
+            self.value = value
+            self.done_value = done
+            self.result_calls = 0
+
+        def done(self):
+            return self.done_value
+
+        def result(self):
+            self.result_calls += 1
+            return self.value
+
+    def test_service_timeout_invalidates_late_response_epoch(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        old = self.Future(value=SimpleNamespace(accepted=True), done=False)
+        planner._service_future = old
+        planner._service_kind = "door"
+        planner._service_generation = 4
+        planner._service_future_generation = 4
+        planner.floor_change_stage_deadline = MODULE.rospy.Time.from_sec(10.0)
+
+        status, response = planner._poll_service(
+            MODULE.rospy.Time.from_sec(10.1), "door"
+        )
+
+        self.assertEqual(status, "timeout")
+        self.assertIsNone(response)
+        self.assertIsNone(planner._service_future)
+        self.assertEqual(planner._service_generation, 5)
+        self.assertEqual(old.result_calls, 0)
+
+    def test_hall_candidate_index_advances_exactly_once(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=0.0, y=0.0)
+        )
+        planner.elevator_halls = [(1.0, 0.0, 0.0), (3.0, 0.0, 0.0)]
+        planner.elevator_hall_index = 0
+        planner.elevator_hall_approach_m = 0.8
+        planner.elevator_hall_navigation_max_s = 180.0
+        planner.elevator_hall_nominal_speed_mps = 0.25
+        planner.elevator_car_target_m = 1.4
+        planner._world_to_map = lambda _x, _y: (1, 1)
+        planner._is_free = lambda _x, _y: True
+        checks = iter(["unreachable", "reachable"])
+        planner._check_path = lambda *_args: next(checks)
+        planner.last_checked_path_metrics = {"path_length": 3.0}
+        planner._send_goal = Mock(return_value=True)
+        planner._set_floor_change_phase = Mock()
+
+        with patch.object(
+                MODULE.rospy.Time, "now",
+                return_value=MODULE.rospy.Time.from_sec(1.0)):
+            self.assertTrue(planner._pick_elevator_hall_and_send())
+        self.assertEqual(planner.elevator_hall_index, 2)
+        planner._send_goal.assert_called_once()
+
+    def test_wait_stable_requires_epoch_two_versions_and_full_hold(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_deadline = MODULE.rospy.Time.from_sec(1000.0)
+        planner.floor_change_step = "WAIT_STABLE"
+        planner.floor_change_target = 2
+        planner.current_floor = 2
+        planner.map_epoch = 8
+        planner.floor_change_expected_epoch = 8
+        planner.floor_change_start_target_version = 4
+        planner.floor_min_new_map_versions = 2
+        planner.current_map_version = 6
+        planner.mapping_ready = True
+        planner.mapping_stable = True
+        planner.mapping_transitioning = False
+        planner.nav_ready = True
+        planner.floor_change_stable_since = MODULE.rospy.Time(0)
+        planner.floor_map_stable_time_s = 15.0
+        planner._floor_change_done = Mock()
+
+        planner._advance_floor_change(MODULE.rospy.Time.from_sec(100.0))
+        planner._advance_floor_change(MODULE.rospy.Time.from_sec(114.9))
+        planner._floor_change_done.assert_not_called()
+        planner._advance_floor_change(MODULE.rospy.Time.from_sec(115.1))
+        planner._floor_change_done.assert_called_once()
+
+    def test_rejected_elevator_service_has_fixed_failure_code(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_deadline = MODULE.rospy.Time.from_sec(1000.0)
+        planner.floor_change_step = "CALL_TARGET_WAIT"
+        planner._service_outcome = Mock(return_value=(
+            "rejected", SimpleNamespace(message="not served")
+        ))
+        planner._floor_change_fail = Mock()
+
+        planner._advance_floor_change(MODULE.rospy.Time.from_sec(10.0))
+
+        planner._floor_change_fail.assert_called_once_with(
+            "SERVICE_REJECTED", "call target floor: not served"
+        )
 
 
 if __name__ == "__main__":

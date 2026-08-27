@@ -3,6 +3,7 @@
 import importlib.util
 import math
 import pathlib
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -37,6 +38,35 @@ def make_planner(grid, resolution=1.0, min_frontier_length=1.0, free_threshold=2
 
 
 class SimpleFrontierTest(unittest.TestCase):
+    def test_cached_wfd_1024_planning_p95_is_below_50_ms(self):
+        size = 1024
+        grid = np.full((size, size), -1, dtype=np.int8)
+        grid[112:912, 112:912] = 0
+        grid[300:305, 250:750] = 100
+        planner = make_planner(
+            grid, resolution=0.05, min_frontier_length=0.40, free_threshold=40
+        )
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=25.6, y=25.6)
+        )
+        planner.connectivity_clearance_radius = 0.30
+        planner.goal_clearance_margin = 0.02
+        planner.observation_min_distance = 0.30
+        planner.observation_target_distance = 0.45
+        planner.observation_max_distance = 0.70
+        planner.trap_blacklist = {}
+        planner.observation_goals_pub = None
+        planner.map_epoch = 1
+        planner.map_revision = 1
+        samples_ms = []
+        for _index in range(20):
+            started = time.perf_counter()
+            frontier = planner._frontier_mask()
+            reachable = planner._reachable_free_mask()
+            planner._observation_goals(frontier, reachable)
+            samples_ms.append((time.perf_counter() - started) * 1000.0)
+        self.assertLess(float(np.percentile(samples_ms, 95)), 50.0)
+
     def test_relaxed_exploration_defaults(self):
         config_path = pathlib.Path(__file__).parents[1] / "config" / "default.yaml"
         with config_path.open(encoding="utf-8") as stream:

@@ -1,7 +1,16 @@
 <launch>
   <arg name="config_file" default="$(find danger_search_exploration)/config/default.yaml" />
+  <arg name="simenv_root" default="$(find danger_search_exploration)/../../../SimEnv" />
+  <arg name="competition_mode" default="true" />
+  <arg name="multifloor_enabled" default="true" />
+  <arg name="localization_backend" default="gicp" />
+  <arg name="scene_info_file" default="$(arg simenv_root)/generated_building/team_scene_info.json" />
 
   <node name="exploration_planner" pkg="danger_search_exploration" type="exploration_planner.py" output="screen">
     <rosparam command="load" file="$(arg config_file)" />
+    <param name="competition_mode" value="$(arg competition_mode)" />
+    <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
+    <param name="localization_backend" value="$(arg localization_backend)" />
+    <param name="scene_info_file" value="$(arg scene_info_file)" />
   </node>
 </launch>

@@ -1,129 +1,86 @@
 # danger_search_exploration
 
-单楼层 S0/P0 探索规划模块。当前目标是跑通合法选点、路径校验、导航执行、有限恢复、稳定完成判定和任务停止链路；这不是最终比赛探索算法。
+P1 分层前沿探索和电梯换层执行模块。它只决定目标并调用 navigation/control，不直接发布
+最终 `/cmd_vel`。
 
-## 当前算法
+## 前沿规划
 
-节点保留简单前沿聚类，但导航目标使用前沿内侧观察位，而不是未知边界本身：
+- 以 `map_epoch/map_version` 为缓存键，用 OpenCV 连通域/WFD 只遍历机器人所在的已知
+  可达区域，避免每周期全图 Python BFS。
+- 前沿簇的目标放在已知区内侧，检查完整落点净空，再调用 `/move_base/make_plan`。
+- 目标按路径长度、路径最小净空和信息量排序；Action 终态按 goal epoch 隔离，失败采用
+  显式 backoff，不允许迟到结果污染新目标。
+- 恢复失败按原始 stuck pose 写入 trap blacklist，并在安全净空连续恢复后解除；不存在
+  move_base 结束后再要求额外物理位移的自锁门控。
+- 每层独立保存失败目标、trap blacklist、地图版本和完成状态。地图稳定且连续 10 秒没有
+  可达 frontier 后才完成当前层。
 
-1. 在当前二维占据地图中，把与未知栅格四邻接、占据概率低于 `free_threshold` 的已知栅格识别为前沿。
-2. 按 `connectivity_occupied_threshold` 提取静态障碍并以圆形 `connectivity_clearance_radius` 膨胀，从机器人附近自由格进行 4 邻域搜索，只保留当前连通区域内的前沿。
-3. 使用 8 邻域连通性聚类可达前沿，过滤长度小于 `min_frontier_length` 的噪声前沿。
-4. 在每个前沿簇的已知可达侧搜索距边界 `0.30-0.70 m`（默认约 `0.45 m`）的观察位，检查完整落点净空并令朝向指向未知区域。
-5. 调用 `/move_base/make_plan` 获取真实路径，拒绝穿越长期黑名单的候选，并按路径长度、整条路径最小净空和前沿信息量联合评分。
-6. 发送得分最优的观察位；允许选择稍远但更宽、更有信息量的前沿。
+`/exploration/complete` 仅在公开 `served_floors` 全部完成时发布。它不是任务完成；mission
+还必须执行跨层返航、起点返航和静止验证。
 
-默认连通性占据阈值为 `65`，圆形净空为 `0.30 m`，与 navigation 的静态地图规划配置一致。候选数量上限在可达区域筛选后生效；全图前沿数量仍用于区分“确实没有前沿”和“存在但当前区域不可达”。
+## 楼层拓扑
 
-该算法是确定性的 P0 基线。按团队追加验收要求，本包在简单前沿上实现了保守自动完成：输入新鲜且健康、无活动导航目标、地图超过稳定窗口且连续多轮无可达前沿时，才发布一次完成事件。它仍不包含 WFD、信息增益和定位修正版本等完整 P1 能力。
+只读取 `team_scene_info_v1` 的公开 `public_scene.elevators` 和 door IDs。以 served floors
+建立楼层/电梯图，并选择到未探索楼层的最少换乘路径；不会使用 `current_floor+1`，也不会
+把“不服务下一层”解释为建筑探索完成。
 
-## 职责与边界
+楼层身份以 `/call_elevator` 成功响应中的 `current_floor` 为准。正式 GICP 的高度不参与
+身份判定；结果 z 使用配置的 `floor_height_m=2.6`。
 
-- 从 `/map` 提取、聚类并过滤简单前沿候选。
-- 使用 `/localization/pose`、`/mapping/status` 和 `/navigation/health` 判断输入是否就绪。
-- 调用 `/move_base/make_plan`，仅发送返回非空路径的候选。
-- 通过 `/move_base` Action 发送、监控、超时取消导航目标。
-- 对普通失败位置执行 15 s 短期空间冷却。只有收到 `/navigation/recovery_event` 的失败事件或最终 `CONTROL_FAILED` 时，才把卡死点周围 `0.70 m` 内低净空通道和失败终点写入长期黑名单；暂停、成功和短期冷却都不清除。只有区域连续两个显著地图版本恢复安全净空才失效。
-- 通过 Trigger 服务幂等地启停；停止时取消全部活动目标。
+## TransitFloor 状态机
 
-模块不发布 `/cmd_vel`，不实现路径跟踪，不读取真值，不汇总危险源结果，也不负责调用任务级 `/danger_search/finish`。S0 允许人工结束任务。
-
-### 为什么不输出 `cmd_vel`
-
-探索模块只负责决定“去哪里”，输出的是带 `map` 坐标和朝向的 `/move_base` 导航目标。路径规划、路径跟踪和速度生成依赖局部障碍、机器人运动约束及控制频率，属于 navigation；navigation 输出 `/danger_search/nav_cmd_vel`。control 随后执行超时停车、加速度限制和安全仲裁，并作为唯一发布者输出最终 `/cmd_vel`：
+本节点提供 `/danger_search/transit_floor` (`TransitFloorAction`)，供探索和 mission 返航
+共同调用：
 
 ```text
-exploration --MoveBaseGoal--> navigation
-            navigation --/danger_search/nav_cmd_vel--> control
-                         control --/cmd_vel--> Unitree A1
+TO_HALL -> OPEN_CURRENT -> VERIFY_HALL -> ENTER -> CLOSE_CURRENT
+-> CALL_TARGET -> SWITCH_FLOOR -> EXIT -> CLEAR_COSTMAP -> WAIT_STABLE
 ```
 
-如果 exploration 同时发布 `/cmd_vel`，会绕过路径跟踪和安全仲裁，并与 control 争抢同一话题，导致速度来源不唯一、停止语义不可靠。因此 exploration 在 stop 或目标超时时取消 Action，由 navigation 停止旧目标速度，再由 control 保证最终零速度。
+- 厅导航超时按 `make_plan` 路径长度计算，上限 180 秒。
+- `CallElevator`/`SetDoorState` 是强类型同步服务，每阶段超时 40 秒；调用在工作线程执行，
+  取消、超时或新 action generation 会忽略迟到响应。
+- 进入和退出轿厢各限 20 秒，使用局部激光避障，速度只发布到
+  `/danger_search/elevator_cmd_vel`；control 以短租约仲裁。
+- `/localization/switch_floor` 成功后要求 epoch 增加，清空 costmap，并等待至少两个目标层
+  新地图版本、定位健康、地图稳定和 15 秒稳定保持。
+- 任何失败都取消普通导航、停止局部控制并返回固定失败码；候选索引只递增一次。
 
-## 接口
+电梯厅候选结合门宽、墙面方向、净空和 `make_plan`。靠近候选后通过允许的门服务和局部
+扫描变化验证，以覆盖连通墙中的井道并抑制房间凹口误检。
 
-订阅：
+固定失败码：
 
-| 默认名称 | 类型 |
-|---|---|
-| `/map` | `nav_msgs/OccupancyGrid` |
-| `/localization/pose` | `geometry_msgs/PoseWithCovarianceStamped` |
-| `/mapping/status` | `danger_search_common/MappingStatus` |
-| `/navigation/health` | `danger_search_common/NavigationHealth` |
-| `/navigation/recovery_event` | `danger_search_common/RecoveryEvent` |
+```text
+NO_HALL UNREACHABLE_HALL SERVICE_UNAVAILABLE SERVICE_REJECTED
+SERVICE_TIMEOUT ENTER_FAILED FLOOR_MISMATCH MAP_NOT_STABLE EXIT_FAILED
+CANCELED STALE_EPOCH
+```
 
-发布：
+## ROS 接口
 
-| 默认名称 | 类型 | 语义 |
-|---|---|---|
-| `/exploration/status` | `std_msgs/String`（JSON） | `state/reason/remaining_frontier_count/known_grid_ratio/map_revision/has_active_goal` |
-| `/exploration/complete` | `std_msgs/Bool`（latched） | 每个会话开始发布 `false`，满足收敛条件后只发布一次 `true` |
-| `/exploration/observation_goals` | `geometry_msgs/PoseArray` | 当前前沿内侧观察位（RViz 诊断） |
-| `/exploration/trap_blacklist` | `nav_msgs/GridCells` | 跨目标、跨暂停保留的卡死区域（RViz 诊断） |
+订阅：`/map`、`/localization/pose`、`/mapping/status`、`/navigation/health`、
+`/navigation/recovery_event`、`/localization/scan`。
 
-调用：
+调用：`/move_base`、`/move_base/make_plan`、`/move_base/clear_costmaps`、
+`/call_elevator`、`/set_door_state`、`/localization/switch_floor`。
 
-| 默认名称 | 类型 |
-|---|---|
-| `/move_base/make_plan` | `nav_msgs/GetPlan` |
-| `/move_base` | `move_base_msgs/MoveBaseAction` |
+发布：`/exploration/status`、`/exploration/complete`、观察目标/黑名单诊断话题、
+`/localization/mapping_pause` 和 `/danger_search/elevator_cmd_vel`。
 
-提供：
+提供：`/danger_search/start_exploration`、`/danger_search/stop_exploration` 和
+`/danger_search/transit_floor`。
 
-| 默认名称 | 类型 |
-|---|---|
-| `/danger_search/start_exploration` | `std_srvs/Trigger` |
-| `/danger_search/stop_exploration` | `std_srvs/Trigger` |
+参数见 `config/default.yaml`；正式启动由 `danger_search_bringup/competition.launch` 统一
+传入 `competition_mode`、`multifloor_enabled`、`localization_backend` 和公开 scene 文件。
 
-所有接口名称、frame、超时和选点参数均从节点私有参数读取，默认值见 `config/default.yaml`。
-
-## 运行
+## 验证
 
 ```bash
-cd /home/langan/danger_search_ws
-source /opt/ros/noetic/setup.bash
-catkin_make
-source devel/setup.bash
-roslaunch danger_search_exploration exploration.launch
+catkin_make run_tests_danger_search_exploration -j4
+catkin_test_results --all build/test_results/danger_search_exploration
 ```
 
-独立 launch 会把 YAML 加载到节点私有命名空间。团队统一启动仍由 `danger_search_bringup competition.launch` 完成。
-
-启动服务只让节点进入探索并等待输入，不要求依赖当时已经就绪。只有地图、位姿、建图健康、导航健康、`make_plan` 和 Action server 全部满足 S0 契约后才会发送目标。
-
-## S0 验收
-
-1. start 前不发送目标，重复 start 返回可预测成功。
-2. 地图或位姿无效、建图未稳定/丢失、导航未就绪时不发送目标。
-3. 候选来自有效前沿簇，必须在地图范围内且栅格值位于 `[0, free_threshold)`，并通过非空 `make_plan` 校验。
-4. 成功后继续选择新目标；失败、取消和超时不会无限重试同一位置。
-5. stop 取消全部目标，旧 Action 回调不能重新激活已停止的会话，重复 stop 返回可预测成功。
-6. 输入过期、地图未初始化、导航服务不可用和定位丢失分别进入明确的 WAITING/FAILED 原因，不计入无可达前沿轮次。
-7. `known_grid_ratio` 仅在已观测栅格的最小包围盒内统计，不把固定地图消息的全部未知边界当成真实可通行总面积。
-
-后续 S1 才实现可靠前沿聚类、目标持久化、自动收敛和更完整恢复；S2 以后再实现房间可见性、多楼层与门梯能力。
-
-## 多楼层探索（multifloor_enabled）
-
-启用 `multifloor_enabled=true` 时，模块在当前层探索收敛（连续多轮无可达前沿且地图稳定）后，
-自动执行电梯换层，而不是直接结束任务：
-
-1. **电梯自主发现**：从当前层二维地图中找出大的实心连通区域（电梯井/楼梯井），
-   在其周界检测"门缝"（墙上 0.8~2.5 m 的自由缺口），作为电梯厅候选。
-   跳过贴地图边界或包围盒过大的区域，避免把密封楼外等伪影当作井道。
-2. **换层状态机**：
-   - 导航到电梯厅门缝前 → `/call_elevator` 呼梯到当前层并开门 → 进入轿厢
-   - `/call_elevator` 呼叫目标楼层（`current_floor+1`）→ 电梯移动并开门
-   - 出门 → 等待 `/mapping/current_floor` 变化且建图稳定 → 继续该层探索
-3. **结束条件**：所有可达楼层探索完（目标楼层被电梯拒绝 `not served`），
-   或换层连续失败达到 `elevator_max_retries` 后，才发布探索完成事件，交 mission 返航。
-4. 电梯/门服务类型运行时动态发现；电梯每次操作带超时，换层失败自动退避重试，
-   不无限循环。
-
-相关参数见 `config/default.yaml` 的"多楼层探索"段：
-`current_floor_topic`、`elevator_service`、`door_service`、`elevator_id`、
-`shaft_min_area_m2`、`shaft_max_area_m2`、`door_gap_min_width_m`、`door_gap_max_width_m`、
-`elevator_hall_approach_m`、`elevator_car_target_m`、`elevator_service_timeout_s`、
-`elevator_max_retries`、`floor_change_timeout_s`、`floor_map_stable_time_s`。
-
-单元测试 `test/test_multifloor.py` 覆盖电梯井门缝发现（含封闭无门缝井道不误检）。
+测试覆盖 WFD 性能、扫描过滤默认合同、多楼层拓扑、连通墙/房间凹口/多候选、服务拒绝和
+超时、迟到响应、候选重试及 WAIT_STABLE。真实电梯运动、Unitree 进出轿厢和 12-seed
+比赛闭环仍需在 SimEnv 正式环境完成。
