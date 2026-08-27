@@ -25,7 +25,9 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 from navigation_monitor_core import (
+    GoalEpochTracker,
     classify_terminal_status,
+    maneuver_from_command,
     polyline_progress,
     recovery_has_translation_progress,
     recovery_maneuver,
@@ -50,6 +52,7 @@ class NavigationMonitor:
         self.goal_pose = None
         self.path = []
         self.active_goal_id = ""
+        self.goal_tracker = GoalEpochTracker()
         self.has_active_goal = False
         self.mapping_ready = False
         self.mapping_stable = False
@@ -69,6 +72,7 @@ class NavigationMonitor:
         self.failure_detail = ""
         self.recovery_event_id = 0
         self.recovery = None
+        self.escape_attempt_count = 0
         self.plan_generation = 0
 
         self.health_pub = rospy.Publisher(
@@ -211,9 +215,29 @@ class NavigationMonitor:
             self.mapping_lost = message.lost
             self.last_mapping = rospy.Time.now()
 
-    def _nav_cmd_callback(self, _message):
+    def _nav_cmd_callback(self, message):
+        update = None
         with self.lock:
             self.last_nav_cmd = rospy.Time.now()
+            if self._recovery_is_current_locked():
+                inferred = maneuver_from_command(
+                    message.linear.x,
+                    message.linear.y,
+                    message.angular.z,
+                    self.recovery["maneuver"],
+                )
+                if inferred != self.recovery["maneuver"]:
+                    self.recovery["maneuver"] = inferred
+                    self.recovery["requested_distance"] = (
+                        0.35 if inferred == "BACKUP"
+                        else 0.30 if inferred.startswith("STRAFE")
+                        else 0.0
+                    )
+                    update = self._recovery_message_locked(
+                        RecoveryEvent.PHASE_TRIGGERED, 0.0
+                    )
+        if update is not None:
+            self.recovery_pub.publish(update)
 
     def _sent_cmd_callback(self, message):
         translation = math.hypot(message.linear.x, message.linear.y) > 0.02
@@ -225,6 +249,8 @@ class NavigationMonitor:
             self.last_sent_cmd = rospy.Time.now()
             self.last_sent_moving = moving
             self.last_sent_translation = translation
+            if self._recovery_is_current_locked() and translation:
+                self.recovery["had_translation"] = True
 
     def _config_ready_callback(self, message):
         with self.lock:
@@ -232,13 +258,28 @@ class NavigationMonitor:
             self.last_config_ready = rospy.Time.now()
 
     def _goal_callback(self, message):
+        previous = None
         with self.lock:
-            self.active_goal_id = message.goal_id.id
+            goal_id = message.goal_id.id
+            if not goal_id:
+                rospy.logwarn_throttle(
+                    2.0, "[navigation_monitor] ignored goal with empty id"
+                )
+                return
+            is_new_goal = not self.goal_tracker.matches(goal_id)
+            if is_new_goal and self.recovery is not None:
+                previous = self._finish_recovery_locked(False)
+            self.goal_tracker.accept_goal(goal_id)
+            self.active_goal_id = goal_id
             self.goal_pose = copy.deepcopy(message.goal.target_pose.pose)
             self.has_active_goal = True
-            self.failure_code = "NONE"
-            self.failure_detail = ""
-            self.path = []
+            if is_new_goal:
+                self.failure_code = "NONE"
+                self.failure_detail = ""
+                self.path = []
+                self.escape_attempt_count = 0
+        if previous is not None:
+            self.recovery_pub.publish(previous)
 
     def _status_callback(self, message):
         active_states = {
@@ -251,8 +292,18 @@ class NavigationMonitor:
                   if status.status in active_states]
         with self.lock:
             self.last_status = rospy.Time.now()
-            if active:
+            matching = [
+                status for status in active
+                if self.goal_tracker.matches(status.goal_id.id)
+            ]
+            if matching:
+                self.has_active_goal = True
+            elif active and not self.goal_tracker.active:
                 selected = active[-1]
+                try:
+                    self.goal_tracker.accept_goal(selected.goal_id.id)
+                except ValueError:
+                    return
                 self.active_goal_id = selected.goal_id.id
                 self.has_active_goal = True
 
@@ -270,19 +321,31 @@ class NavigationMonitor:
 
     def _result_callback(self, message):
         event = None
+        ignored = False
         with self.lock:
-            code = classify_terminal_status(
-                message.status.status, message.status.text
-            )
-            self.failure_code = code
-            self.failure_detail = message.status.text or code
-            self.has_active_goal = False
-            if message.status.goal_id.id:
-                self.active_goal_id = message.status.goal_id.id
-            if self.recovery is not None:
-                event = self._finish_recovery_locked(
-                    message.status.status == GoalStatus.SUCCEEDED
+            result_goal_id = message.status.goal_id.id
+            if not self.goal_tracker.matches(result_goal_id):
+                ignored = True
+            else:
+                code = classify_terminal_status(
+                    message.status.status, message.status.text
                 )
+                self.failure_code = code
+                self.failure_detail = message.status.text or code
+                self.has_active_goal = False
+                self.active_goal_id = result_goal_id
+                if self._recovery_is_current_locked():
+                    event = self._finish_recovery_locked(
+                        message.status.status == GoalStatus.SUCCEEDED
+                    )
+                self.goal_tracker.close_goal(result_goal_id)
+        if ignored:
+            rospy.logwarn_throttle(
+                2.0,
+                "[navigation_monitor] ignored terminal result for stale goal %s",
+                message.status.goal_id.id or "<empty>",
+            )
+            return
         if event is not None:
             self.recovery_pub.publish(event)
         self._publish_health()
@@ -290,17 +353,35 @@ class NavigationMonitor:
     def _recovery_callback(self, message):
         previous = None
         with self.lock:
-            if self.recovery is not None:
+            if not self.has_active_goal or not self.goal_tracker.active:
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[navigation_monitor] ignored recovery without active goal",
+                )
+                return
+            if self._recovery_is_current_locked():
                 previous = self._finish_recovery_locked(False)
+            elif self.recovery is not None:
+                self.recovery = None
             self.recovery_event_id += 1
             stuck_pose = self._pose_tuple(message.pose_stamped.pose)
             if not all(math.isfinite(value) for value in stuck_pose):
                 stuck_pose = self.pose or (0.0, 0.0, 0.0)
+            behavior_name = message.recovery_behavior_name
+            if "escape_recovery" in behavior_name.lower():
+                self.escape_attempt_count += 1
+                attempt = self.escape_attempt_count
+            else:
+                attempt = int(message.current_recovery_number) + 1
             self.recovery = {
                 "event_id": self.recovery_event_id,
-                "behavior": message.recovery_behavior_name,
-                "maneuver": recovery_maneuver(message.recovery_behavior_name),
-                "attempt": int(message.current_recovery_number) + 1,
+                "goal_id": self.goal_tracker.active_goal_id,
+                "goal_epoch": self.goal_tracker.epoch,
+                "behavior": behavior_name,
+                "maneuver": recovery_maneuver(behavior_name),
+                "attempt": attempt,
+                "requested_distance": 0.0,
+                "had_translation": False,
                 "stuck_pose": stuck_pose,
                 "goal_pose": copy.deepcopy(self.goal_pose),
                 "plan_generation": self.plan_generation,
@@ -315,7 +396,7 @@ class NavigationMonitor:
     def _timer_callback(self, _event):
         event = None
         with self.lock:
-            if (self.recovery is not None and self.pose is not None
+            if (self._recovery_is_current_locked() and self.pose is not None
                     and self._fresh(
                         rospy.Time.now(), self.last_sent_cmd, self.command_timeout
                     )):
@@ -323,11 +404,17 @@ class NavigationMonitor:
                 achieved = math.hypot(
                     self.pose[0] - stuck[0], self.pose[1] - stuck[1]
                 )
-                if recovery_has_translation_progress(
+                translating_escape = (
+                    "escape_recovery" in self.recovery["behavior"].lower()
+                    and self.recovery["had_translation"]
+                    and achieved >= self.recovery_success_distance
+                    and self.plan_generation > self.recovery["plan_generation"]
+                )
+                if (translating_escape or recovery_has_translation_progress(
                         achieved, self.recovery_success_distance,
                         self.plan_generation,
                         self.recovery["plan_generation"],
-                        self.last_sent_translation):
+                        self.last_sent_translation)):
                     event = self._finish_recovery_locked(True)
         if event is not None:
             self.recovery_pub.publish(event)
@@ -348,18 +435,30 @@ class NavigationMonitor:
         self.recovery = None
         return message
 
+    def _recovery_is_current_locked(self):
+        return (
+            self.recovery is not None
+            and self.goal_tracker.matches(
+                self.recovery["goal_id"], self.recovery["goal_epoch"]
+            )
+        )
+
     def _recovery_message_locked(self, phase, achieved):
         state = self.recovery
         message = RecoveryEvent()
         message.header.stamp = rospy.Time.now()
         message.header.frame_id = self.map_frame
         message.event_id = state["event_id"]
-        message.active_goal_id = self.active_goal_id
+        message.active_goal_id = state["goal_id"]
         message.phase = phase
-        message.maneuver = (
-            RecoveryEvent.MANEUVER_ROTATE
-            if state["maneuver"] == "ROTATE"
-            else RecoveryEvent.MANEUVER_NONE
+        maneuver_values = {
+            "BACKUP": RecoveryEvent.MANEUVER_BACKUP,
+            "STRAFE_LEFT": RecoveryEvent.MANEUVER_STRAFE_LEFT,
+            "STRAFE_RIGHT": RecoveryEvent.MANEUVER_STRAFE_RIGHT,
+            "ROTATE": RecoveryEvent.MANEUVER_ROTATE,
+        }
+        message.maneuver = maneuver_values.get(
+            state["maneuver"], RecoveryEvent.MANEUVER_NONE
         )
         message.stuck_pose.position.x = state["stuck_pose"][0]
         message.stuck_pose.position.y = state["stuck_pose"][1]
@@ -374,7 +473,7 @@ class NavigationMonitor:
         else:
             message.goal_pose.orientation.w = 1.0
         message.attempt = state["attempt"]
-        message.requested_distance = 0.0
+        message.requested_distance = state.get("requested_distance", 0.0)
         message.achieved_distance = float(achieved)
         message.min_clearance = 0.0
         return message
@@ -427,7 +526,7 @@ class NavigationMonitor:
                 message.failure_detail = "standard move_base input is stale"
             elif (self.has_active_goal and not self.config_ready):
                 message.failure_code = "CONTROL_FAILED"
-                message.failure_detail = "TrajectoryPlannerROS configuration is not verified"
+                message.failure_detail = "selected local planner configuration is not verified"
             else:
                 message.failure_code = self.failure_code
                 message.failure_detail = self.failure_detail

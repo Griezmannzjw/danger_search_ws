@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Apply and continuously verify TrajectoryPlannerROS dynamic configuration.
+"""Apply and continuously verify the selected standard local planner config.
 
-TrajectoryPlannerROS owns part of its configuration through the standard
-dynamic_reconfigure service.  This guard intentionally has no cmd_vel or
+The planner owns part of its configuration through the standard
+dynamic_reconfigure service. This guard intentionally has no cmd_vel or
 action interface: it only prevents the rest of the stack from accepting goals
 until the plugin reports the values requested by the launch configuration.
 """
@@ -18,19 +18,21 @@ class NavigationConfigGuard:
     def __init__(self):
         rospy.init_node("navigation_config_guard", anonymous=False)
         self.planner_name = rospy.get_param(
-            "~planner_name", "/move_base/TrajectoryPlannerROS"
+            "~planner_name", "/move_base/DWAPlannerROS"
+        )
+        self.planner_config_key = rospy.get_param(
+            "~planner_config_key", "DWAPlannerROS"
         )
         self.ready_topic = rospy.get_param(
             "~ready_topic", "/navigation/config_ready"
         )
-        self.expected = dict(rospy.get_param("~TrajectoryPlannerROS", {}))
+        self.expected = dict(rospy.get_param(
+            "~" + self.planner_config_key, {}
+        ))
         if not self.expected:
-            raise rospy.ROSInitException("TrajectoryPlannerROS configuration is empty")
-        y_vels = self.expected.get("y_vels")
-        if isinstance(y_vels, (list, tuple)):
-            self.expected["y_vels"] = ", ".join(str(value) for value in y_vels)
-        if not isinstance(self.expected.get("y_vels"), str):
-            raise rospy.ROSInitException("TrajectoryPlannerROS/y_vels must be a string")
+            raise rospy.ROSInitException(
+                "%s configuration is empty" % self.planner_config_key
+            )
 
         self.publisher = rospy.Publisher(self.ready_topic, Bool, queue_size=1, latch=True)
         self.client = None
@@ -59,12 +61,15 @@ class NavigationConfigGuard:
             if key in current
         }
         if not dynamic:
-            raise RuntimeError("TrajectoryPlannerROS exposed no expected dynamic parameters")
+            raise RuntimeError(
+                "%s exposed no expected dynamic parameters"
+                % self.planner_config_key
+            )
         self.client.update_configuration(dynamic)
         self.applied = True
         rospy.loginfo(
-            "[navigation_config_guard] applied %d dynamic TrajectoryPlannerROS parameters",
-            len(dynamic),
+            "[navigation_config_guard] applied %d dynamic %s parameters",
+            len(dynamic), self.planner_config_key,
         )
 
     def _verified(self):

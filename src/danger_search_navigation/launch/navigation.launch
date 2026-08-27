@@ -5,7 +5,7 @@
        behind danger_search_control/cmd_mux. -->
   <node name="move_base" pkg="move_base" type="move_base" output="screen" clear_params="true">
     <rosparam command="load" file="$(arg config_dir)/standard_move_base.yaml" />
-    <rosparam command="load" file="$(arg config_dir)/trajectory_planner.yaml" />
+    <rosparam command="load" file="$(arg config_dir)/dwa_planner.yaml" />
     <rosparam command="load" file="$(arg config_dir)/costmap_common.yaml" ns="global_costmap" />
     <rosparam command="load" file="$(arg config_dir)/costmap_common.yaml" ns="local_costmap" />
     <rosparam command="load" file="$(arg config_dir)/global_costmap.yaml" ns="global_costmap" />
@@ -19,7 +19,9 @@
         pkg="danger_search_navigation"
         type="navigation_config_guard.py"
         output="screen">
-    <rosparam command="load" file="$(arg config_dir)/trajectory_planner.yaml" />
+    <param name="planner_name" value="/move_base/DWAPlannerROS" />
+    <param name="planner_config_key" value="DWAPlannerROS" />
+    <rosparam command="load" file="$(arg config_dir)/dwa_planner.yaml" />
   </node>
 
   <!-- Compatibility only: converts standard action/recovery state to the

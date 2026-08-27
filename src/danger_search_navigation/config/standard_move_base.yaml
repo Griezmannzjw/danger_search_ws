@@ -1,8 +1,8 @@
-# Standard ROS navigation stack.  The Unitree-provided TrajectoryPlannerROS
-# configuration is the baseline; values below are limited to the command range
-# accepted by danger_search_control/cmd_mux.
+# Standard ROS navigation stack.  DWAPlannerROS avoids TrajectoryPlannerROS's
+# hard-coded 0.10 m/s holonomic diagonal candidates, which the Unitree RL gait
+# cannot execute reliably.
 base_global_planner: navfn/NavfnROS
-base_local_planner: base_local_planner/TrajectoryPlannerROS
+base_local_planner: dwa_local_planner/DWAPlannerROS
 
 planner_frequency: 1.0
 controller_frequency: 10.0
@@ -13,13 +13,16 @@ oscillation_timeout: 8.0
 oscillation_distance: 0.10
 shutdown_costmaps: false
 recovery_behavior_enabled: true
-clearing_rotation_allowed: false
+clearing_rotation_allowed: true
 make_plan_clear_costmap: false
 make_plan_add_unreachable_goal: false
 
 recovery_behaviors:
   - {name: conservative_reset, type: clear_costmap_recovery/ClearCostmapRecovery}
+  - {name: escape_recovery_1, type: danger_search_navigation/UnitreeEscapeRecovery}
+  - {name: rotate_recovery, type: rotate_recovery/RotateRecovery}
   - {name: aggressive_reset, type: clear_costmap_recovery/ClearCostmapRecovery}
+  - {name: escape_recovery_2, type: danger_search_navigation/UnitreeEscapeRecovery}
 
 # Clear only short-lived scan observations.  The static map is never cleared.
 conservative_reset:
@@ -33,6 +36,28 @@ aggressive_reset:
   affected_maps: both
   layer_names: [obstacles]
   force_updating: true
+
+# Both plugin instances share a per-move_base-goal attempt budget.  Keeping
+# the parameters identical lets the second attempt continue a partially
+# successful escape or choose another direction after zero progress.
+escape_recovery_1: &unitree_escape
+  backup_distance: 0.35
+  backup_speed: -0.30
+  strafe_distance: 0.30
+  strafe_speed: 0.20
+  simulation_step: 0.025
+  frequency: 20.0
+  no_progress_timeout: 1.5
+  timeout: 8.0
+  progress_epsilon: 0.01
+  max_attempts_per_goal: 2
+
+escape_recovery_2:
+  <<: *unitree_escape
+
+rotate_recovery:
+  sim_granularity: 0.025
+  frequency: 20.0
 
 NavfnROS:
   allow_unknown: false

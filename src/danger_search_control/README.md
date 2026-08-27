@@ -1,20 +1,22 @@
 # danger_search_control
 
-控制执行层。`cmd_mux.py` 是最终 `/cmd_vel` 的唯一发布者，当前 P0 只有一条导航速度通道和一个最高优先级的外部急停门。
+控制执行层。`cmd_mux.py` 是最终 `/cmd_vel` 的唯一发布者，仲裁导航、电梯短租约速度和最高优先级外部急停。
 
 ## 数据流
 
 ```text
 /danger_search/nav_cmd_vel
-            ↓
+            ↓             /danger_search/elevator_cmd_vel
+            └───────────────┐
         cmd_mux
             ↓
 /cmd_vel 与 /danger_search/cmd_vel_sent
 ```
 
-## P0 职责
+## 正式职责
 
 - 处理导航的 `linear.x`、`linear.y`、`angular.z`，其余 Twist 分量始终保持为零。
+- 电梯命令采用 0.25 秒短租约，租约内优先于导航，超时后才回退到仍新鲜的导航命令。
 - 拒绝 NaN、Inf 或无法转换为有限数值的导航速度。
 - 先做三轴最大速度限幅，再做线速度和角速度加速度限制。
 - 未收到有效命令、命令超时或外部急停时立即输出三轴零速度。
@@ -25,6 +27,7 @@
 
 ```text
 safety_stop
+  > elevator 短租约
   > 非法输入 / 超时 / 未收到有效命令
   > 限幅和加速度限制后的导航命令
 ```
@@ -36,6 +39,7 @@ safety_stop
 | 话题 | 类型 | 说明 |
 |------|------|------|
 | `/danger_search/nav_cmd_vel` | `geometry_msgs/Twist` | 导航速度输入 |
+| `/danger_search/elevator_cmd_vel` | `geometry_msgs/Twist` | 电梯进出控制速度输入，租约 0.25 秒 |
 | `/danger_search/safety_stop` | `std_msgs/Bool` | 由外部安全模块发布的急停输入，`true` 时立即停车 |
 
 ### 输出
@@ -50,16 +54,19 @@ safety_stop
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `nav_cmd_topic` | `/danger_search/nav_cmd_vel` | 导航输入话题 |
+| `elevator_cmd_topic` | `/danger_search/elevator_cmd_vel` | 电梯控制输入话题 |
 | `output_cmd_topic` | `/cmd_vel` | 最终输出话题 |
 | `sent_cmd_topic` | `/danger_search/cmd_vel_sent` | 输出回显话题 |
 | `safety_stop_topic` | `/danger_search/safety_stop` | 外部急停输入话题 |
 | `enable_safety` | `true` | 是否启用命令超时停车 |
 | `cmd_timeout_s` | `0.5` | 有效导航命令最大允许间隔，单位秒 |
+| `elevator_timeout_s` | `0.25` | 电梯输入短租约，单位秒 |
 | `max_linear_speed` | `0.40` | `linear.x` 最大绝对速度，单位米每秒 |
 | `max_lateral_speed` | `0.25` | `linear.y` 最大绝对速度，单位米每秒 |
 | `max_angular_speed` | `0.80` | `angular.z` 最大绝对速度，单位弧度每秒 |
-| `max_linear_accel` | `1.0` | `linear.x`、`linear.y` 每次变化的最大加速度 |
-| `max_angular_accel` | `2.0` | `angular.z` 每次变化的最大加速度 |
+| `max_linear_accel` | `3.0` | `linear.x` 纵向加速度上限，与 10 Hz DWA 动态窗口一致 |
+| `max_lateral_accel` | `2.0` | `linear.y` 横向加速度上限 |
+| `max_angular_accel` | `8.0` | `angular.z` 角加速度上限，使首周期可达 0.8 rad/s |
 | `max_dt_s` | `0.10` | 加速度计算使用的最大时间步长，单位秒 |
 | `output_rate` | `50` | 输出频率，单位赫兹 |
 
@@ -84,6 +91,7 @@ source /opt/ros/noetic/setup.bash
 source /home/ruilinli/SimEnv/danger_search_ws/devel/setup.bash
 rosrun danger_search_control cmd_mux.py \
   _nav_cmd_topic:=/test/nav_cmd_vel \
+  _elevator_cmd_topic:=/test/elevator_cmd_vel \
   _output_cmd_topic:=/test/cmd_vel \
   _sent_cmd_topic:=/test/cmd_vel_sent \
   _safety_stop_topic:=/test/safety_stop
@@ -124,9 +132,9 @@ python3 /home/ruilinli/SimEnv/danger_search_ws/src/danger_search_control/test/cm
 
 该脚本只发布和订阅 `/test/*`，不会启动 Gazebo，也不会向真实 `/cmd_vel` 发送命令。
 
-## 明确不在本 P0 实现内
+## 明确不在本实现内
 
-- 多路速度仲裁和手动遥控。
+- 除导航、电梯短租约和急停外的其他速度仲裁或手动遥控。
 - 自动障碍急停、摔倒检测和碰撞检测。
 - `/control/status` 或任何新的 ROS msg、srv、action、急停话题。
 - Unitree 控制器侧的硬件命令看门狗。
