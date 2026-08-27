@@ -98,6 +98,11 @@ FAST-LIO2 也在独立诊断链路上做了升级条件对照。当前 SimEnv �
 真值路径约 `19.85 m`，FAST-LIO2 输出路径约 `21.8 km`。它没有达到误差改善 20% 的门槛，
 所以本轮不接入、不设为正式默认。
 
+仓库已有的 Hector 受限修正也做了启动候选检查。正式参数同时启用
+`multifloor_enabled=true` 与 `use_hector_correction=true` 时，定位 adapter 按设计拒绝启动：
+当前 Hector 长期地图不支持独立楼层地图存取。该组合没有退化为单层运行，因此门禁行为
+正确；在完成 Hector 分层地图实现前，它不能用于绕过本次 GICP 平移退化。
+
 ## 下一轮整改和放行顺序
 
 1. 保留现有同步 bag 作为回归基线；新增 bag 继续由测试端单独录制 truth，且不得把 truth
