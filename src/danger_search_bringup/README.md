@@ -1,8 +1,8 @@
 # danger_search_bringup
 
-P0 系统集成启动包。`competition.launch` 一次装配 localization、perception、navigation、
-exploration、control、mission 和入口门控制，共 10 个运行节点。其中 localization 内部
-包含传感器适配、FAST-LIO2、占据栅格和公共接口适配 4 个节点。
+P1 比赛系统集成启动包。`competition.launch` 一次装配 localization、perception、
+navigation、exploration、control、mission、入口门控制和 required preflight。正式定位
+链使用 GICP；仓库中的 FAST-LIO2 源码未接入本轮默认构建。
 
 ## 默认目录约定
 
@@ -26,9 +26,13 @@ SimEnv/results/detected_danger.json
 |---|---|---|
 | `simenv_root` | 自动查找同级 `SimEnv` | 不同部署布局只需覆盖这一项 |
 | `result_file` | `$(arg simenv_root)/results/detected_danger.json` | 可选的完整结果文件覆盖 |
+| `scene_info_file` | `$(arg simenv_root)/generated_building/team_scene_info.json` | 唯一允许的公开场景合同 |
+| `result_coordinate_frame` | `auto` | 按公开合同选择 world，否则 start_relative |
 | `autostart` | `false` | 为 true 时所有预检就绪后自动开始任务 |
 | `open_main_entrance` | `true` | 调用官方服务实际打开主入口；仅隔离调试时关闭 |
-| `localization_source` | `gicp` | `gicp` 为正式默认；`gazebo_truth` 仅用于 SimEnv 模块联调 |
+| `competition_mode` | `true` | 正式模式；开启时禁止真值后端并要求多楼层 |
+| `multifloor_enabled` | `true` | 启用分层地图和显式楼层切换 |
+| `localization_backend` | `gicp` | 正式后端；`gazebo_truth` 只允许测试模式 |
 | `gazebo_base_link` | `a1_gazebo::base` | 真值测试模式读取的 Gazebo link 名称 |
 
 零配置启动：
@@ -48,21 +52,21 @@ roslaunch danger_search_bringup competition.launch \
 
 ```bash
 roslaunch danger_search_bringup competition.launch \
-  localization_source:=gazebo_truth
+  competition_mode:=false localization_backend:=gazebo_truth
 ```
 
 该参数不得用于正式比赛，也不要同时启用 SimEnv referee odom；真值节点只替换内部
 里程计来源，公共接口和传感器占据地图保持不变。
 
-## P0 推荐流程
+## 正式推荐流程
 
-1. 启动 SimEnv：为官方底层步态控制保留 ground-truth 状态话题，但关闭 referee odom
-   和真值点云变换；算法节点不得订阅 `/ground_truth/*`；
+1. 以 `ENABLE_REFEREE_ODOM=0 ENABLE_GROUND_TRUTH=0
+   POINTCLOUD_USE_GROUND_TRUTH_ODOM=0` 启动 SimEnv；
 2. 在 junior_ctrl 终端按 `2` 站立，再按 `6` 进入 `/cmd_vel` 模式；
 3. 启动 `competition.launch autostart:=true`；
 4. bringup 调用官方门服务打开 `main_entrance`；
 5. mission 在门外记录出生点，以短目标滚动进入建筑，确认前向进度后再进入 `EXPLORING`；
-6. exploration 收敛后自动进入 `RETURNING`，返回门外出生点；
+6. exploration 完成全部 served floors 后，mission 必要时乘电梯回 0 层，再返回出生点；
 7. 返回起点后自动写结果并进入 `FINISHED`。
 
 官方生成场景当前把主入口设为 `initial_open: true`；`entrance_door` 仍会在
@@ -82,4 +86,4 @@ rosservice call /danger_search/start "{}"
 
 - `perception_only.launch`：感知模块隔离调试；
 - `navigation_only.launch`：定位、导航、探索和控制联调；
-- `competition.launch`：P0 完整系统唯一正式入口。
+- `competition.launch`：P1 多楼层系统唯一正式入口；preflight 失败时整个 launch 退出。

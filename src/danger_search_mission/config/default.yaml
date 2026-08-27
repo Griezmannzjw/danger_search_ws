@@ -15,15 +15,23 @@ exploration_complete_topic: /exploration/complete
 mission_status_topic: /mission/status
 mission_active_topic: /mission/active
 entrance_ready_topic: /entrance/ready
+preflight_ready_topic: /danger_search/preflight_ready
+sent_cmd_topic: /danger_search/cmd_vel_sent
 start_exploration_service: /danger_search/start_exploration
 stop_exploration_service: /danger_search/stop_exploration
 start_mission_service: /danger_search/start
 finish_mission_service: /danger_search/finish
 return_home_service: /danger_search/return_home
 move_base_action_name: /move_base
+transit_floor_action_name: /danger_search/transit_floor
 
 # 由 launch 根据同级 SimEnv 自动生成绝对路径，也可在启动时覆盖。
 result_file: ""
+scene_info_file: ""
+# auto follows public team_scene_info.coordinate_frame; missing/unknown falls
+# back to the PDF's task-start-relative contract.
+result_coordinate_frame: auto
+home_floor: 0
 
 # 多帧确认与任务时序
 dedup_distance: 0.8
@@ -54,4 +62,12 @@ entry_timeout_s: 150.0
 # 正式 P0 必须等 /entrance/ready=true；仅 mission 隔离测试时才关闭。
 require_entrance_ready: true
 return_timeout_s: 120.0
+return_position_tolerance_m: 0.50
+return_yaw_tolerance_rad: 0.3490658504
+return_stationary_hold_s: 2.0
+return_stationary_linear_mps: 0.02
+return_stationary_angular_rps: 0.05
+return_verify_timeout_s: 15.0
+return_max_goal_attempts: 2
+require_preflight_ready: true
 autostart: false

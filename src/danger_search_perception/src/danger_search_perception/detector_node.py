@@ -15,6 +15,7 @@ from danger_search_common.msg import (
     DangerSource,
     DangerSourceArray,
     DetectionStatus,
+    LocalizationStatus,
     MappingStatus,
 )
 
@@ -27,7 +28,11 @@ from .config import (
     TrackingConfig,
 )
 from .depth_geometry import DepthGeometryValidator
-from .floor_context import FloorHeightClassifier, MappingGate
+from .floor_context import (
+    FloorHeightClassifier,
+    LocalizationCorrectionGate,
+    MappingGate,
+)
 from .tracking import DetectionObservation, MultiFrameDangerTracker
 
 
@@ -63,6 +68,9 @@ class DangerDetectorNode:
         self.mapping_status_topic = rospy.get_param(
             "~mapping_status_topic", "/mapping/status"
         )
+        self.localization_status_topic = rospy.get_param(
+            "~localization_status_topic", "/localization/status"
+        )
         self.require_stable_mapping = bool(
             rospy.get_param(
                 "~require_stable_mapping",
@@ -86,6 +94,15 @@ class DangerDetectorNode:
         self.mapping_gate = MappingGate(
             self.mapping_status_timeout_s,
             fallback_floor_id=self.floor_id,
+        )
+        self.require_localization_status = bool(
+            rospy.get_param("~require_localization_status", True)
+        )
+        self.localization_status_timeout_s = float(
+            rospy.get_param("~localization_status_timeout_s", 1.5)
+        )
+        self.correction_gate = LocalizationCorrectionGate(
+            self.localization_status_timeout_s
         )
         self.input_fresh_timeout_s = float(
             rospy.get_param("~input_fresh_timeout_s", 1.0)
@@ -139,6 +156,12 @@ class DangerDetectorNode:
             self._mapping_status_callback,
             queue_size=5,
         )
+        self.localization_status_sub = rospy.Subscriber(
+            self.localization_status_topic,
+            LocalizationStatus,
+            self._localization_status_callback,
+            queue_size=5,
+        )
         self.rgb_sub = message_filters.Subscriber(self.rgb_topic, Image)
         self.depth_sub = message_filters.Subscriber(self.depth_topic, Image)
         self.camera_info_sub = message_filters.Subscriber(
@@ -187,6 +210,16 @@ class DangerDetectorNode:
         if not mapping_snapshot.allowed:
             self._set_floor_context(
                 False, mapping_snapshot.epoch, mapping_snapshot.reason
+            )
+            self._publish(output)
+            return
+        correction_snapshot = self.correction_gate.snapshot(
+            rospy.Time.now().to_sec(),
+            required=self.require_localization_status,
+        )
+        if not correction_snapshot.allowed:
+            self._set_floor_context(
+                False, mapping_snapshot.epoch, correction_snapshot.reason
             )
             self._publish(output)
             return
@@ -298,21 +331,27 @@ class DangerDetectorNode:
 
             danger = self._to_danger_message(
                 geometry, confidence, camera_frame, rgb_msg.header.stamp,
-                transform, candidate_index, mapping_snapshot.floor_id
+                transform, candidate_index, mapping_snapshot.floor_id,
+                mapping_snapshot.epoch, correction_snapshot.version,
             )
             if danger is not None:
                 output.dangers.append(danger)
 
+        now_s = rospy.Time.now().to_sec()
         if not self.mapping_gate.is_current(
             mapping_snapshot,
-            rospy.Time.now().to_sec(),
+            now_s,
             required=self.require_stable_mapping,
+        ) or not self.correction_gate.is_current(
+            correction_snapshot,
+            now_s,
+            required=self.require_localization_status,
         ):
             output.dangers = []
             self._set_floor_context(
                 False,
                 mapping_snapshot.epoch,
-                "MAPPING_CHANGED_DURING_FRAME",
+                "LOCALIZATION_CONTEXT_CHANGED_DURING_FRAME",
             )
         elif self.tracker is not None and output.dangers:
             self._annotate_tracks(output.dangers, rgb_msg.header.stamp)
@@ -339,7 +378,7 @@ class DangerDetectorNode:
 
     def _to_danger_message(
         self, geometry, confidence, camera_frame, stamp, transform,
-        candidate_index, floor_id=None
+        candidate_index, floor_id=None, map_epoch=0, correction_version=0
     ):
         point_camera = PointStamped()
         point_camera.header.stamp = stamp
@@ -360,7 +399,8 @@ class DangerDetectorNode:
         point_target.header.frame_id = self.target_frame
 
         danger = DangerSource()
-        danger.detection_id = "{}.{}-{}".format(
+        danger.detection_id = "m{}-c{}-{}.{}-{}".format(
+            int(map_epoch), int(correction_version),
             stamp.secs, stamp.nsecs, candidate_index
         )
         danger.class_id = DangerSource.CLASS_DANGER_RED_SPHERE
@@ -369,7 +409,9 @@ class DangerDetectorNode:
             with self.floor_lock:
                 floor_id = self.current_floor
         danger.floor_id = int(floor_id)
+        danger.map_epoch = int(map_epoch)
         danger.confidence = float(confidence)
+        danger.localization_correction_version = int(correction_version)
         danger.source_time = stamp
         return danger
 
@@ -380,6 +422,8 @@ class DangerDetectorNode:
             message.lost,
             message.current_floor,
             rospy.Time.now().to_sec(),
+            transitioning=bool(getattr(message, "transitioning", False)),
+            map_epoch=int(getattr(message, "map_epoch", 0)),
         )
         if message.current_floor < 0:
             rospy.logwarn_throttle(
@@ -390,6 +434,16 @@ class DangerDetectorNode:
             return
         with self.floor_lock:
             self.current_floor = int(message.current_floor)
+
+    def _localization_status_callback(self, message):
+        changed = self.correction_gate.update(
+            message.correction_version,
+            rospy.Time.now().to_sec(),
+        )
+        if changed and self.tracker is not None:
+            # Existing track coordinates belong to an older corrected map.
+            # Mission-level confirmed results remain preserved independently.
+            self.tracker.reset()
 
     def _annotate_tracks(self, dangers, stamp):
         observations = [
@@ -475,6 +529,9 @@ class DangerDetectorNode:
         mapping_snapshot = self.mapping_gate.snapshot(
             now.to_sec(), required=self.require_stable_mapping
         )
+        correction_snapshot = self.correction_gate.snapshot(
+            now.to_sec(), required=self.require_localization_status
+        )
         floor_context_current = (
             not self.verify_floor_height
             or (
@@ -494,6 +551,7 @@ class DangerDetectorNode:
         status.ready = (
             status.input_fresh
             and mapping_snapshot.allowed
+            and correction_snapshot.allowed
             and last_camera_valid
             and last_tf_available
             and floor_context_current
@@ -520,6 +578,8 @@ class DangerDetectorNode:
             status.status_reason = "INPUT_STALE"
         elif not mapping_snapshot.allowed:
             status.status_reason = mapping_snapshot.reason
+        elif not correction_snapshot.allowed:
+            status.status_reason = correction_snapshot.reason
         elif (
             self.verify_floor_height
             and last_floor_context_epoch == mapping_snapshot.epoch

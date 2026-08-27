@@ -7,6 +7,9 @@
     <param name="preflight_wait_timeout_s" value="3.0" />
     <param name="input_timeout_s" value="1.0" />
     <param name="return_timeout_s" value="3.0" />
+    <param name="competition_mode" value="false" />
+    <param name="multifloor_enabled" value="false" />
+    <param name="require_preflight_ready" value="false" />
   </node>
 
   <test test-name="mission_smoke"

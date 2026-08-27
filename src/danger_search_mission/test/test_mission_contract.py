@@ -30,12 +30,17 @@ class MissionContractTest(unittest.TestCase):
             config["entry_completion_tolerance_m"], config["entry_distance_m"]
         )
         self.assertTrue(config["require_entrance_ready"])
+        self.assertTrue(config["require_preflight_ready"])
+        self.assertEqual(config["transit_floor_action_name"], "/danger_search/transit_floor")
+        self.assertEqual(config["return_stationary_hold_s"], 2.0)
 
     def test_manager_owns_complete_subscription_and_return_goal(self):
         source = (PACKAGE / "scripts" / "mission_manager.py").read_text(encoding="utf-8")
         self.assertIn("self.exploration_complete_sub = rospy.Subscriber", source)
         self.assertIn("goal = MoveBaseGoal()", source)
-        self.assertIn("done_cb=self._return_done_callback", source)
+        self.assertIn("self._return_done_callback(", source)
+        self.assertIn("self._return_transit_done_callback(", source)
+        self.assertIn("return_epoch != self.return_epoch", source)
         self.assertIn("self._entry_done_callback(", source)
         self.assertIn("self.entry_retry_at = rospy.Time.now()", source)
         self.assertIn('navigation_failure == "LOCALIZATION_LOST"', source)

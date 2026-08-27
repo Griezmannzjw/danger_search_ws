@@ -17,7 +17,7 @@ from danger_search_common.msg import (
     MissionStatus,
     NavigationHealth,
 )
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from move_base_msgs.msg import MoveBaseAction, MoveBaseResult
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger, TriggerResponse
@@ -61,6 +61,9 @@ class MissionSmokeTest(unittest.TestCase):
         )
         self.detections_pub = rospy.Publisher(
             "/danger_detector/detections", DangerSourceArray, queue_size=5
+        )
+        self.sent_cmd_pub = rospy.Publisher(
+            "/danger_search/cmd_vel_sent", Twist, queue_size=5
         )
         self.status_sub = rospy.Subscriber(
             "/mission/status", MissionStatus, self._status_callback
@@ -140,6 +143,7 @@ class MissionSmokeTest(unittest.TestCase):
         detection.ready = True
         detection.input_fresh = True
         self.detection_status_pub.publish(detection)
+        self.sent_cmd_pub.publish(Twist())
 
         self.exploration_status_pub.publish(String(data=json.dumps({
             "remaining_frontier_count": 0,

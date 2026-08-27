@@ -148,6 +148,53 @@ def task_relative_position(x, y, z, home_x, home_y, home_z, home_yaw):
     )
 
 
+def task_to_world_position(x, y, z, start_x, start_y, start_z, start_yaw):
+    """Transform a task-start-relative point into the public world frame."""
+    values = (x, y, z, start_x, start_y, start_z, start_yaw)
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("world transform requires finite values")
+    cosine = math.cos(float(start_yaw))
+    sine = math.sin(float(start_yaw))
+    return (
+        float(start_x) + cosine * float(x) - sine * float(y),
+        float(start_y) + sine * float(x) + cosine * float(y),
+        float(start_z) + float(z),
+    )
+
+
+def resolve_result_coordinate_frame(requested, scene_frame=None):
+    """Resolve the evaluator-facing frame without consulting forbidden files."""
+    requested = str(requested or "auto").strip().lower()
+    if requested not in ("auto", "world", "start_relative"):
+        raise ValueError("result_coordinate_frame must be auto, world or start_relative")
+    if requested != "auto":
+        return requested
+    normalized_scene = str(scene_frame or "").strip().lower()
+    return "world" if normalized_scene == "world" else "start_relative"
+
+
+def parse_public_scene_contract(document):
+    """Extract only the explicitly public fields used by the mission runtime."""
+    if not isinstance(document, dict):
+        raise ValueError("team scene info must be a JSON object")
+    if document.get("schema") != "team_scene_info_v1":
+        raise ValueError("unsupported team scene info schema")
+    coordinate_frame = str(document.get("coordinate_frame", "")).strip().lower()
+    if coordinate_frame not in ("", "world", "start_relative"):
+        raise ValueError("unsupported public coordinate frame")
+    start = document.get("robot_start")
+    if not isinstance(start, dict):
+        raise ValueError("team scene info is missing robot_start")
+    values = tuple(float(start[name]) for name in ("x", "y", "z", "yaw"))
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("robot_start must contain finite x/y/z/yaw")
+    return {
+        "coordinate_frame": coordinate_frame,
+        "robot_start": values,
+        "public_scene": document.get("public_scene", {}),
+    }
+
+
 def entry_progress(current_x, current_y, home_x, home_y, home_yaw):
     """Return forward and lateral displacement in the captured entry frame."""
     values = (current_x, current_y, home_x, home_y, home_yaw)
@@ -194,13 +241,21 @@ def normalize_result_file(path):
     return normalized
 
 
-def build_result_document(tracks, home, elapsed_s):
+def build_result_document(
+    tracks,
+    home,
+    elapsed_s,
+    coordinate_frame="start_relative",
+    robot_start=None,
+    mission_status="FINISHED",
+):
     """Build the exact evaluator-facing JSON document."""
     if not math.isfinite(float(elapsed_s)) or float(elapsed_s) < 0.0:
         raise ValueError("elapsed_s must be non-negative and finite")
     if len(home) != 4:
         raise ValueError("home must contain x, y, z and yaw")
-    positions = [
+    coordinate_frame = resolve_result_coordinate_frame(coordinate_frame)
+    relative_positions = [
         task_relative_position(
             track.x,
             track.y,
@@ -212,8 +267,19 @@ def build_result_document(tracks, home, elapsed_s):
         )
         for track in tracks
     ]
+    if coordinate_frame == "world":
+        if robot_start is None or len(robot_start) != 4:
+            raise ValueError("world output requires public robot_start x/y/z/yaw")
+        positions = [
+            task_to_world_position(*position, *robot_start)
+            for position in relative_positions
+        ]
+    else:
+        positions = relative_positions
     return {
         "exploration_time": round(float(elapsed_s), 2),
+        "coordinate_frame": coordinate_frame,
+        "mission_status": str(mission_status),
         "detected_danger_sources": [
             {"position": [round(x, 2), round(y, 2), round(z, 2)]}
             for x, y, z in positions

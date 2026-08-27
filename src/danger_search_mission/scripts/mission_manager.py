@@ -17,6 +17,8 @@ from danger_search_common.msg import (
     MappingStatus,
     MissionStatus,
     NavigationHealth,
+    TransitFloorAction,
+    TransitFloorGoal,
 )
 from danger_search_mission.mission_core import (
     build_result_document,
@@ -25,8 +27,10 @@ from danger_search_mission.mission_core import (
     MissionLifecycle,
     next_entry_target,
     normalize_result_file,
+    parse_public_scene_contract,
+    resolve_result_coordinate_frame,
 )
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger, TriggerResponse
@@ -67,6 +71,12 @@ class MissionManager:
         self.entrance_ready_topic = rospy.get_param(
             "~entrance_ready_topic", "/entrance/ready"
         )
+        self.preflight_ready_topic = rospy.get_param(
+            "~preflight_ready_topic", "/danger_search/preflight_ready"
+        )
+        self.sent_cmd_topic = rospy.get_param(
+            "~sent_cmd_topic", "/danger_search/cmd_vel_sent"
+        )
 
         self.start_exploration_service = rospy.get_param(
             "~start_exploration_service", "/danger_search/start_exploration"
@@ -86,6 +96,9 @@ class MissionManager:
         self.move_base_action_name = rospy.get_param(
             "~move_base_action_name", "/move_base"
         )
+        self.transit_floor_action_name = rospy.get_param(
+            "~transit_floor_action_name", "/danger_search/transit_floor"
+        )
 
         try:
             self.result_file = normalize_result_file(
@@ -103,6 +116,41 @@ class MissionManager:
             "~preflight_wait_timeout_s", 20.0
         )
         self.return_timeout_s = self._positive_param("~return_timeout_s", 120.0)
+        self.return_position_tolerance_m = self._positive_param(
+            "~return_position_tolerance_m", 0.5
+        )
+        self.return_yaw_tolerance_rad = self._positive_param(
+            "~return_yaw_tolerance_rad", math.radians(20.0)
+        )
+        self.return_stationary_hold_s = self._positive_param(
+            "~return_stationary_hold_s", 2.0
+        )
+        self.return_verify_timeout_s = self._positive_param(
+            "~return_verify_timeout_s", 15.0
+        )
+        self.return_stationary_linear_mps = self._nonnegative_param(
+            "~return_stationary_linear_mps", 0.02
+        )
+        self.return_stationary_angular_rps = self._nonnegative_param(
+            "~return_stationary_angular_rps", 0.05
+        )
+        self.return_max_goal_attempts = int(
+            rospy.get_param("~return_max_goal_attempts", 2)
+        )
+        if self.return_max_goal_attempts < 1:
+            raise rospy.ROSInitException("~return_max_goal_attempts must be at least one")
+        self.home_floor = int(rospy.get_param("~home_floor", 0))
+        if self.home_floor < 0:
+            raise rospy.ROSInitException("~home_floor cannot be negative")
+        self.result_coordinate_frame = rospy.get_param(
+            "~result_coordinate_frame", "auto"
+        )
+        self.scene_info_file = str(rospy.get_param("~scene_info_file", "")).strip()
+        self.scene_contract = self._load_scene_contract(self.scene_info_file)
+        self.output_coordinate_frame = resolve_result_coordinate_frame(
+            self.result_coordinate_frame,
+            self.scene_contract.get("coordinate_frame"),
+        )
         self.entry_timeout_s = self._positive_param("~entry_timeout_s", 90.0)
         self.entry_distance_m = self._positive_param("~entry_distance_m", 4.2)
         self.entry_step_m = self._positive_param("~entry_step_m", 0.6)
@@ -134,6 +182,27 @@ class MissionManager:
         self.require_entrance_ready = bool(
             rospy.get_param("~require_entrance_ready", True)
         )
+        self.competition_mode = bool(rospy.get_param(
+            "~competition_mode", rospy.get_param("/competition_mode", True)
+        ))
+        self.multifloor_enabled = bool(rospy.get_param(
+            "~multifloor_enabled", rospy.get_param("/multifloor_enabled", True)
+        ))
+        self.localization_backend = str(rospy.get_param(
+            "~localization_backend", rospy.get_param("/localization_backend", "gicp")
+        ))
+        self.require_preflight_ready = bool(rospy.get_param(
+            "~require_preflight_ready", self.competition_mode
+        ))
+        if self.competition_mode and (
+                not self.multifloor_enabled or self.localization_backend != "gicp"):
+            raise rospy.ROSInitException(
+                "competition mission requires multifloor GICP runtime"
+            )
+        if self.competition_mode and not self.scene_contract:
+            raise rospy.ROSInitException(
+                "competition mission requires public team_scene_info.json"
+            )
         self.autostart = bool(rospy.get_param("~autostart", False))
 
         self.lock = threading.RLock()
@@ -145,6 +214,7 @@ class MissionManager:
         self.home_pose = None
         self.finish_reason = ""
         self.current_floor = 0
+        self.current_map_epoch = 0
         self.latest_pose = None
         self.last_pose_time = rospy.Time(0)
         self.mapping_status = None
@@ -156,6 +226,11 @@ class MissionManager:
         self.remaining_frontier_count = 0
         self.map_coverage_summary = ""
         self.return_goal_active = False
+        self.transit_goal_active = False
+        self.return_goal_attempts = 0
+        self.return_epoch = 0
+        self.return_verify_since = rospy.Time(0)
+        self.return_verify_deadline = rospy.Time(0)
         self.entry_goal_active = False
         self.entry_goal_sequence = 0
         self.entry_goal_progress_m = 0.0
@@ -164,6 +239,9 @@ class MissionManager:
         self.entry_retry_at = rospy.Time(0)
         self.entry_waiting_for_localization = False
         self.entrance_ready = not self.require_entrance_ready
+        self.preflight_ready = not self.require_preflight_ready
+        self.last_sent_cmd = Twist()
+        self.last_sent_cmd_time = rospy.Time(0)
         self.exploration_completion_armed = False
         self.finalized = False
         self.autostart_attempted = False
@@ -177,6 +255,15 @@ class MissionManager:
         self.entrance_ready_sub = rospy.Subscriber(
             self.entrance_ready_topic, Bool, self._entrance_ready_callback, queue_size=2
         )
+        self.preflight_ready_sub = rospy.Subscriber(
+            self.preflight_ready_topic,
+            Bool,
+            self._preflight_ready_callback,
+            queue_size=2,
+        )
+        self.sent_cmd_sub = rospy.Subscriber(
+            self.sent_cmd_topic, Twist, self._sent_cmd_callback, queue_size=10
+        )
 
         self.start_explore_client = rospy.ServiceProxy(
             self.start_exploration_service, Trigger
@@ -186,6 +273,9 @@ class MissionManager:
         )
         self.move_base_client = actionlib.SimpleActionClient(
             self.move_base_action_name, MoveBaseAction
+        )
+        self.transit_floor_client = actionlib.SimpleActionClient(
+            self.transit_floor_action_name, TransitFloorAction
         )
 
         self.pose_sub = rospy.Subscriber(
@@ -252,6 +342,29 @@ class MissionManager:
         )
 
     @staticmethod
+    def _load_scene_contract(path):
+        if not path:
+            return {}
+        normalized = os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+        if os.path.basename(normalized) != "team_scene_info.json":
+            raise rospy.ROSInitException(
+                "scene_info_file must reference public team_scene_info.json"
+            )
+        forbidden = {
+            "layout_metadata.json",
+            "building_config.json",
+            "scene_manifest.json",
+            "danger_truth.json",
+        }
+        if any(part in forbidden for part in normalized.split(os.sep)):
+            raise rospy.ROSInitException("scene_info_file references forbidden data")
+        try:
+            with open(normalized, encoding="utf-8") as stream:
+                return parse_public_scene_contract(json.load(stream))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise rospy.ROSInitException("invalid public scene info: %s" % exc)
+
+    @staticmethod
     def _positive_param(name, default):
         value = float(rospy.get_param(name, default))
         if not math.isfinite(value) or value <= 0.0:
@@ -293,10 +406,20 @@ class MissionManager:
         with self.lock:
             self.entrance_ready = bool(message.data)
 
+    def _preflight_ready_callback(self, message):
+        with self.lock:
+            self.preflight_ready = bool(message.data)
+
+    def _sent_cmd_callback(self, message):
+        with self.lock:
+            self.last_sent_cmd = copy.deepcopy(message)
+            self.last_sent_cmd_time = rospy.Time.now()
+
     def _mapping_status_callback(self, message):
         with self.lock:
             self.mapping_status = copy.deepcopy(message)
             self.current_floor = int(message.current_floor)
+            self.current_map_epoch = int(getattr(message, "map_epoch", 0))
             self.last_mapping_status_time = rospy.Time.now()
 
     def _navigation_health_callback(self, message):
@@ -330,6 +453,8 @@ class MissionManager:
         with self.lock:
             if self.mission_state != MissionLifecycle.EXPLORING:
                 return
+            current_floor = self.current_floor
+            current_map_epoch = self.current_map_epoch
         for danger in message.dangers:
             if danger.class_id != DangerSource.CLASS_DANGER_RED_SPHERE:
                 continue
@@ -338,6 +463,14 @@ class MissionManager:
                     5.0,
                     "[mission] ignoring detection outside %s frame",
                     self.map_frame,
+                )
+                continue
+            if (int(danger.floor_id) != current_floor
+                    or int(getattr(danger, "map_epoch", 0)) != current_map_epoch):
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[mission] ignoring stale floor/map detection floor=%d epoch=%d",
+                    int(danger.floor_id), int(getattr(danger, "map_epoch", 0)),
                 )
                 continue
             point = danger.position.point
@@ -374,6 +507,9 @@ class MissionManager:
             detection = self.detection_status
             detection_time = self.last_detection_status_time
             entrance_ready = self.entrance_ready
+            preflight_ready = self.preflight_ready
+        if self.require_preflight_ready and not preflight_ready:
+            return "competition_preflight_not_ready"
         if self.require_entrance_ready and not entrance_ready:
             return "entrance_not_ready"
         inputs = (
@@ -387,14 +523,24 @@ class MissionManager:
                 return name + "_missing"
             if (now - stamp).to_sec() > self.input_timeout_s:
                 return name + "_stale"
-        if not mapping.ready or not mapping.stable or mapping.lost:
+        if (
+            not mapping.ready
+            or not mapping.stable
+            or mapping.lost
+            or bool(getattr(mapping, "transitioning", False))
+        ):
             return "mapping_not_ready"
+        if int(mapping.current_floor) != self.home_floor:
+            return "mission_start_not_on_home_floor"
         if not navigation.ready:
             return "navigation_not_ready"
         if not detection.ready:
             return "perception_not_ready"
         if not self.move_base_client.wait_for_server(rospy.Duration(0.05)):
             return "move_base_unavailable"
+        if (self.multifloor_enabled
+                and not self.transit_floor_client.wait_for_server(rospy.Duration(0.05))):
+            return "transit_floor_unavailable"
         try:
             rospy.wait_for_service(self.start_exploration_service, timeout=0.05)
             rospy.wait_for_service(self.stop_exploration_service, timeout=0.05)
@@ -444,6 +590,11 @@ class MissionManager:
             self.finish_reason = ""
             self.tracker.reset()
             self.return_goal_active = False
+            self.transit_goal_active = False
+            self.return_goal_attempts = 0
+            self.return_epoch += 1
+            self.return_verify_since = rospy.Time(0)
+            self.return_verify_deadline = rospy.Time(0)
             self.entry_goal_active = False
             self.entry_goal_sequence += 1
             self.entry_goal_progress_m = 0.0
@@ -455,6 +606,13 @@ class MissionManager:
             self.finalized = False
             self.remaining_frontier_count = 0
             self.map_coverage_summary = ""
+        try:
+            self._write_result_file(
+                mission_status="RUNNING", finish_override=self.start_time
+            )
+        except (OSError, ValueError) as exc:
+            self._finalize("initial_result_write_failed:" + str(exc), error=True)
+            return TriggerResponse(False, "Could not initialize result file")
         self.active_pub.publish(Bool(data=True))
         self._publish_status()
         if self.entry_enabled:
@@ -715,6 +873,12 @@ class MissionManager:
             self.return_start_time = rospy.Time.now()
             self.finish_reason = reason
             self.return_goal_active = False
+            self.transit_goal_active = False
+            self.return_goal_attempts = 0
+            self.return_epoch += 1
+            return_epoch = self.return_epoch
+            self.return_verify_since = rospy.Time(0)
+            self.return_verify_deadline = rospy.Time(0)
             self.entry_goal_active = False
             self.entry_goal_sequence += 1
             self.entry_retry_at = rospy.Time(0)
@@ -728,30 +892,141 @@ class MissionManager:
         if home_pose is None:
             self._finalize("home_pose_missing", error=True)
             return False, "Home pose missing"
+        with self.lock:
+            current_floor = self.current_floor
+        if current_floor != self.home_floor:
+            if not self.transit_floor_client.wait_for_server(rospy.Duration(1.0)):
+                self._finalize("transit_floor_unavailable_for_return", error=True)
+                return False, "floor transit unavailable"
+            goal = TransitFloorGoal()
+            goal.target_floor = self.home_floor
+            goal.exit_to_hall = True
+            self.transit_floor_client.send_goal(
+                goal,
+                done_cb=lambda state, result: self._return_transit_done_callback(
+                    return_epoch, state, result
+                ),
+            )
+            with self.lock:
+                self.transit_goal_active = True
+            self._publish_status()
+            rospy.loginfo(
+                "[mission] RETURNING via floor transit %d -> %d: %s",
+                current_floor,
+                self.home_floor,
+                reason,
+            )
+            return True, "Return floor transit started"
+        return self._send_home_goal(reason)
+
+    def _return_transit_done_callback(self, return_epoch, state, result):
+        with self.lock:
+            if (self.mission_state != MissionLifecycle.RETURNING or self.finalized
+                    or return_epoch != self.return_epoch):
+                return
+            self.transit_goal_active = False
+        if (
+            state != GoalStatus.SUCCEEDED
+            or result is None
+            or not result.success
+            or int(result.reached_floor) != self.home_floor
+        ):
+            failure = getattr(result, "failure_code", "ACTION_FAILED")
+            self._finalize("return_floor_transit_failed:" + str(failure), error=True)
+            return
+        self._send_home_goal("home_floor_reached")
+
+    def _send_home_goal(self, reason):
+        with self.lock:
+            if self.mission_state != MissionLifecycle.RETURNING or self.finalized:
+                return False, "Mission is not returning"
+            home_pose = copy.deepcopy(self.home_pose)
+            if self.return_goal_attempts >= self.return_max_goal_attempts:
+                self._finalize("return_goal_attempts_exhausted", error=True)
+                return False, "Return attempts exhausted"
+            self.return_goal_attempts += 1
+            return_epoch = self.return_epoch
+            self.return_verify_since = rospy.Time(0)
+            self.return_verify_deadline = rospy.Time(0)
         if not self.move_base_client.wait_for_server(rospy.Duration(1.0)):
             self._finalize("move_base_unavailable_for_return", error=True)
             return False, "move_base unavailable"
-
         goal = MoveBaseGoal()
         goal.target_pose.header.stamp = rospy.Time.now()
         goal.target_pose.header.frame_id = self.map_frame
         goal.target_pose.pose = copy.deepcopy(home_pose.pose.pose)
-        self.move_base_client.send_goal(goal, done_cb=self._return_done_callback)
+        self.move_base_client.send_goal(
+            goal,
+            done_cb=lambda state, result: self._return_done_callback(
+                return_epoch, state, result
+            ),
+        )
         with self.lock:
             self.return_goal_active = True
         self._publish_status()
-        rospy.loginfo("[mission] RETURNING to captured home pose: %s", reason)
-        return True, "Return started"
+        rospy.loginfo(
+            "[mission] RETURNING to home pose attempt=%d: %s",
+            self.return_goal_attempts,
+            reason,
+        )
+        return True, "Return home goal sent"
 
-    def _return_done_callback(self, state, _result):
+    def _return_done_callback(self, return_epoch, state, _result):
         with self.lock:
-            if self.mission_state != MissionLifecycle.RETURNING or self.finalized:
+            if (self.mission_state != MissionLifecycle.RETURNING or self.finalized
+                    or return_epoch != self.return_epoch):
                 return
             self.return_goal_active = False
         if state == GoalStatus.SUCCEEDED:
-            self._finalize("completed", error=False)
+            with self.lock:
+                self.return_verify_deadline = (
+                    rospy.Time.now() + rospy.Duration(self.return_verify_timeout_s)
+                )
         else:
-            self._finalize("return_failed_action_state_%d" % state, error=True)
+            with self.lock:
+                attempts = self.return_goal_attempts
+            if attempts < self.return_max_goal_attempts:
+                self._send_home_goal("retry_action_state_%d" % state)
+            else:
+                self._finalize("return_failed_action_state_%d" % state, error=True)
+
+    def _return_pose_within_tolerance(self):
+        with self.lock:
+            home = copy.deepcopy(self.home_pose)
+            current = copy.deepcopy(self.latest_pose)
+            navigation = copy.deepcopy(self.navigation_health)
+            floor = self.current_floor
+            command = copy.deepcopy(self.last_sent_cmd)
+            command_time = self.last_sent_cmd_time
+        if home is None or current is None or floor != self.home_floor:
+            return False
+        home_position = home.pose.pose.position
+        current_position = current.pose.pose.position
+        distance = math.hypot(
+            current_position.x - home_position.x,
+            current_position.y - home_position.y,
+        )
+        yaw_error = abs(
+            math.atan2(
+                math.sin(self._pose_yaw(current) - self._pose_yaw(home)),
+                math.cos(self._pose_yaw(current) - self._pose_yaw(home)),
+            )
+        )
+        stationary = (
+            navigation is not None
+            and not navigation.controller_active
+            and not navigation.has_active_goal
+            and command_time != rospy.Time(0)
+            and (rospy.Time.now() - command_time).to_sec() <= self.input_timeout_s
+            and math.hypot(command.linear.x, command.linear.y)
+            <= self.return_stationary_linear_mps
+            and abs(command.angular.z) <= self.return_stationary_angular_rps
+        )
+        return (
+            distance <= self.return_position_tolerance_m
+            and yaw_error <= self.return_yaw_tolerance_rad
+            and stationary
+        )
 
     def _timer_callback(self, _event=None):
         now = rospy.Time.now()
@@ -763,6 +1038,7 @@ class MissionManager:
             entry_retry_at = self.entry_retry_at
             entry_goal_active = self.entry_goal_active
             entry_waiting_for_localization = self.entry_waiting_for_localization
+            return_verify_deadline = self.return_verify_deadline
             should_autostart = (
                 self.autostart
                 and not self.autostart_attempted
@@ -814,7 +1090,30 @@ class MissionManager:
             and (now - return_start_time).to_sec() >= self.return_timeout_s
         ):
             self.move_base_client.cancel_goal()
+            self.transit_floor_client.cancel_goal()
             self._finalize("return_timeout", error=True)
+        elif (
+            state == MissionLifecycle.RETURNING
+            and not return_verify_deadline.is_zero()
+        ):
+            if self._return_pose_within_tolerance():
+                with self.lock:
+                    if self.return_verify_since.is_zero():
+                        self.return_verify_since = now
+                    held_for = (now - self.return_verify_since).to_sec()
+                if held_for >= self.return_stationary_hold_s:
+                    self._finalize("completed", error=False)
+            else:
+                with self.lock:
+                    self.return_verify_since = rospy.Time(0)
+                if now >= return_verify_deadline:
+                    with self.lock:
+                        attempts = self.return_goal_attempts
+                        self.return_verify_deadline = rospy.Time(0)
+                    if attempts < self.return_max_goal_attempts:
+                        self._send_home_goal("pose_verification_retry")
+                    else:
+                        self._finalize("return_pose_verification_failed", error=True)
         self._publish_status()
 
     def _entry_localization_ready(self, now):
@@ -869,12 +1168,13 @@ class MissionManager:
             self.result_file,
         )
 
-    def _write_result_file(self):
+    def _write_result_file(self, mission_status=None, finish_override=None):
         with self.lock:
             home = copy.deepcopy(self.home_pose)
             tracks = list(self.tracker.confirmed_tracks())
             start_time = self.start_time
-            finish_time = self.finish_time or rospy.Time.now()
+            finish_time = finish_override or self.finish_time or rospy.Time.now()
+            status = mission_status or self.mission_state
         if home is None or start_time is None:
             raise ValueError("mission start pose/time unavailable")
         orientation = home.pose.pose.orientation
@@ -887,6 +1187,9 @@ class MissionManager:
             tracks,
             (home_position.x, home_position.y, home_position.z, yaw),
             (finish_time - start_time).to_sec(),
+            coordinate_frame=self.output_coordinate_frame,
+            robot_start=self.scene_contract.get("robot_start"),
+            mission_status=status,
         )
         directory = os.path.dirname(self.result_file)
         os.makedirs(directory, exist_ok=True)
@@ -935,6 +1238,7 @@ class MissionManager:
             )
         if active:
             self.move_base_client.cancel_all_goals()
+            self.transit_floor_client.cancel_all_goals()
 
     def run(self):
         rospy.spin()

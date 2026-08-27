@@ -7,9 +7,13 @@ target_frame: map
 base_frame: base
 floor_id: 0
 mapping_status_topic: /mapping/status
+localization_status_topic: /localization/status
 # 正式 map 输出只有在当前楼层地图健康稳定时才允许发布。
 require_stable_mapping: true
 mapping_status_timeout_s: 1.5
+# 每个检测都携带采集期间的定位修正版本；版本变化中的帧整帧丢弃。
+require_localization_status: true
+localization_status_timeout_s: 1.5
 # 用图像采集时刻的 map->base 高度复核楼层，避免换层瞬间错标。
 verify_floor_height: true
 floor_heights: [0.0, 2.6, 5.2]

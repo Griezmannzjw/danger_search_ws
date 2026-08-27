@@ -38,16 +38,20 @@ class TestP0MessageAdapter(unittest.TestCase):
             stamp=stamp,
             transform=transform,
             candidate_index=2,
+            map_epoch=7,
+            correction_version=3,
         )
 
         self.assertEqual(
             result.class_id, DangerSource.CLASS_DANGER_RED_SPHERE
         )
-        self.assertEqual(result.detection_id, "12.34-2")
+        self.assertEqual(result.detection_id, "m7-c3-12.34-2")
         self.assertEqual(result.position.header.frame_id, "map")
         self.assertEqual(result.position.header.stamp, stamp)
         self.assertEqual(result.floor_id, 0)
+        self.assertEqual(result.map_epoch, 7)
         self.assertAlmostEqual(result.confidence, 0.9)
+        self.assertEqual(result.localization_correction_version, 3)
         self.assertEqual(result.source_time, stamp)
 
     def test_tracking_fields_are_populated_without_changing_message_type(self):

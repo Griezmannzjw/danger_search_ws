@@ -13,7 +13,10 @@ from danger_search_mission.mission_core import (
     MissionLifecycle,
     next_entry_target,
     normalize_result_file,
+    parse_public_scene_contract,
+    resolve_result_coordinate_frame,
     task_relative_position,
+    task_to_world_position,
 )
 
 
@@ -92,10 +95,49 @@ class ResultContractTest(unittest.TestCase):
         track = DangerTrack(2.345, -1.234, 0.156, 0, count=3, max_confidence=0.9)
         result = build_result_document([track], (0.0, 0.0, 0.0, 0.0), 12.345)
         self.assertEqual(result["exploration_time"], 12.35)
+        self.assertEqual(result["coordinate_frame"], "start_relative")
+        self.assertEqual(result["mission_status"], "FINISHED")
         self.assertEqual(
             result["detected_danger_sources"],
             [{"position": [2.35, -1.23, 0.16]}],
         )
+
+    def test_world_result_uses_public_nonzero_start_and_yaw(self):
+        track = DangerTrack(2.0, 0.0, 0.2, 0, count=3, max_confidence=0.9)
+        result = build_result_document(
+            [track],
+            (0.0, 0.0, 0.0, 0.0),
+            1.0,
+            coordinate_frame="world",
+            robot_start=(10.0, 5.0, 0.6, math.pi / 2.0),
+        )
+        self.assertEqual(
+            result["detected_danger_sources"],
+            [{"position": [10.0, 7.0, 0.8]}],
+        )
+
+    def test_auto_result_frame_falls_back_to_pdf_contract(self):
+        self.assertEqual(
+            resolve_result_coordinate_frame("auto", "world"), "world"
+        )
+        self.assertEqual(
+            resolve_result_coordinate_frame("auto", None), "start_relative"
+        )
+        self.assertEqual(
+            task_to_world_position(1.0, 0.0, 0.2, 10.0, 5.0, 0.6, math.pi / 2.0),
+            (10.0, 6.0, 0.8),
+        )
+
+    def test_public_scene_contract_rejects_unknown_schema(self):
+        with self.assertRaises(ValueError):
+            parse_public_scene_contract({"schema": "private_layout_v1"})
+        parsed = parse_public_scene_contract({
+            "schema": "team_scene_info_v1",
+            "coordinate_frame": "world",
+            "robot_start": {"x": 1, "y": 2, "z": 0.6, "yaw": 0.5},
+            "public_scene": {"elevators": []},
+        })
+        self.assertEqual(parsed["robot_start"], (1.0, 2.0, 0.6, 0.5))
 
     def test_result_path_expands_and_normalizes(self):
         with tempfile.TemporaryDirectory() as directory:
