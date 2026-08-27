@@ -70,15 +70,42 @@ GICP rejected (TRANSLATION_LIMIT): translation=0.123/0.080
 `active_goal_id`、事件时间和 exploration/transit 所有权隔离，并补充 Mission goal 与迟到
 old-goal 回归测试。
 
+## 同步 bag 复测与控制器标定
+
+随后在相同 seed 上录制了同步诊断 bag：
+
+```text
+/home/ruilinli/simenv_p1_smoke_seed42001.vpJjb2/diagnostic_nonholonomic_entry.bag
+```
+
+测试端真值仅写入 bag 用于离线评分，没有接入算法 ROS 图。复测得到：
+
+- Unitree RL 控制器在 `linear.y=0.20/0.25 m/s` 时没有可测平移，`1.0 m/s`
+  才有明显横移；原 DWA 的 `[-0.20, 0.20]` 横移域会预测机器人实际不能执行的轨迹。
+- 已据此把正式 DWA 改为 `max_vel_y=min_vel_y=0`、`vy_samples=1`，并关闭恢复插件的
+  strafe 候选。全系统仍由 control mux 做每轴限速、加速度限制和过零保护。
+- 非完整约束复测仍在 `150.48 s` 触发 `entry_timeout`。机器人已推进，但在第 6 段开始
+  出现长时间旋转与恢复；这证明横移模型是一个真实缺陷，但不是唯一根因。
+- 去除初始 world/map 刚体偏置后，第 5/6/7/8 个导航结果处的 GICP 平面误差分别约为
+  `1.01/2.46/2.56/3.03 m`，而 yaw 误差仍约为 `0.09/0.13/0.04/0.02 rad`。
+  退化主要发生在平面平移，不能通过放宽 jump gate 解决。
+- 离线把 GICP 增量约束为非完整运动只能把末端误差从约 `3.03 m` 降到约 `2.36 m`，
+  仍不合格。用本 seed 真值拟合的命令积分可得到较小误差，但它会在机器人受阻时虚增
+  里程，且属于对单一场景的过拟合，因此没有写入正式定位。
+
+FAST-LIO2 也在独立诊断链路上做了升级条件对照。当前 SimEnv 点云是每帧瞬时采样，点的
+`offset_time` 全为零；后端持续报告 `No Effective Points`。约 `116.9 s` 的对照中，测试端
+真值路径约 `19.85 m`，FAST-LIO2 输出路径约 `21.8 km`。它没有达到误差改善 20% 的门槛，
+所以本轮不接入、不设为正式默认。
+
 ## 下一轮整改和放行顺序
 
-1. 用同一 seed 录制 `/scan`、IMU、GICP raw/validated pose、mapping pose、
-   `/danger_search/cmd_vel_sent`、局部/全局规划和 navigation recovery；测试端另录 truth，
-   两者不得接入算法图。
-2. 对齐每帧点云时间、实际控制速度与 GICP 接受周期，定位 translation gate 拒绝的是
-   单帧正常位移、点云畸变还是错误配准；修复原因后再用离线 bag 回放比较 XY/yaw 漂移。
-3. 单独执行 Unitree 起步、窄门、近目标和原地旋转矩阵，检查 footprint/costmap 与 DWA
-   加速度联合合同；四项全部通过后才把候选 DWA 参数标记为正式。
+1. 保留现有同步 bag 作为回归基线；新增 bag 继续由测试端单独录制 truth，且不得把 truth
+   接入算法 ROS 图。
+2. 用同一同步 bag 评估带退化检测的扫描匹配运动先验；先验只能用于候选生成和退化门控，
+   不能在受阻时替代几何观测累加位移。至少补充直走、转弯、受阻和恢复四类 bag。
+3. 继续执行 Unitree 窄门、近目标和原地旋转矩阵；目前只完成起步与横移响应标定，不能把
+   DWA 候选参数标记为正式配置。
 4. 单层 seed 42001 必须完成“入场→探索→返航→静止→FINISHED”，再进入 2/3 层和
    `0→1→2→0` 的真实电梯测试。
 5. 最后运行 12-seed 与重复稳定性矩阵，并归档覆盖率、耗时、召回、虚警、三维误差、

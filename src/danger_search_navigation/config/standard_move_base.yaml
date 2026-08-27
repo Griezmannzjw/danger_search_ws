@@ -43,6 +43,10 @@ aggressive_reset:
 escape_recovery_1: &unitree_escape
   backup_distance: 0.35
   backup_speed: -0.30
+  # The formal RL controller does not move measurably for the safe 0.20--0.25
+  # m/s lateral range.  Never select a collision-free but physically inert
+  # strafe as recovery progress.
+  enable_strafe: false
   strafe_distance: 0.30
   strafe_speed: 0.20
   simulation_step: 0.025

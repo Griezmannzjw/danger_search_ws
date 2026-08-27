@@ -40,6 +40,7 @@ void UnitreeEscapeRecovery::initialize(
   ros::NodeHandle private_node("~/" + name_);
   private_node.param("backup_distance", backup_distance_, backup_distance_);
   private_node.param("backup_speed", backup_speed_, backup_speed_);
+  private_node.param("enable_strafe", enable_strafe_, enable_strafe_);
   private_node.param("strafe_distance", strafe_distance_, strafe_distance_);
   private_node.param("strafe_speed", strafe_speed_, strafe_speed_);
   private_node.param("simulation_step", simulation_step_, simulation_step_);
@@ -70,8 +71,9 @@ void UnitreeEscapeRecovery::initialize(
   initialized_ = true;
   ROS_INFO(
       "[%s] Unitree escape recovery ready: backup=%.2fm@%.2fm/s "
-      "strafe=%.2fm@%.2fm/s max_attempts=%d",
+      "strafe=%s %.2fm@%.2fm/s max_attempts=%d",
       name_.c_str(), backup_distance_, backup_speed_,
+      enable_strafe_ ? "enabled" : "disabled",
       strafe_distance_, strafe_speed_, max_attempts_per_goal_);
 }
 
@@ -198,12 +200,15 @@ void UnitreeEscapeRecovery::runBehavior()
     backup = EscapeRecoveryCore::evaluateSweep(
         *costmap, footprint, start, EscapeManeuver::BACKUP,
         backup_distance_, simulation_step_);
-    left = EscapeRecoveryCore::evaluateSweep(
-        *costmap, footprint, start, EscapeManeuver::STRAFE_LEFT,
-        strafe_distance_, simulation_step_);
-    right = EscapeRecoveryCore::evaluateSweep(
-        *costmap, footprint, start, EscapeManeuver::STRAFE_RIGHT,
-        strafe_distance_, simulation_step_);
+    if (enable_strafe_)
+    {
+      left = EscapeRecoveryCore::evaluateSweep(
+          *costmap, footprint, start, EscapeManeuver::STRAFE_LEFT,
+          strafe_distance_, simulation_step_);
+      right = EscapeRecoveryCore::evaluateSweep(
+          *costmap, footprint, start, EscapeManeuver::STRAFE_RIGHT,
+          strafe_distance_, simulation_step_);
+    }
   }
 
   const EscapeManeuver maneuver = EscapeRecoveryCore::selectManeuver(

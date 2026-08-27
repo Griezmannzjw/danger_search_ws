@@ -53,6 +53,7 @@ class StandardNavigationConfigTest(unittest.TestCase):
         for name in ("escape_recovery_1", "escape_recovery_2"):
             self.assertEqual(config[name]["max_attempts_per_goal"], 2)
             self.assertEqual(config[name]["simulation_step"], 0.025)
+            self.assertFalse(config[name]["enable_strafe"])
 
     def test_unitree_dwa_velocity_domain_and_supported_parameters(self):
         config = self._yaml("dwa_planner.yaml")["DWAPlannerROS"]
@@ -61,27 +62,19 @@ class StandardNavigationConfigTest(unittest.TestCase):
         self.assertEqual(config["max_vel_trans"], 0.40)
         self.assertEqual(config["min_vel_x"], 0.0)
         self.assertEqual(config["max_vel_x"], 0.40)
-        self.assertEqual(config["min_vel_y"], -0.20)
-        self.assertEqual(config["max_vel_y"], 0.20)
+        self.assertEqual(config["min_vel_y"], 0.0)
+        self.assertEqual(config["max_vel_y"], 0.0)
         self.assertEqual(config["max_vel_theta"], 0.80)
         self.assertEqual(config["min_vel_theta"], 0.80)
         self.assertEqual((config["vx_samples"], config["vy_samples"],
-                          config["vth_samples"]), (5, 3, 5))
+                          config["vth_samples"]), (5, 1, 5))
         self.assertTrue(config["use_dwa"])
         self.assertEqual(config["path_distance_bias"], 32.0)
         self.assertEqual(config["goal_distance_bias"], 24.0)
         self.assertEqual(config["occdist_scale"], 0.02)
         self.assertEqual(config["twirling_scale"], 0.30)
 
-        # Three evenly spaced lateral samples are exactly {-0.20, 0, 0.20};
-        # the ineffective +/-0.10 TrajectoryPlanner special cases cannot occur.
-        lateral_samples = [
-            config["min_vel_y"] + index * (
-                config["max_vel_y"] - config["min_vel_y"]
-            ) / (config["vy_samples"] - 1)
-            for index in range(config["vy_samples"])
-        ]
-        self.assertEqual(lateral_samples, [-0.20, 0.0, 0.20])
+        self.assertEqual(config["vy_samples"], 1)
 
     def test_dwa_speed_and_acceleration_contract_matches_cmd_mux(self):
         planner = self._yaml("dwa_planner.yaml")["DWAPlannerROS"]

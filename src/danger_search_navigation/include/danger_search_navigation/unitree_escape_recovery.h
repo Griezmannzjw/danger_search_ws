@@ -50,6 +50,7 @@ private:
 
   double backup_distance_{0.35};
   double backup_speed_{-0.30};
+  bool enable_strafe_{false};
   double strafe_distance_{0.30};
   double strafe_speed_{0.20};
   double simulation_step_{0.025};
