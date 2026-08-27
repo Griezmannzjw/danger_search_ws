@@ -502,6 +502,8 @@ class ExplorationPlanner:
         self.last_recovery_event_id = 0
         self.last_recovery_trigger_id = 0
         self.last_recovery_stuck_pose = None
+        self.last_recovery_goal_id = ""
+        self.navigation_goal_sent_at = rospy.Time(0)
         self.last_checked_path_metrics = None
         self.observation_goal_cells = []
         self.session_id = 0
@@ -721,26 +723,42 @@ class ExplorationPlanner:
         self.last_nav_health_time = rospy.Time.now()
 
     def recovery_event_callback(self, msg):
-        if msg.header.frame_id != self.map_frame or self.map_data is None:
-            return
-        stuck_pose = (msg.stuck_pose.position.x, msg.stuck_pose.position.y)
-        if msg.phase == RecoveryEvent.PHASE_TRIGGERED:
-            # Triggered is diagnostic only.  A slow A1 gait may recover, so it
-            # must not poison all nearby frontier candidates pre-emptively.
+        with self.state_lock:
+            if (msg.header.frame_id != self.map_frame or self.map_data is None
+                    or (not self.exploring and not self.floor_change_active)):
+                return
+
+            # RecoveryEvent is latched and navigation is also used by Mission.
+            # Only consume an event for the goal most recently handed to
+            # move_base by this planner.  Clearing nav_active_goal_id when a
+            # goal is sent forces a fresh NavigationHealth sample to establish
+            # ownership, while the timestamp rejects a delayed latched event.
+            event_goal_id = str(msg.active_goal_id or "")
+            if (not event_goal_id or event_goal_id != self.nav_active_goal_id
+                    or msg.header.stamp < self.navigation_goal_sent_at):
+                return
+
+            stuck_pose = (msg.stuck_pose.position.x, msg.stuck_pose.position.y)
+            if msg.phase == RecoveryEvent.PHASE_TRIGGERED:
+                # Triggered is diagnostic only.  A slow A1 gait may recover, so it
+                # must not poison all nearby frontier candidates pre-emptively.
+                self.last_recovery_goal_id = event_goal_id
+                self.last_recovery_stuck_pose = stuck_pose
+                self.last_recovery_trigger_id = msg.event_id
+                rospy.loginfo(
+                    "[exploration] recovery triggered at (%.2f, %.2f), "
+                    "attempt=%d maneuver=%d goal=%s (diagnostic only)",
+                    stuck_pose[0], stuck_pose[1], msg.attempt, msg.maneuver,
+                    event_goal_id,
+                )
+                return
+            if (msg.phase != RecoveryEvent.PHASE_FAILED
+                    or msg.event_id <= self.last_recovery_event_id):
+                return
+            self.last_recovery_goal_id = event_goal_id
+            self.last_recovery_event_id = msg.event_id
             self.last_recovery_stuck_pose = stuck_pose
-            self.last_recovery_trigger_id = msg.event_id
-            rospy.loginfo(
-                "[exploration] recovery triggered at (%.2f, %.2f), "
-                "attempt=%d maneuver=%d (diagnostic only)",
-                stuck_pose[0], stuck_pose[1], msg.attempt, msg.maneuver,
-            )
-            return
-        if (msg.phase != RecoveryEvent.PHASE_FAILED
-                or msg.event_id <= self.last_recovery_event_id):
-            return
-        self.last_recovery_event_id = msg.event_id
-        self.last_recovery_stuck_pose = stuck_pose
-        self._remember_trap_region(*stuck_pose)
+            self._remember_trap_region(*stuck_pose)
 
     def _remember_control_failure_if_needed(self, _event, event_id, stuck_pose):
         """Fallback if a CONTROL_FAILED Action has no FAILED event."""
@@ -1368,6 +1386,9 @@ class ExplorationPlanner:
         self.goal_id += 1
         self.last_recovery_stuck_pose = None
         self.last_recovery_trigger_id = 0
+        self.last_recovery_goal_id = ""
+        self.nav_active_goal_id = ""
+        self.navigation_goal_sent_at = rospy.Time.now()
         session_id = self.session_id
         goal_id = self.goal_id
         self.move_base_client.send_goal(
@@ -1429,6 +1450,9 @@ class ExplorationPlanner:
             self.exploring = True
             self.waiting_for_result = False
             self.current_goal = None
+            self.last_recovery_goal_id = ""
+            self.nav_active_goal_id = ""
+            self.navigation_goal_sent_at = rospy.Time(0)
             self.retry_count = 0
             self.backoff_until = rospy.Time(0)
             self.no_reachable_frontier_cycles = 0
@@ -1464,6 +1488,9 @@ class ExplorationPlanner:
             self.goal_id += 1
             self.waiting_for_result = False
             self.current_goal = None
+            self.last_recovery_goal_id = ""
+            self.nav_active_goal_id = ""
+            self.navigation_goal_sent_at = rospy.Time(0)
             self.move_base_client.cancel_all_goals()
             self._set_state("STOPPED", "stop_requested")
             return TriggerResponse(success=True, message="Exploration stopped")
@@ -2012,6 +2039,9 @@ class ExplorationPlanner:
         self.move_base_client.cancel_all_goals()
         self.waiting_for_result = False
         self.current_goal = None
+        self.last_recovery_goal_id = ""
+        self.nav_active_goal_id = ""
+        self.navigation_goal_sent_at = rospy.Time(0)
         self._floor_change_goal_succeeded = None
 
         self.elevator_halls = self._detect_elevator_halls()
@@ -2466,6 +2496,9 @@ class ExplorationPlanner:
         failed_step = self.floor_change_step
         self.floor_change_active = False
         self.floor_change_step = None
+        self.last_recovery_goal_id = ""
+        self.nav_active_goal_id = ""
+        self.navigation_goal_sent_at = rospy.Time(0)
         self._record_floor_change_result(False, failure_code, message)
         self.floor_change_gave_up_count += 1
         self.floor_change_retry_after = rospy.Time.now() + rospy.Duration(
@@ -2514,6 +2547,9 @@ class ExplorationPlanner:
             return
         self.floor_change_active = False
         self.floor_change_step = None
+        self.last_recovery_goal_id = ""
+        self.nav_active_goal_id = ""
+        self.navigation_goal_sent_at = rospy.Time(0)
         self._record_floor_change_result(True, "", "target floor reached and stable")
         self._set_state("EXPLORE_FLOOR", "new_floor_reached")
 

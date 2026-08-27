@@ -150,4 +150,6 @@ catkin_test_results --all
 
 这些测试不等于正式比赛闭环实测。12 个固定 seed、覆盖率、600 s、召回/虚警/误差、
 CPU/内存和重复稳定性仍必须在真实 SimEnv 上按验收矩阵运行并归档后，才能宣布比赛闭环
-通过。
+通过。2026-08-27 的首轮正式模式 smoke 已通过 preflight，但在入场导航阶段以
+`entry_timeout` 结束；当前不得标记为比赛闭环通过，证据和整改顺序见
+[seed 42001 正式 smoke 记录](docs/FORMAL_SMOKE_SEED42001.md)。

@@ -90,13 +90,20 @@ class SimpleFrontierTest(unittest.TestCase):
     def test_recovery_trigger_is_diagnostic_and_failed_event_blacklists(self):
         planner = make_planner(np.zeros((5, 5), dtype=np.int8))
         planner.map_frame = "map"
+        planner.state_lock = MODULE.threading.RLock()
+        planner.exploring = True
+        planner.floor_change_active = False
+        planner.nav_active_goal_id = "goal-a"
+        planner.navigation_goal_sent_at = MODULE.rospy.Time(0)
         planner.last_recovery_event_id = 0
+        planner.last_recovery_goal_id = ""
         planner.last_recovery_stuck_pose = None
         remembered = []
         planner._remember_trap_region = lambda x, y: remembered.append((x, y))
         event = MODULE.RecoveryEvent()
         event.header.frame_id = "map"
         event.event_id = 7
+        event.active_goal_id = "goal-a"
         event.stuck_pose.position.x = 1.0
         event.stuck_pose.position.y = 2.0
         event.attempt = 1
@@ -110,6 +117,53 @@ class SimpleFrontierTest(unittest.TestCase):
         self.assertEqual(remembered, [(1.0, 2.0)])
         planner.recovery_event_callback(event)
         self.assertEqual(remembered, [(1.0, 2.0)])
+
+    def test_recovery_from_mission_goal_does_not_pollute_blacklist(self):
+        planner = make_planner(np.zeros((5, 5), dtype=np.int8))
+        planner.map_frame = "map"
+        planner.state_lock = MODULE.threading.RLock()
+        planner.exploring = False
+        planner.floor_change_active = False
+        planner.nav_active_goal_id = "mission-entry"
+        planner.navigation_goal_sent_at = MODULE.rospy.Time(0)
+        planner.last_recovery_event_id = 0
+        planner.last_recovery_goal_id = ""
+        remembered = []
+        planner._remember_trap_region = lambda x, y: remembered.append((x, y))
+        event = MODULE.RecoveryEvent()
+        event.header.frame_id = "map"
+        event.event_id = 8
+        event.active_goal_id = "mission-entry"
+        event.phase = MODULE.RecoveryEvent.PHASE_FAILED
+
+        planner.recovery_event_callback(event)
+
+        self.assertEqual(remembered, [])
+        self.assertEqual(planner.last_recovery_event_id, 0)
+
+    def test_delayed_recovery_from_previous_goal_is_ignored(self):
+        planner = make_planner(np.zeros((5, 5), dtype=np.int8))
+        planner.map_frame = "map"
+        planner.state_lock = MODULE.threading.RLock()
+        planner.exploring = True
+        planner.floor_change_active = False
+        planner.nav_active_goal_id = "goal-b"
+        planner.navigation_goal_sent_at = MODULE.rospy.Time.from_sec(10.0)
+        planner.last_recovery_event_id = 0
+        planner.last_recovery_goal_id = ""
+        remembered = []
+        planner._remember_trap_region = lambda x, y: remembered.append((x, y))
+        event = MODULE.RecoveryEvent()
+        event.header.frame_id = "map"
+        event.header.stamp = MODULE.rospy.Time.from_sec(9.0)
+        event.event_id = 9
+        event.active_goal_id = "goal-a"
+        event.phase = MODULE.RecoveryEvent.PHASE_FAILED
+
+        planner.recovery_event_callback(event)
+
+        self.assertEqual(remembered, [])
+        self.assertEqual(planner.last_recovery_event_id, 0)
 
     def test_make_plan_path_may_leave_but_not_reenter_exploration_blacklist(self):
         planner = make_planner(np.zeros((3, 7), dtype=np.int8))
