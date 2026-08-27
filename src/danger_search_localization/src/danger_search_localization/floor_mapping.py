@@ -15,6 +15,128 @@ class FloorAssignment:
     height_error: float
 
 
+@dataclass(frozen=True)
+class FloorSwitchDecision:
+    """Pure result of an idempotent explicit floor-switch request."""
+
+    success: bool
+    changed: bool
+    current_floor: int
+    map_epoch: int
+    floor_z_m: float
+    message: str
+
+
+class FloorSwitchState:
+    """Track active-floor identity independently of ROS service retries.
+
+    ``transition_id`` is the idempotency key. Replaying a completed or active
+    request returns its original epoch; reusing an id for another target is a
+    contract error. ``map_epoch`` identifies the active map, whereas each
+    floor's ``map_version`` continues to identify occupancy updates within it.
+    """
+
+    def __init__(self, floor_heights, initial_floor=0, initial_epoch=1):
+        self.floor_heights = tuple(float(value) for value in floor_heights)
+        self.current_floor = int(initial_floor)
+        self.map_epoch = int(initial_epoch)
+        self.transitioning = False
+        self._requests = {}
+        if not self.floor_heights:
+            raise ValueError("floor_heights cannot be empty")
+        if self.current_floor < 0 or self.current_floor >= len(self.floor_heights):
+            raise ValueError("initial_floor is outside floor_heights")
+        if self.map_epoch < 1:
+            raise ValueError("initial_epoch must be positive")
+
+    @property
+    def floor_z_m(self):
+        return self.floor_heights[self.current_floor]
+
+    def replay(self, transition_id, target_floor):
+        """Return a prior decision, a conflict failure, or ``None`` if new."""
+        transition_id = str(transition_id).strip()
+        target_floor = int(target_floor)
+        previous = self._requests.get(transition_id)
+        if previous is None:
+            return None
+        previous_target, decision = previous
+        if previous_target != target_floor:
+            return self._failure(
+                "transition_id already belongs to floor %d" % previous_target
+            )
+        return decision
+
+    def validate(self, transition_id, target_floor):
+        transition_id = str(transition_id).strip()
+        target_floor = int(target_floor)
+        if not transition_id:
+            return self._failure("transition_id cannot be empty")
+        replay = self.replay(transition_id, target_floor)
+        if replay is not None:
+            return replay
+        if target_floor < 0 or target_floor >= len(self.floor_heights):
+            return self._failure("target_floor is outside floor_heights")
+        return None
+
+    def request(self, transition_id, target_floor):
+        transition_id = str(transition_id).strip()
+        target_floor = int(target_floor)
+        validation = self.validate(transition_id, target_floor)
+        if validation is not None:
+            return validation
+
+        changed = target_floor != self.current_floor
+        if changed:
+            self.current_floor = target_floor
+            self.map_epoch += 1
+            self.transitioning = True
+            message = "active floor changed to %d" % target_floor
+        else:
+            message = "floor %d is already active" % target_floor
+        decision = FloorSwitchDecision(
+            success=True,
+            changed=changed,
+            current_floor=self.current_floor,
+            map_epoch=self.map_epoch,
+            floor_z_m=self.floor_z_m,
+            message=message,
+        )
+        self._requests[transition_id] = (target_floor, decision)
+        return decision
+
+    def force_floor(self, target_floor):
+        """Apply a trusted automatic floor observation (test/truth backend)."""
+        target_floor = int(target_floor)
+        if target_floor < 0 or target_floor >= len(self.floor_heights):
+            raise ValueError("target_floor is outside floor_heights")
+        changed = target_floor != self.current_floor
+        if changed:
+            self.current_floor = target_floor
+            self.map_epoch += 1
+            self.transitioning = True
+        return changed
+
+    def reset_map(self):
+        self.map_epoch += 1
+        self.transitioning = True
+        self._requests.clear()
+        return self.map_epoch
+
+    def mark_stable(self):
+        self.transitioning = False
+
+    def _failure(self, message):
+        return FloorSwitchDecision(
+            success=False,
+            changed=False,
+            current_floor=self.current_floor,
+            map_epoch=self.map_epoch,
+            floor_z_m=self.floor_z_m,
+            message=message,
+        )
+
+
 class FloorHeightClassifier:
     """Assign poses near known landings and reject between-floor poses.
 

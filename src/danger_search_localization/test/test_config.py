@@ -126,15 +126,16 @@ class TestLocalizationConfig(unittest.TestCase):
             argument.attrib["name"]: argument.attrib.get("default")
             for argument in root.findall("arg")
         }
-        self.assertEqual(arguments["localization_source"], "gicp")
+        self.assertEqual(arguments["competition_mode"], "true")
+        self.assertEqual(arguments["multifloor_enabled"], "true")
+        self.assertEqual(arguments["localization_backend"], "gicp")
         self.assertEqual(arguments["gazebo_base_link"], "a1_gazebo::base")
-        self.assertIn("gazebo_truth", arguments["enable_multifloor_maps"])
 
         source = launch_path.read_text()
-        self.assertIn("localization_source') == 'gicp'", source)
-        self.assertIn("localization_source') == 'gazebo_truth'", source)
+        self.assertIn("localization_backend') == 'gicp'", source)
+        self.assertIn("localization_backend') == 'gazebo_truth'", source)
         self.assertIn("tf_publish_future_tolerance_s", source)
-        self.assertIn("localization_source') == 'gazebo_truth' else 0.5", source)
+        self.assertIn("localization_backend') == 'gazebo_truth' else 0.5", source)
         self.assertIn("pose_stabilizer_mode", source)
         self.assertIn("trusted_passthrough", source)
         self.assertEqual(source.count('name="lidar_odometry"'), 1)
@@ -149,12 +150,12 @@ class TestLocalizationConfig(unittest.TestCase):
             for parameter in adapter_node.findall("param")
         }
         self.assertEqual(
-            adapter_parameters["localization_source"],
-            "$(arg localization_source)",
+            adapter_parameters["localization_backend"],
+            "$(arg localization_backend)",
         )
         self.assertEqual(
             adapter_parameters["multifloor_enabled"],
-            "$(arg enable_multifloor_maps)",
+            "$(arg multifloor_enabled)",
         )
         mapper_node = next(
             node for node in root.findall(".//node")
@@ -166,7 +167,11 @@ class TestLocalizationConfig(unittest.TestCase):
         }
         self.assertEqual(
             mapper_parameters["multifloor_enabled"],
-            "$(arg enable_multifloor_maps)",
+            "$(arg multifloor_enabled)",
+        )
+        self.assertEqual(
+            mapper_parameters["localization_backend"],
+            "$(arg localization_backend)",
         )
 
         truth_script = (
@@ -175,6 +180,12 @@ class TestLocalizationConfig(unittest.TestCase):
         self.assertIn('"~gicp_pose_topic"', truth_script)
         self.assertNotIn("TransformBroadcaster", truth_script)
         self.assertNotIn("/localization/pose", truth_script)
+
+        adapter_source = (
+            self.package_dir / "src" / "danger_search_localization" / "adapter_node.py"
+        ).read_text()
+        self.assertIn("gazebo_truth localization is forbidden", adapter_source)
+        self.assertIn("competition_mode requires multifloor_enabled=true", adapter_source)
 
     def test_pose_guard_is_wired_before_public_pose_and_mapping(self):
         config_path = self.package_dir / "config" / "default.yaml"

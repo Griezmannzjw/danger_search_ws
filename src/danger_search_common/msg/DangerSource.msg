@@ -15,6 +15,7 @@ geometry_msgs/PointStamped position     # 位置（map坐标系，带时间戳�
 float64[9] position_covariance          # 3x3位置协方差矩阵（行优先）
 
 int32 floor_id                          # 所在楼层（从0开始）
+uint64 map_epoch                        # 检测时激活的分层地图 epoch
 float32 confidence                      # 置信度 0.0~1.0
 bool confirmed                          # 是否已确认入库
 bool verification_required              # 是否需要异视角复核

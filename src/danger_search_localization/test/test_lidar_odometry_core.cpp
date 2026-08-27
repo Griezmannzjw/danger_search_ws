@@ -76,6 +76,23 @@ TEST(LidarOdometryCore, LegalTranslationIsAcceptedContinuously) {
   EXPECT_NEAR(result.pose.translation().x(), 0.10, 0.02);
   EXPECT_TRUE(core.Process(moved, 1.2).healthy);
 }
+TEST(LidarOdometryCore, ExplicitRebaselinePreservesPoseAndBootstrapsNextFloor) {
+  Core core(TestConfig());
+  const auto scene = MakeScene();
+  core.Process(scene, 1.0);
+  const auto moved = TransformCloud(scene, -0.10);
+  const auto accepted = core.Process(moved, 1.1);
+  ASSERT_EQ(accepted.outcome, Core::Outcome::kAccepted);
+  const auto pose_before = core.pose();
+
+  core.RequestRebaseline();
+  EXPECT_EQ(core.history_size(), 0U);
+  const auto next_floor = core.Process(TransformCloud(scene, -2.0), 1.2);
+
+  EXPECT_EQ(next_floor.outcome, Core::Outcome::kBootstrap);
+  EXPECT_TRUE(next_floor.pose.matrix().isApprox(pose_before.matrix(), 1e-9));
+  EXPECT_EQ(core.history_size(), 1U);
+}
 TEST(LidarOdometryCore, DifferentVerticalSamplesDoNotInventPlanarMotion) {
   Core core(TestConfig());
   const auto scene = MakeScene();

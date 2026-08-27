@@ -16,7 +16,10 @@ from danger_search_localization.adapter_node import (
     LocalVelocityEstimator,
 )
 from danger_search_localization.config import AdapterConfig
-from danger_search_localization.floor_mapping import FloorHeightClassifier
+from danger_search_localization.floor_mapping import (
+    FloorHeightClassifier,
+    FloorSwitchState,
+)
 from danger_search_localization.vertical_estimation import quaternion_to_rpy
 
 
@@ -327,6 +330,53 @@ class TestLocalizationAdapter(unittest.TestCase):
         self.adapter.current_floor_pub.publish.assert_called_once()
         published = self.adapter.current_floor_pub.publish.call_args.args[0]
         self.assertEqual(published.data, 1)
+
+    def test_explicit_floor_switch_retries_do_not_repeat_dependencies(self):
+        self.adapter.multifloor_enabled = True
+        self.adapter.lock = threading.RLock()
+        self.adapter.current_floor = 0
+        self.adapter.current_height = 0.0
+        self.adapter.floor_switch_state = FloorSwitchState([0.0, 2.6, 5.2])
+        self.adapter.map_epoch = 1
+        self.adapter.floor_transition_active = False
+        self.adapter.floor_transition_baseline_version = 0
+        self.adapter.floor_map_versions = {0: 8}
+        self.adapter.map_version = 8
+        self.adapter.map_update_count = 8
+        self.adapter.last_map_stamp = rospy.Time.from_sec(1.0)
+        self.adapter.last_map_received = rospy.Time.from_sec(1.0)
+        self.adapter.last_public_map_published = rospy.Time.from_sec(1.0)
+        self.adapter.last_map_update = rospy.Time.from_sec(1.0)
+        self.adapter.latest_raw_map = OccupancyGrid()
+        self.adapter.floor_switch_service_timeout_s = 0.1
+        self.adapter.gicp_rebaseline_service_name = "/gicp/rebaseline"
+        self.adapter.mapper_switch_floor_service_name = "/mapper/switch_floor"
+        self.adapter.gicp_rebaseline = mock.Mock(
+            return_value=SimpleNamespace(success=True, message="scheduled")
+        )
+        self.adapter.mapper_switch_floor = mock.Mock(
+            return_value=SimpleNamespace(
+                success=True, map_epoch=2, message="switched"
+            )
+        )
+        self.adapter.current_floor_pub = mock.Mock()
+        request = SimpleNamespace(
+            transition_id="elevator-run-1", target_floor=1
+        )
+
+        with mock.patch.object(rospy, "wait_for_service"):
+            first = self.adapter._switch_floor_callback(request)
+            replay = self.adapter._switch_floor_callback(request)
+
+        self.assertTrue(first.success)
+        self.assertTrue(replay.success)
+        self.assertEqual(first.map_epoch, 2)
+        self.assertEqual(replay.map_epoch, 2)
+        self.assertEqual(self.adapter.current_floor, 1)
+        self.assertEqual(self.adapter.current_height, 2.6)
+        self.assertTrue(self.adapter.floor_transition_active)
+        self.assertEqual(self.adapter.gicp_rebaseline.call_count, 1)
+        self.assertEqual(self.adapter.mapper_switch_floor.call_count, 1)
 
     def test_floor_map_restores_only_after_fresh_updates(self):
         self.adapter.config = AdapterConfig(min_map_updates_for_stable=2)

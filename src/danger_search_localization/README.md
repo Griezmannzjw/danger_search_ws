@@ -1,6 +1,6 @@
 # danger_search_localization
 
-定位与建图包。P0 默认使用 GICP 提供连续局部里程计 `odom -> base`，并由同一份
+定位与建图包。正式默认使用 GICP 提供连续局部里程计 `odom -> base`，并由同一份
 经验证位姿构建二维占据地图。Hector 受限全局修正仅是显式开启的兼容模式，不属于
 默认数据链。后端仍可在不改变公共接口的前提下替换为 FAST-LIO 或其他 LIO。
 
@@ -16,12 +16,13 @@
 
 ```bash
 roslaunch danger_search_bringup competition.launch \
-  localization_source:=gazebo_truth
+  competition_mode:=false localization_backend:=gazebo_truth
 ```
 
 这是 SimEnv 联调专用入口，不得用于正式比赛。无需开启 `ENABLE_REFEREE_ODOM` 或
 ground-truth TF；同时开启 referee odom 会造成重复 TF 发布。默认
-`localization_source:=gicp` 保持不变。
+正式入口固定使用 `competition_mode:=true multifloor_enabled:=true
+localization_backend:=gicp`；launch 会在启动任何节点前拒绝正式模式下的真值后端。
 
 真值联调模式会自动开启分楼层地图。SimEnv 的楼板相对高度由
 `floor_heights: [0.0, 2.6, 5.2]` 配置；机器人位于楼层附近时，扫描只更新该层地图，
@@ -62,14 +63,13 @@ ground-truth TF；同时开启 referee odom 会造成重复 TF 发布。默认
 ```bash
 GUI=false \
 ENABLE_REFEREE_ODOM=0 \
-ENABLE_GROUND_TRUTH=1 \
+ENABLE_GROUND_TRUTH=0 \
 POINTCLOUD_USE_GROUND_TRUTH_ODOM=0 \
 ./auto.sh
 ```
 
-`ENABLE_GROUND_TRUTH=1` 仅供 SimEnv 的 `junior_ctrl` 获取步态策略观测；本包不订阅
-这些真值话题，referee 里程计和真值变换点云仍由另外两个选项禁用。
-上述约束针对默认 GICP 正式模式；只有显式 `gazebo_truth` 测试模式会读取 Gazebo
+当前 SimEnv 控制器已使用允许的 IMU 状态，正式模式不需要发布 ground-truth 话题。
+只有显式 `gazebo_truth` 测试模式会读取 Gazebo
 `/gazebo/link_states`。
 
 点云投影会排除机器人自身范围；同一角度的回波先按距离聚类，只接受具有足够
@@ -104,8 +104,9 @@ GICP 位姿和地图更新建立后，`/mapping/status` 应变为 `ready: True`�
 | `/map` | `nav_msgs/OccupancyGrid` | 当前楼层二维占据地图；换层稳定前暂停更新 |
 | `/mapping/current_floor` | `std_msgs/Int32` | 当前确认楼层，编号从 0 开始 |
 | `/mapping/floors/<id>/map` | `nav_msgs/OccupancyGrid` | 已访问楼层的独立、latched 地图 |
+| `/localization/switch_floor` | `danger_search_common/SwitchFloor` | 以 `transition_id` 幂等切换活动楼层地图 |
 | `/localization/reset_map` | `std_srvs/Empty` | 任务停止后清空所有分楼层占据图并发布全未知地图 |
-| `/mapping/status` | `danger_search_common/MappingStatus` | 地图就绪、稳定、丢失、楼层和版本 |
+| `/mapping/status` | `danger_search_common/MappingStatus` | 地图就绪、稳定、楼层、`transitioning`、`map_epoch` 和 `floor_z_m` |
 | `/localization/status` | `danger_search_common/LocalizationStatus` | 定位跟踪和协方差状态 |
 
 `/localization/pose` 第一帧定义为比赛出发点附近 `(0,0,0)`。GICP 对静止微动使用
@@ -131,7 +132,10 @@ Hector 模式正常时才显示 `TRACKING_FUSED_GICP_ODOMETRY_WITH_BOUNDED_HECTO
 换层期间 `/mapping/status` 明确发布 `stable=false`，原因为
 `FLOOR_TRANSITION_WAITING_FOR_CURRENT_MAP`。确认新楼层并积累至少
 `min_map_updates_for_stable` 次新扫描后，`/map` 才切换到该层；
-`floor_maps[]` 同时保留所有已访问楼层各自的版本与最后更新时间。
+`floor_maps[]` 同时保留所有已访问楼层各自的版本与最后更新时间。正式 GICP 模式由
+换层执行方使用唯一 `transition_id` 调用 `/localization/switch_floor`；重复请求不会重复
+递增 `map_epoch`、切图或触发 GICP rebaseline。切层时 GICP 保留累计平面位姿，但下一帧
+重建楼层局部参考，避免拿新楼层扫描和旧楼层子地图配准。
 
 ## 编译与启动
 
@@ -165,19 +169,19 @@ rosservice call /localization/reset_map "{}"
 rostest danger_search_localization multifloor_pipeline.test
 ```
 
-该测试发布合成位姿和扫描，验证 `0 -> 1 -> 0` 换层、层间扫描拒绝、地图互不
+该测试发布合成位姿和扫描，验证 `0 -> 1 -> 2 -> 0` 换层、层间扫描拒绝、地图互不
 污染以及返层恢复；它不替代后续真实电梯和完整 P1 闭环测试。
 
 ## 目前边界与升级项
 
 - 默认正式 GICP 模式仍使用可靠性优先的二维 `x/y/yaw`，未经验证的 IMU 双积分
-  默认关闭；当前分楼层能力只在显式 Gazebo 真值联调模式中自动启用；
+  默认关闭；分楼层身份通过显式切层服务和配置楼层标高维护；
 - 已实现当前层 `/map`、所有已访问层地图留存、换层隔离和返层恢复；电梯调用、
-  跨层目标调度和全楼层结束条件属于 mission/exploration 的后续工作；
+  跨层目标调度和全楼层结束条件由 mission/exploration 实现；
 - 2D 投影不能保留楼梯、门槛和坡面的完整高度信息；
 - GICP 以最近可信扫描组成的有限局部子地图配准，长时间弱特征运动仍可能降级；可选
   Hector 只以受限 `map -> odom` 修正长期漂移；
 - GICP 位姿门控或可选 Hector 被判定为异常时会冻结公共地图，保证不会给 navigation 同时提供错误地图和
   正常状态；连续异常需要停车等待恢复，而不是冒险继续探索；
-- 下一阶段应让正式 LIO 提供可靠高度，再为导航/探索接入电梯状态机和跨层调度；
+- 正式 LIO 高度仍可作为后续复核信号；电梯动作和跨层调度由上层模块负责；
 - 后端升级时保持本 README 中的公共输出不变，探索、导航和感知无需跟着改。

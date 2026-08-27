@@ -1,0 +1,6 @@
+string transition_id
+int32 target_floor
+---
+bool success
+uint64 map_epoch
+string message

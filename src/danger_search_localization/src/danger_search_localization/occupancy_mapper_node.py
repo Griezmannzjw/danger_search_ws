@@ -6,6 +6,7 @@ import threading
 
 import rospy
 from danger_search_common.msg import FloorOccupancyGrid
+from danger_search_common.srv import SwitchFloor, SwitchFloorResponse
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
@@ -14,6 +15,7 @@ from std_srvs.srv import Empty, EmptyResponse
 from .occupancy_mapping import OccupancyMapperCore, OccupancyMappingConfig
 from .floor_mapping import (
     FloorHeightClassifier,
+    FloorSwitchState,
     MultiFloorOccupancyStore,
 )
 
@@ -42,8 +44,18 @@ class OccupancyMapperNode:
         self.multifloor_enabled = bool(
             rospy.get_param("~multifloor_enabled", False)
         )
+        self.localization_backend = rospy.get_param(
+            "~localization_backend", "gicp"
+        )
+        self.explicit_floor_switching = bool(rospy.get_param(
+            "~explicit_floor_switching",
+            self.multifloor_enabled and self.localization_backend == "gicp",
+        ))
         self.reset_map_service = rospy.get_param(
             "~reset_map_service", "/localization/reset_map"
+        )
+        self.switch_floor_service = rospy.get_param(
+            "~mapper_switch_floor_service", "/localization/mapper_switch_floor"
         )
         self.unhealthy_variance = float(
             rospy.get_param("~gicp_unhealthy_variance_threshold", 1.0)
@@ -84,6 +96,9 @@ class OccupancyMapperNode:
             self.config,
             range(len(self.floor_heights)),
             initial_floor=self.initial_floor,
+        )
+        self.floor_switch = FloorSwitchState(
+            self.floor_heights, initial_floor=self.initial_floor
         )
         self.current_floor = self.initial_floor
         self.core = self.floor_store.core(self.current_floor)
@@ -130,6 +145,11 @@ class OccupancyMapperNode:
         self.reset_service = rospy.Service(
             self.reset_map_service, Empty, self._reset_map_callback
         )
+        self.floor_switch_service = rospy.Service(
+            self.switch_floor_service,
+            SwitchFloor,
+            self._switch_floor_callback,
+        )
         self.timer = rospy.Timer(
             rospy.Duration(self.publish_period), self._publish_map
         )
@@ -175,16 +195,19 @@ class OccupancyMapperNode:
         height = float(position.z)
         if not all(math.isfinite(value) for value in (*pose, height)):
             return
-        assignment = (
-            self.floor_classifier.classify(height)
-            if self.multifloor_enabled
-            else None
-        )
-        floor_id = (
-            assignment.floor_id
-            if assignment is not None
-            else (None if self.multifloor_enabled else self.initial_floor)
-        )
+        if self.multifloor_enabled and self.explicit_floor_switching:
+            floor_id = self.current_floor
+        else:
+            assignment = (
+                self.floor_classifier.classify(height)
+                if self.multifloor_enabled
+                else None
+            )
+            floor_id = (
+                assignment.floor_id
+                if assignment is not None
+                else (None if self.multifloor_enabled else self.initial_floor)
+            )
         with self.lock:
             self.pose_cache[self._key(message.header.stamp)] = (pose, floor_id)
             self._consume(self._key(message.header.stamp))
@@ -226,6 +249,7 @@ class OccupancyMapperNode:
                         self.current_floor,
                         floor_id,
                     )
+                    self.floor_switch.force_floor(floor_id)
                 self.current_floor = floor_id
                 self.latest_floor_key = key
                 self._sync_current_floor_compatibility()
@@ -255,6 +279,8 @@ class OccupancyMapperNode:
             return self._reset_all_floor_maps()
         now = rospy.Time.now()
         with self.lock:
+            if hasattr(self, "floor_switch"):
+                self.floor_switch.reset_map()
             if now <= self.map_load_time:
                 now = self.map_load_time + rospy.Duration.from_sec(1e-9)
             self.core = OccupancyMapperCore(self.config)
@@ -271,6 +297,8 @@ class OccupancyMapperNode:
     def _reset_all_floor_maps(self):
         now = rospy.Time.now()
         with self.lock:
+            if hasattr(self, "floor_switch"):
+                self.floor_switch.reset_map()
             known_floors = self.floor_store.floor_ids
             latest_load_time = max(
                 self.map_load_times.values(), default=rospy.Time(0)
@@ -300,6 +328,61 @@ class OccupancyMapperNode:
         self._publish_floor_messages(self.current_floor, 0, current_message)
         rospy.logwarn("[localization] all per-floor occupancy maps reset")
         return EmptyResponse()
+
+    def _switch_floor_callback(self, request):
+        """Atomically select a per-floor store with retry-safe semantics."""
+        publish = None
+        with self.lock:
+            if not self.multifloor_enabled:
+                return SwitchFloorResponse(
+                    success=False,
+                    map_epoch=self.floor_switch.map_epoch,
+                    message="multifloor mapping is disabled",
+                )
+            decision = self.floor_switch.request(
+                request.transition_id, request.target_floor
+            )
+            if not decision.success:
+                return SwitchFloorResponse(
+                    success=False,
+                    map_epoch=decision.map_epoch,
+                    message=decision.message,
+                )
+            if decision.changed:
+                previous_floor = self.current_floor
+                self.current_floor = decision.current_floor
+                self.pose_cache.clear()
+                self.scan_cache.clear()
+                self.latest_floor_key = None
+                self._sync_current_floor_compatibility()
+                stamp = self.last_scan_stamps[self.current_floor]
+                publish = (
+                    self.current_floor,
+                    self.floor_store.version(self.current_floor),
+                    self._map_message_locked(stamp, self.current_floor),
+                )
+                rospy.loginfo(
+                    "[localization] explicit occupancy map switch %d -> %d "
+                    "(transition=%s epoch=%d)",
+                    previous_floor,
+                    self.current_floor,
+                    request.transition_id,
+                    decision.map_epoch,
+                )
+            elif self.floor_store.has_floor(self.current_floor):
+                stamp = self.last_scan_stamps[self.current_floor]
+                publish = (
+                    self.current_floor,
+                    self.floor_store.version(self.current_floor),
+                    self._map_message_locked(stamp, self.current_floor),
+                )
+        if publish is not None:
+            self._publish_floor_messages(*publish)
+        return SwitchFloorResponse(
+            success=True,
+            map_epoch=decision.map_epoch,
+            message=decision.message,
+        )
 
     def _ensure_floor_runtime(self, floor_id):
         self.floor_store.core(floor_id)

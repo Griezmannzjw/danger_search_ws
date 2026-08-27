@@ -1,11 +1,15 @@
 <launch>
   <arg name="config_file" default="$(find danger_search_localization)/config/default.yaml" />
+  <arg name="competition_mode" default="true" />
+  <arg name="multifloor_enabled" default="true" />
+  <arg name="localization_backend" default="gicp" />
   <arg name="use_hector_correction" default="false" />
-  <arg name="localization_source" default="gicp" />
   <arg name="gazebo_base_link" default="a1_gazebo::base" />
-  <!-- 真值联调时可验证分层任务；正式模式需生产定位后端先提供可靠高度。 -->
-  <arg name="enable_multifloor_maps"
-       default="$(eval arg('localization_source') == 'gazebo_truth')" />
+  <!-- Resolve before any node starts: truth is test-only and formal runs are multi-floor. -->
+  <arg name="_runtime_mode_guard"
+       default="$(eval 'ok' if (arg('localization_backend') in ['gicp', 'gazebo_truth'] and (not arg('competition_mode') or (arg('multifloor_enabled') and arg('localization_backend') == 'gicp'))) else 1/0)" />
+  <param name="/danger_search/localization_runtime_mode_guard"
+         value="$(arg _runtime_mode_guard)" />
 
   <!-- 只读取官方原始 /scan；不读取 /Odometry_gazebo 或真值变换后的点云。 -->
   <node name="local_scan_projector"
@@ -16,7 +20,7 @@
   </node>
 
   <!-- GICP 提供连续局部里程计，其健康状态参与 P0 readiness。 -->
-  <group if="$(eval arg('localization_source') == 'gicp')">
+  <group if="$(eval arg('localization_backend') == 'gicp')">
     <node name="lidar_odometry"
           pkg="danger_search_localization"
           type="lidar_odometry_node"
@@ -26,28 +30,38 @@
   </group>
 
   <!-- SimEnv integration test only. It publishes internal odometry, never TF. -->
-  <group if="$(eval arg('localization_source') == 'gazebo_truth')">
+  <group if="$(eval arg('localization_backend') == 'gazebo_truth')">
     <node name="gazebo_truth_odometry"
           pkg="danger_search_localization"
           type="gazebo_truth_odometry.py"
           output="screen">
       <rosparam command="load" file="$(arg config_file)" />
+      <!-- Test-only truth parameters are never loaded into formal nodes. -->
+      <param name="gazebo_link_states_topic" value="/gazebo/link_states" />
       <param name="gazebo_base_link" value="$(arg gazebo_base_link)" />
+      <param name="gazebo_truth_max_age_s" value="0.20" />
+      <param name="gazebo_truth_max_future_s" value="0.05" />
+      <param name="gazebo_truth_history_size" value="1000" />
+      <param name="gazebo_truth_xy_variance" value="0.0001" />
+      <param name="gazebo_truth_yaw_variance" value="0.0001" />
     </node>
   </group>
 
-  <group if="$(eval arg('localization_source') == 'gazebo_truth' or not arg('use_hector_correction'))">
+  <group if="$(eval arg('localization_backend') == 'gazebo_truth' or not arg('use_hector_correction'))">
     <node name="local_occupancy_mapper"
           pkg="danger_search_localization"
           type="occupancy_mapper.py"
           output="screen">
       <rosparam command="load" file="$(arg config_file)" />
-      <param name="multifloor_enabled" value="$(arg enable_multifloor_maps)" />
+      <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
+      <param name="localization_backend" value="$(arg localization_backend)" />
+      <param name="explicit_floor_switching"
+             value="$(eval arg('localization_backend') == 'gicp' and arg('multifloor_enabled'))" />
     </node>
   </group>
 
   <!-- Optional compatibility backend. P0 defaults to the odometry-driven map. -->
-  <group if="$(eval arg('localization_source') == 'gicp' and arg('use_hector_correction'))">
+  <group if="$(eval arg('localization_backend') == 'gicp' and arg('use_hector_correction'))">
     <node name="hector_mapping"
           pkg="hector_mapping"
           type="hector_mapping"
@@ -68,15 +82,16 @@
         type="pose_estimator.py"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
-    <param name="localization_source" value="$(arg localization_source)" />
-    <param name="multifloor_enabled" value="$(arg enable_multifloor_maps)" />
+    <param name="competition_mode" value="$(arg competition_mode)" />
+    <param name="localization_backend" value="$(arg localization_backend)" />
+    <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
     <!-- Truth scans and poses share timestamps; do not extrapolate TF into the future. -->
     <param name="tf_publish_future_tolerance_s"
-           value="$(eval 0.0 if arg('localization_source') == 'gazebo_truth' else 0.5)" />
+           value="$(eval 0.0 if arg('localization_backend') == 'gazebo_truth' else 0.5)" />
     <!-- Gazebo truth is already mission-relative and must not be low-pass lagged. -->
     <param name="pose_stabilizer_mode"
-           value="$(eval 'trusted_passthrough' if arg('localization_source') == 'gazebo_truth' else 'filtered_anchored')" />
+           value="$(eval 'trusted_passthrough' if arg('localization_backend') == 'gazebo_truth' else 'filtered_anchored')" />
     <param name="use_hector_correction"
-           value="$(eval arg('localization_source') == 'gicp' and arg('use_hector_correction'))" />
+           value="$(eval arg('localization_backend') == 'gicp' and arg('use_hector_correction'))" />
   </node>
 </launch>
