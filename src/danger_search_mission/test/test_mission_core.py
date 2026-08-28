@@ -16,11 +16,52 @@ from danger_search_mission.mission_core import (
     normalize_run_profile,
     normalize_result_file,
     parse_public_scene_contract,
+    PostureSafetyGate,
     resolve_result_coordinate_frame,
     result_profile_errors,
     task_relative_position,
     task_to_world_position,
 )
+
+
+class PostureSafetyGateTest(unittest.TestCase):
+    def test_transient_sensor_stop_recovers_without_abort(self):
+        gate = PostureSafetyGate(3.0)
+        gate.update_reason("imu_stale")
+        gate.update_stop(True, 10.0)
+        self.assertIsNone(gate.abort_detail(12.99, mission_active=True))
+        gate.update_stop(False, 13.0)
+        gate.update_reason("stable_recovery")
+        self.assertIsNone(gate.abort_detail(20.0, mission_active=True))
+
+    def test_persistent_sensor_stop_preserves_trigger_reason(self):
+        gate = PostureSafetyGate(3.0)
+        gate.update_stop(True, 4.0)
+        gate.update_reason("invalid_imu:zero norm")
+        self.assertEqual(
+            gate.abort_detail(7.0, mission_active=True),
+            "persistent_invalid_imu_zero_norm",
+        )
+
+    def test_true_fall_is_immediate_for_either_callback_order(self):
+        for fallen_first in (False, True):
+            gate = PostureSafetyGate(3.0)
+            if fallen_first:
+                gate.update_fallen(True)
+                gate.update_stop(True, 1.0)
+            else:
+                gate.update_stop(True, 1.0)
+                gate.update_fallen(True)
+            self.assertEqual(
+                gate.abort_detail(1.0, mission_active=True),
+                "posture_fallen",
+            )
+
+    def test_idle_startup_never_requests_terminal_abort(self):
+        gate = PostureSafetyGate(3.0)
+        gate.update_reason("imu_not_received")
+        gate.update_stop(True, 0.0)
+        self.assertIsNone(gate.abort_detail(30.0, mission_active=False))
 
 
 class ReturnBudgetTest(unittest.TestCase):

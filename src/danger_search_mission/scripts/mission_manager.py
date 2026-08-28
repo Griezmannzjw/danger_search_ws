@@ -47,6 +47,7 @@ from danger_search_mission.mission_core import (
     normalize_run_profile,
     normalize_result_file,
     parse_public_scene_contract,
+    PostureSafetyGate,
     resolve_result_coordinate_frame,
 )
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
@@ -104,6 +105,15 @@ class MissionManager:
         self.imu_topic = rospy.get_param("~imu_topic", "/trunk_imu")
         self.safety_stop_topic = rospy.get_param(
             "~safety_stop_topic", "/danger_search/safety_stop"
+        )
+        self.posture_fallen_topic = rospy.get_param(
+            "~posture_fallen_topic", "/danger_search/posture_fallen"
+        )
+        self.posture_reason_topic = rospy.get_param(
+            "~posture_reason_topic", "/danger_search/posture_safety_reason"
+        )
+        self.recoverable_safety_abort_s = self._positive_param(
+            "~recoverable_safety_abort_s", 3.0
         )
 
         self.start_exploration_service = rospy.get_param(
@@ -462,6 +472,9 @@ class MissionManager:
         self.latest_entry_imu = None
         self.last_entry_imu_time = rospy.Time(0)
         self.safety_stop_active = False
+        self.posture_safety = PostureSafetyGate(
+            self.recoverable_safety_abort_s
+        )
         self.safety_abort_started = False
         self.entrance_ready = not self.require_entrance_ready
         self.preflight_ready = not self.require_preflight_ready
@@ -501,6 +514,18 @@ class MissionManager:
         )
         self.safety_stop_sub = rospy.Subscriber(
             self.safety_stop_topic, Bool, self._safety_stop_callback, queue_size=5
+        )
+        self.posture_fallen_sub = rospy.Subscriber(
+            self.posture_fallen_topic,
+            Bool,
+            self._posture_fallen_callback,
+            queue_size=5,
+        )
+        self.posture_reason_sub = rospy.Subscriber(
+            self.posture_reason_topic,
+            String,
+            self._posture_reason_callback,
+            queue_size=5,
         )
 
         self.start_explore_client = rospy.ServiceProxy(
@@ -696,30 +721,53 @@ class MissionManager:
             self.last_entry_imu_time = rospy.Time.now()
 
     def _safety_stop_callback(self, message):
-        abort = False
+        now = rospy.Time.now()
         with self.lock:
             self.safety_stop_active = bool(message.data)
-            abort = (
-                self.safety_stop_active
-                and not self.safety_abort_started
-                and not self.finalized
-                and self.mission_state in (
-                    MissionLifecycle.ENTERING,
-                    MissionLifecycle.EXPLORING,
-                    MissionLifecycle.RETURNING,
-                )
+            self.posture_safety.update_stop(
+                self.safety_stop_active, now.to_sec()
             )
-            if abort:
+        self._maybe_start_safety_abort(now)
+
+    def _posture_fallen_callback(self, message):
+        now = rospy.Time.now()
+        with self.lock:
+            self.posture_safety.update_fallen(message.data)
+        self._maybe_start_safety_abort(now)
+
+    def _posture_reason_callback(self, message):
+        with self.lock:
+            self.posture_safety.update_reason(message.data)
+
+    def _maybe_start_safety_abort(self, now):
+        start_abort = False
+        with self.lock:
+            mission_active = self.mission_state in (
+                MissionLifecycle.ENTERING,
+                MissionLifecycle.EXPLORING,
+                MissionLifecycle.RETURNING,
+            )
+            detail = self.posture_safety.abort_detail(
+                now.to_sec(), mission_active
+            )
+            abort_required = detail is not None and not self.finalized
+            if abort_required and not self.safety_abort_started:
                 self.safety_abort_started = True
-        if abort:
+                start_abort = True
+        if start_abort:
             thread = threading.Thread(
                 target=self._abort_for_safety_stop,
+                args=(detail,),
                 name="mission_safety_abort",
             )
             thread.daemon = True
             thread.start()
+        return abort_required
 
-    def _abort_for_safety_stop(self):
+    def _abort_for_safety_stop(self, detail):
+        rospy.logerr(
+            "[mission] terminal posture safety stop: %s", detail
+        )
         self._stop_entry_crossing()
         self.move_base_client.cancel_all_goals()
         self.transit_floor_client.cancel_all_goals()
@@ -727,7 +775,7 @@ class MissionManager:
             self.stop_explore_client()
         except (rospy.ROSException, rospy.ServiceException) as exc:
             rospy.logwarn("[mission] safety stop exploration failed: %s", str(exc))
-        self._finalize("posture_safety_stop", error=True)
+        self._finalize("posture_safety_stop:" + detail, error=True)
 
     def _mapping_status_callback(self, message):
         with self.lock:
@@ -1074,7 +1122,12 @@ class MissionManager:
         if phase in ("PREPARE", "HANDOFF"):
             self._publish_entry_command()
         if safety_stop:
-            self._fail_entry_crossing("SAFETY_STOP", "safety stop is active")
+            # cmd_mux enforces the same zero-motion stop globally.  Keep the
+            # entry phase alive so a recoverable IMU dropout can resume rather
+            # than turning a transient sensor fault into a terminal mission.
+            if phase == "CROSS":
+                self.entry_progress_watchdog.last_progress_time_s = now.to_sec()
+            self._publish_entry_command()
             return
         inputs = (
             ("pose", current_pose, pose_time),
@@ -1541,6 +1594,7 @@ class MissionManager:
                 "",
                 "NONE",
                 "LOCALIZATION_LOST",
+                "SAFETY_STOP",
                 "UNREACHABLE",
             )
             self.entry_waiting_for_localization = localization_lost
@@ -1780,6 +1834,20 @@ class MissionManager:
                 return
             self.return_goal_active = False
             self.return_goal_deadline = rospy.Time(0)
+            safety_stop = self.safety_stop_active
+            if state != GoalStatus.SUCCEEDED and safety_stop:
+                # The controller correctly terminates its Action while the
+                # hard stop is active.  Retry only after recovery and do not
+                # spend the bounded return-attempt budget on that safety event.
+                self.return_goal_attempts = max(
+                    0, self.return_goal_attempts - 1
+                )
+                self.return_retry_reason = "safety_recovery"
+                self.return_retry_at = (
+                    rospy.Time.now()
+                    + rospy.Duration(self.return_retry_delay_s)
+                )
+                return
         if state == GoalStatus.SUCCEEDED:
             with self.lock:
                 self.return_verify_deadline = (
@@ -1860,6 +1928,12 @@ class MissionManager:
                 and not self.autostart_attempted
                 and state == MissionLifecycle.IDLE
             )
+        if self._maybe_start_safety_abort(now):
+            return
+        with self.lock:
+            safety_stop = self.safety_stop_active
+        if safety_stop:
+            return
         if should_autostart and self._preflight_reason(now) == "ready":
             with self.lock:
                 self.autostart_attempted = True

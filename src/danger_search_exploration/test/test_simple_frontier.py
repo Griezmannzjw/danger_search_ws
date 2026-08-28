@@ -99,6 +99,7 @@ class SimpleFrontierTest(unittest.TestCase):
         self.assertAlmostEqual(config["failed_goal_cooldown"], 15.0)
         self.assertAlmostEqual(config["failed_goal_radius"], 0.50)
         self.assertAlmostEqual(config["min_goal_dispatch_distance_m"], 0.45)
+        self.assertAlmostEqual(config["floor_unreachable_hold_s"], 30.0)
         self.assertAlmostEqual(config["trap_blacklist_radius"], 0.70)
         self.assertAlmostEqual(config["trap_clearance_margin"], 0.08)
         self.assertEqual(config["blacklist_clear_revisions"], 2)
@@ -655,6 +656,109 @@ class SimpleFrontierTest(unittest.TestCase):
 
         self.assertIsNone(goal)
         self.assertEqual(reason, "frontier_already_in_observation_range")
+
+    @staticmethod
+    def _completion_planner():
+        planner = make_planner(np.zeros((1, 1), dtype=np.int8))
+        planner.no_reachable_frontier_cycles = 0
+        planner.floor_no_frontier_since = MODULE.rospy.Time(0)
+        planner.floor_unreachable_since = MODULE.rospy.Time(0)
+        planner.no_frontier_cycles_required = 5
+        planner.floor_no_frontier_hold_s = 10.0
+        planner.floor_unreachable_hold_s = 30.0
+        planner.map_stable_time = 8.0
+        planner.last_significant_map_change = MODULE.rospy.Time(0)
+        planner.waiting_for_result = False
+        planner.nav_has_active_goal = False
+        planner._navigation_service_available = lambda: True
+        return planner
+
+    def test_strict_no_frontier_completion_contract_is_unchanged(self):
+        planner = self._completion_planner()
+        mode = None
+        for stamp in (1.0, 3.0, 5.0, 7.0, 11.0):
+            mode, reason = planner._floor_completion_mode(
+                "no_frontier", MODULE.rospy.Time.from_sec(stamp)
+            )
+        self.assertEqual(reason, "no_frontier")
+        self.assertEqual(mode, "strict_no_frontier")
+
+        planner = self._completion_planner()
+        planner.coverage_debt_by_floor[0] = {(3, 4, "unreachable")}
+        for stamp in (1.0, 3.0, 5.0, 7.0, 11.0):
+            mode, _reason = planner._floor_completion_mode(
+                "no_frontier", MODULE.rospy.Time.from_sec(stamp)
+            )
+        self.assertIsNone(mode)
+
+    def test_bounded_unreachable_completion_waits_and_preserves_debt(self):
+        planner = self._completion_planner()
+        debt = {(5, 1, "disconnected")}
+        planner.coverage_debt_by_floor[0] = set(debt)
+        reason = "all_frontiers_unreachable_or_blacklisted"
+        mode, _ = planner._floor_completion_mode(
+            reason, MODULE.rospy.Time.from_sec(1.0)
+        )
+        self.assertIsNone(mode)
+        mode, _ = planner._floor_completion_mode(
+            reason, MODULE.rospy.Time.from_sec(30.99)
+        )
+        self.assertIsNone(mode)
+        mode, _ = planner._floor_completion_mode(
+            reason, MODULE.rospy.Time.from_sec(31.0)
+        )
+        self.assertEqual(mode, "bounded_unreachable")
+        self.assertEqual(planner.coverage_debt_by_floor[0], debt)
+
+    def test_bounded_unreachable_timer_resets_on_reachable_goal(self):
+        planner = self._completion_planner()
+        reason = "frontier_already_in_observation_range"
+        planner._floor_completion_mode(
+            reason, MODULE.rospy.Time.from_sec(1.0)
+        )
+        planner._floor_completion_mode(
+            "reachable_frontier", MODULE.rospy.Time.from_sec(20.0)
+        )
+        mode, _ = planner._floor_completion_mode(
+            reason, MODULE.rospy.Time.from_sec(31.0)
+        )
+        self.assertIsNone(mode)
+        self.assertEqual(
+            planner.floor_unreachable_since,
+            MODULE.rospy.Time.from_sec(31.0),
+        )
+
+    def test_navigation_service_failure_resets_bounded_evidence(self):
+        planner = self._completion_planner()
+        reason = "all_frontiers_unreachable_or_blacklisted"
+        planner._navigation_service_available = lambda: False
+        planner._floor_completion_mode(
+            reason, MODULE.rospy.Time.from_sec(1.0)
+        )
+        mode, wait_reason = planner._floor_completion_mode(
+            reason, MODULE.rospy.Time.from_sec(31.0)
+        )
+        self.assertIsNone(mode)
+        self.assertEqual(wait_reason, "navigation_service_unavailable")
+        self.assertEqual(planner.floor_unreachable_since, MODULE.rospy.Time(0))
+
+    def test_input_failure_reset_and_active_goal_block_completion(self):
+        planner = self._completion_planner()
+        reason = "frontier_already_in_observation_range"
+        planner._floor_completion_mode(
+            reason, MODULE.rospy.Time.from_sec(1.0)
+        )
+        planner._reset_bounded_floor_completion_evidence()
+        mode, _ = planner._floor_completion_mode(
+            reason, MODULE.rospy.Time.from_sec(31.0)
+        )
+        self.assertIsNone(mode)
+
+        planner.nav_has_active_goal = True
+        mode, _ = planner._floor_completion_mode(
+            reason, MODULE.rospy.Time.from_sec(61.0)
+        )
+        self.assertIsNone(mode)
 
     def test_inflation_disconnects_a_too_narrow_gap(self):
         grid = np.zeros((9, 9), dtype=np.int8)

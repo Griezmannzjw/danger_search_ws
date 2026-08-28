@@ -8,6 +8,51 @@ import os
 DEFAULT_ENTRY_COMPLETION_TOLERANCE_M = 0.45
 
 
+class PostureSafetyGate:
+    """Classify posture stops without coupling sensor faults to true falls."""
+
+    def __init__(self, recoverable_abort_s):
+        recoverable_abort_s = float(recoverable_abort_s)
+        if not math.isfinite(recoverable_abort_s) or recoverable_abort_s <= 0.0:
+            raise ValueError("recoverable safety abort must be positive and finite")
+        self.recoverable_abort_s = recoverable_abort_s
+        self.active = False
+        self.fallen = False
+        self.reason = "unknown"
+        self.active_since = None
+
+    def update_stop(self, active, now):
+        active = bool(active)
+        now = float(now)
+        if active and not self.active:
+            self.active_since = now
+        elif not active:
+            self.active_since = None
+        self.active = active
+
+    def update_fallen(self, fallen):
+        self.fallen = bool(fallen)
+
+    def update_reason(self, reason):
+        normalized = str(reason or "").strip()
+        if normalized:
+            self.reason = normalized
+
+    def abort_detail(self, now, mission_active):
+        """Return a stable abort detail, or ``None`` while recovery is allowed."""
+        if not mission_active:
+            return None
+        if self.fallen:
+            return "posture_fallen"
+        if not self.active or self.active_since is None:
+            return None
+        elapsed = float(now) - self.active_since
+        if elapsed < self.recoverable_abort_s:
+            return None
+        reason = self.reason.replace(":", "_").replace(" ", "_")
+        return "persistent_" + reason
+
+
 def allocate_return_attempt_budget(
         remaining_s, attempt_cap_s, retry_reserve_s,
         terminal_reserve_s, attempts_left):

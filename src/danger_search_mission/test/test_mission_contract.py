@@ -20,6 +20,14 @@ class MissionContractTest(unittest.TestCase):
         self.assertEqual(config["exploration_complete_topic"], "/exploration/complete")
         self.assertEqual(config["pose_topic"], "/localization/pose")
         self.assertEqual(config["return_home_service"], "/danger_search/return_home")
+        self.assertEqual(
+            config["posture_fallen_topic"], "/danger_search/posture_fallen"
+        )
+        self.assertEqual(
+            config["posture_reason_topic"],
+            "/danger_search/posture_safety_reason",
+        )
+        self.assertEqual(config["recoverable_safety_abort_s"], 3.0)
         self.assertGreaterEqual(config["min_detections"], 2)
         self.assertGreater(config["return_timeout_s"], 0)
         self.assertEqual(
@@ -165,7 +173,13 @@ class MissionContractTest(unittest.TestCase):
         self.assertIn('self.entry_short_range_phase = "HANDOFF"', source)
         self.assertIn("os.replace(temporary, self.result_file)", source)
         self.assertIn("self._abort_for_safety_stop", source)
-        self.assertIn('self._finalize("posture_safety_stop", error=True)', source)
+        self.assertIn("self.posture_fallen_sub = rospy.Subscriber", source)
+        self.assertIn("self.posture_reason_sub = rospy.Subscriber", source)
+        self.assertIn('self._finalize("posture_safety_stop:" + detail', source)
+        self.assertIn("and not self.safety_abort_started", source)
+        self.assertIn('"SAFETY_STOP",', source)
+        self.assertIn('self.return_retry_reason = "safety_recovery"', source)
+        self.assertIn("if safety_stop:\n            return", source)
         self.assertIn("if self.shutting_down or rospy.is_shutdown():", source)
 
 

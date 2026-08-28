@@ -49,6 +49,9 @@ dependency_check_timeout: 0.1
 input_timeout: 3.0
 no_frontier_cycles_required: 5
 floor_no_frontier_hold_s: 10.0
+# 前沿仍存在但持续不可达/已在观察范围内时，保留拓扑债务并在 30 秒后
+# 允许换层，避免同层永久等待。期间任一可达目标或依赖故障都会重新计时。
+floor_unreachable_hold_s: 30.0
 map_stable_time: 8.0
 map_change_cell_threshold: 5
 

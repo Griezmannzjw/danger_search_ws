@@ -21,6 +21,8 @@ entry_cmd_topic: /danger_search/entry_cmd_vel
 scan_topic: /localization/scan
 imu_topic: /trunk_imu
 safety_stop_topic: /danger_search/safety_stop
+posture_fallen_topic: /danger_search/posture_fallen
+posture_reason_topic: /danger_search/posture_safety_reason
 start_exploration_service: /danger_search/start_exploration
 stop_exploration_service: /danger_search/stop_exploration
 start_mission_service: /danger_search/start
@@ -43,6 +45,8 @@ min_detections: 3
 min_confidence: 0.60
 input_timeout_s: 2.0
 preflight_wait_timeout_s: 20.0
+# 真实倾倒立即终止；IMU stale/invalid 先由底层停车，持续到该时限才终止任务。
+recoverable_safety_abort_s: 3.0
 # 0 表示不因探索耗时自动触发返航。任务只在探索自然完成，或收到
 # FinishMission/ReturnHome 请求后进入返航；比赛总时限由测试端统计。
 mission_timeout_s: 0.0

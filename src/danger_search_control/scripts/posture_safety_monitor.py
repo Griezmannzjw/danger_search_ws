@@ -33,6 +33,7 @@ class PostureSafetyMonitor:
         # publishers are being destroyed.  This latch closes that local race
         # in addition to rospy.is_shutdown().
         self._shutdown_started = False
+        self._last_logged_state = None
         self.timer = None
         self.safety_pub = rospy.Publisher(
             rospy.get_param("~safety_stop_topic", "/danger_search/safety_stop"),
@@ -100,8 +101,34 @@ class PostureSafetyMonitor:
             active, reason, fallen = (
                 self.state.latched, self.state.reason, self.state.fallen
             )
+            tilt = getattr(self.state, "last_tilt", None)
+            log_key = (active, str(reason).split(":", 1)[0], fallen)
+            state_changed = log_key != getattr(
+                self, "_last_logged_state", None
+            )
         if self._is_stopping():
             return False
+        if state_changed:
+            tilt_text = (
+                "unknown" if tilt is None
+                else "%.1fdeg" % math.degrees(float(tilt))
+            )
+            if active:
+                rospy.logwarn(
+                    "[posture_safety_monitor] safety stop active: "
+                    "reason=%s fallen=%s tilt=%s",
+                    reason,
+                    fallen,
+                    tilt_text,
+                )
+            else:
+                rospy.loginfo(
+                    "[posture_safety_monitor] safety stop cleared: "
+                    "reason=%s fallen=%s tilt=%s",
+                    reason,
+                    fallen,
+                    tilt_text,
+                )
         try:
             self.safety_pub.publish(Bool(data=active))
             self.fallen_pub.publish(Bool(data=fallen))
@@ -110,6 +137,7 @@ class PostureSafetyMonitor:
             if self._is_stopping():
                 return False
             raise
+        self._last_logged_state = log_key
         return True
 
     def shutdown(self):

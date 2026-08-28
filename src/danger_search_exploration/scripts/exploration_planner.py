@@ -68,6 +68,12 @@ except ImportError:  # Unit tests may import the pure helpers without SimEnv sou
     SetDoorStateRequest = None
 
 
+BOUNDED_FLOOR_EXHAUSTION_REASONS = frozenset((
+    "all_frontiers_unreachable_or_blacklisted",
+    "frontier_already_in_observation_range",
+))
+
+
 def classify_navigation_failure(state, status_text=""):
     """Classify an Action terminal state without stale health telemetry."""
     normalized = str(status_text or "").lower()
@@ -464,6 +470,9 @@ class ExplorationPlanner:
         self.floor_no_frontier_hold_s = float(
             rospy.get_param("~floor_no_frontier_hold_s", 10.0)
         )
+        self.floor_unreachable_hold_s = float(
+            rospy.get_param("~floor_unreachable_hold_s", 30.0)
+        )
         self.map_stable_time = rospy.get_param("~map_stable_time", 8.0)
         self.map_change_cell_threshold = rospy.get_param("~map_change_cell_threshold", 5)
         self.observation_min_distance = float(
@@ -631,6 +640,7 @@ class ExplorationPlanner:
                 and 0.0 < self.elevator_door_changed_fraction <= 1.0
                 and self.floor_min_new_map_versions >= 2
                 and self.floor_no_frontier_hold_s >= 10.0
+                and self.floor_unreachable_hold_s >= 10.0
                 and self.floor_height_m > 0.0
                 and self.retry_backoff > 0.0):
             raise rospy.ROSInitException("多楼层电梯参数无效")
@@ -747,6 +757,7 @@ class ExplorationPlanner:
         self.coverage_debt_by_floor = {}
         self.elevator_hall_bindings = {}
         self.floor_no_frontier_since = rospy.Time(0)
+        self.floor_unreachable_since = rospy.Time(0)
         self.elevator_halls = []          # 候选电梯厅世界坐标 (x, y)
         self.elevator_hall_index = 0      # 当前尝试的候选
         self.elevator_hall_found = None   # 确认的电梯厅 (x, y, 门缝朝向 yaw)
@@ -2044,6 +2055,7 @@ class ExplorationPlanner:
             self.backoff_until = rospy.Time(0)
             self.no_reachable_frontier_cycles = 0
             self.floor_no_frontier_since = rospy.Time(0)
+            self.floor_unreachable_since = rospy.Time(0)
             self.complete_published = False
             self.complete_pub.publish(Bool(data=False))
             self.visited_floors = {self.current_floor}
@@ -2084,6 +2096,72 @@ class ExplorationPlanner:
             self._set_state("STOPPED", "stop_requested")
             return TriggerResponse(success=True, message="Exploration stopped")
 
+    def _reset_floor_completion_evidence(self):
+        self.no_reachable_frontier_cycles = 0
+        self.floor_no_frontier_since = rospy.Time(0)
+        self.floor_unreachable_since = rospy.Time(0)
+
+    def _reset_bounded_floor_completion_evidence(self):
+        self.floor_unreachable_since = rospy.Time(0)
+
+    def _navigation_service_available(self):
+        try:
+            rospy.wait_for_service(
+                self.make_plan_service, timeout=self.dependency_check_timeout
+            )
+            return True
+        except rospy.ROSException:
+            return False
+
+    def _floor_completion_mode(self, selection_reason, now):
+        """Accumulate strict or bounded floor-exhaustion evidence."""
+        if selection_reason == "no_frontier":
+            self.floor_unreachable_since = rospy.Time(0)
+            self.no_reachable_frontier_cycles += 1
+            if self.floor_no_frontier_since == rospy.Time(0):
+                self.floor_no_frontier_since = now
+        elif selection_reason in BOUNDED_FLOOR_EXHAUSTION_REASONS:
+            self.no_reachable_frontier_cycles = 0
+            self.floor_no_frontier_since = rospy.Time(0)
+            if self.floor_unreachable_since == rospy.Time(0):
+                self.floor_unreachable_since = now
+        else:
+            self._reset_floor_completion_evidence()
+            return None, selection_reason
+
+        map_stable = (
+            now - self.last_significant_map_change
+        ).to_sec() >= self.map_stable_time
+        no_active_goal = (
+            not self.waiting_for_result and not self.nav_has_active_goal
+        )
+        if selection_reason == "no_frontier":
+            held = (
+                now - self.floor_no_frontier_since
+            ).to_sec() >= self.floor_no_frontier_hold_s
+            no_coverage_debt = not self.coverage_debt_by_floor.get(
+                self.current_floor, set()
+            )
+            ready = (
+                self.no_reachable_frontier_cycles
+                >= self.no_frontier_cycles_required
+                and held
+                and no_coverage_debt
+                and map_stable
+                and no_active_goal
+            )
+            return ("strict_no_frontier" if ready else None), selection_reason
+
+        held = (
+            now - self.floor_unreachable_since
+        ).to_sec() >= self.floor_unreachable_hold_s
+        if not (held and map_stable and no_active_goal):
+            return None, selection_reason
+        if not self._navigation_service_available():
+            self._reset_floor_completion_evidence()
+            return None, "navigation_service_unavailable"
+        return "bounded_unreachable", selection_reason
+
     def planner_loop(self, event):
         """主规划循环"""
         now = rospy.Time.now()
@@ -2099,7 +2177,11 @@ class ExplorationPlanner:
 
         healthy, reason = self._inputs_health(now)
         if not healthy:
+            # Preserve the legacy strict no-frontier hold semantics, while a
+            # bounded-unreachable decision must observe 30 continuous seconds
+            # of healthy inputs.
             self.no_reachable_frontier_cycles = 0
+            self._reset_bounded_floor_completion_evidence()
             state = "FAILED" if reason == "localization_lost" else "WAITING"
             self._set_state(state, reason)
             return
@@ -2144,8 +2226,7 @@ class ExplorationPlanner:
         # 选择目标
         goal, selection_reason = self._select_goal()
         if goal is not None:
-            self.no_reachable_frontier_cycles = 0
-            self.floor_no_frontier_since = rospy.Time(0)
+            self._reset_floor_completion_evidence()
             selected_metrics = self.selected_goal_metrics or {}
             if not self._send_goal(
                     *goal,
@@ -2158,33 +2239,25 @@ class ExplorationPlanner:
                 self._set_state("NAVIGATING", "goal_sent")
         else:
             if selection_reason == "navigation_service_unavailable":
-                self.no_reachable_frontier_cycles = 0
-                self.floor_no_frontier_since = rospy.Time(0)
+                self._reset_floor_completion_evidence()
                 self._set_state("WAITING", selection_reason)
                 return
-            # Existing-but-unreachable frontiers are not exploration
-            # convergence.  Counting them as completion caused a noisy or
-            # temporarily disconnected map to finish the mission while many
-            # frontiers were still present.
-            if selection_reason != "no_frontier":
-                self.no_reachable_frontier_cycles = 0
-                self.floor_no_frontier_since = rospy.Time(0)
-                self._set_state("WAITING", selection_reason)
-                return
-            self.no_reachable_frontier_cycles += 1
-            if self.floor_no_frontier_since == rospy.Time(0):
-                self.floor_no_frontier_since = now
-            map_stable = (now - self.last_significant_map_change).to_sec() >= self.map_stable_time
-            no_active_goal = not self.waiting_for_result and not self.nav_has_active_goal
-            no_frontier_held = (
-                now - self.floor_no_frontier_since
-            ).to_sec() >= self.floor_no_frontier_hold_s
-            no_coverage_debt = not self.coverage_debt_by_floor.get(
-                self.current_floor, set()
+            completion_mode, wait_reason = self._floor_completion_mode(
+                selection_reason, now
             )
-            if (self.no_reachable_frontier_cycles >= self.no_frontier_cycles_required
-                    and no_frontier_held and no_coverage_debt
-                    and map_stable and no_active_goal):
+            if completion_mode is not None:
+                debt_count = len(self.coverage_debt_by_floor.get(
+                    self.current_floor, set()
+                ))
+                rospy.loginfo(
+                    "[exploration] floor %d complete: mode=%s reason=%s "
+                    "remaining_frontiers=%d coverage_debt=%d",
+                    self.current_floor,
+                    completion_mode,
+                    selection_reason,
+                    self.remaining_frontier_count,
+                    debt_count,
+                )
                 self._save_current_floor_runtime()
                 self.completed_floors.add(self.current_floor)
                 next_floor = self._select_next_floor()
@@ -2200,7 +2273,7 @@ class ExplorationPlanner:
                 elif now > self.floor_change_retry_after:
                     self._begin_floor_change(next_floor)
             else:
-                self._set_state("WAITING", selection_reason)
+                self._set_state("WAITING", wait_reason)
 
     # ========== 多楼层：电梯自主发现与换层 ==========
 
@@ -2267,6 +2340,7 @@ class ExplorationPlanner:
         self.backoff_until = rospy.Time(0)
         self.no_reachable_frontier_cycles = 0
         self.floor_no_frontier_since = rospy.Time(0)
+        self.floor_unreachable_since = rospy.Time(0)
         self._reachable_cache_key = None
         self._reachable_cache = None
         self._component_cache_key = None
@@ -2292,6 +2366,7 @@ class ExplorationPlanner:
         self.backoff_until = rospy.Time(0)
         self.no_reachable_frontier_cycles = 0
         self.floor_no_frontier_since = rospy.Time(0)
+        self.floor_unreachable_since = rospy.Time(0)
         self.current_goal = None
         self.waiting_for_result = False
         self.last_recovery_goal_id = ""
@@ -3373,6 +3448,7 @@ class ExplorationPlanner:
         self.elevator_hall_found = None
         self.no_reachable_frontier_cycles = 0
         self.floor_no_frontier_since = rospy.Time(0)
+        self.floor_unreachable_since = rospy.Time(0)
         self.last_significant_map_change = rospy.Time.now()
         self.floor_change_gave_up_count = 0
         if self.current_floor != final_target:

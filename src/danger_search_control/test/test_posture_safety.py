@@ -148,10 +148,19 @@ class FakeRospy:
     Time = FakeTime
     ROSException = RuntimeError
     shutdown_active = False
+    logs = []
 
     @classmethod
     def is_shutdown(cls):
         return cls.shutdown_active
+
+    @classmethod
+    def logwarn(cls, message, *args):
+        cls.logs.append(("warn", message % args))
+
+    @classmethod
+    def loginfo(cls, message, *args):
+        cls.logs.append(("info", message % args))
 
 
 class FakePublisher:
@@ -210,6 +219,7 @@ class PostureSafetyMonitorShutdownTest(unittest.TestCase):
         self.original_rospy = monitor_module.rospy
         monitor_module.rospy = FakeRospy
         FakeRospy.shutdown_active = False
+        FakeRospy.logs = []
 
     def tearDown(self):
         FakeRospy.shutdown_active = False
@@ -253,6 +263,28 @@ class PostureSafetyMonitorShutdownTest(unittest.TestCase):
         node.safety_pub = FakePublisher(exception=FakeRospy.ROSException("unexpected"))
         with self.assertRaises(FakeRospy.ROSException):
             node._publish()
+
+    def test_publish_logs_each_state_reason_transition_once(self):
+        node = _monitor_test_node()
+        self.assertTrue(node._publish())
+        self.assertTrue(node._publish())
+        self.assertEqual(len(FakeRospy.logs), 1)
+        self.assertIn("reason=imu_stale", FakeRospy.logs[0][1])
+
+        node.state.latched = False
+        node.state.reason = "stable_recovery"
+        self.assertTrue(node._publish())
+        self.assertEqual(len(FakeRospy.logs), 2)
+        self.assertIn("reason=stable_recovery", FakeRospy.logs[1][1])
+
+        node.state.latched = True
+        node.state.fallen = True
+        node.state.reason = "excessive_tilt:39.0deg"
+        self.assertTrue(node._publish())
+        node.state.reason = "excessive_tilt:40.2deg"
+        self.assertTrue(node._publish())
+        self.assertEqual(len(FakeRospy.logs), 3)
+        self.assertIn("reason=excessive_tilt:39.0deg", FakeRospy.logs[2][1])
 
 
 if __name__ == "__main__":
