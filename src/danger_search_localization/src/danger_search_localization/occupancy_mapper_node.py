@@ -47,10 +47,26 @@ class OccupancyMapperNode:
         self.localization_backend = rospy.get_param(
             "~localization_backend", "gicp"
         )
-        self.explicit_floor_switching = bool(rospy.get_param(
-            "~explicit_floor_switching",
-            self.multifloor_enabled and self.localization_backend == "gicp",
+        # Floor identity is an elevator-service contract, not a pose-height
+        # heuristic.  In particular, Gazebo truth z must never be able to
+        # advance a test mission to a new floor.  The legacy height classifier
+        # remains available only for isolated mapper tests that explicitly opt
+        # in to it.
+        self.allow_pose_height_floor_assignment = bool(rospy.get_param(
+            "~allow_pose_height_floor_assignment", False
         ))
+        self.explicit_floor_switching = bool(rospy.get_param(
+            "~explicit_floor_switching", self.multifloor_enabled
+        ))
+        if (
+            self.multifloor_enabled
+            and not self.explicit_floor_switching
+            and not self.allow_pose_height_floor_assignment
+        ):
+            raise rospy.ROSInitException(
+                "multifloor mapping requires explicit_floor_switching=true; "
+                "pose-height assignment is test-only"
+            )
         self.reset_map_service = rospy.get_param(
             "~reset_map_service", "/localization/reset_map"
         )
@@ -407,6 +423,8 @@ class OccupancyMapperNode:
         envelope = FloorOccupancyGrid()
         envelope.header = message.header
         envelope.floor_id = int(floor_id)
+        with self.lock:
+            envelope.map_epoch = int(self.floor_switch.map_epoch)
         envelope.map_version = int(version)
         envelope.occupancy_grid = message
         self.floor_publisher.publish(envelope)

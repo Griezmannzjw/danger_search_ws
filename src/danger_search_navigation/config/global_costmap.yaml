@@ -20,7 +20,7 @@ static:
   trinary_costmap: true
 
 obstacles:
-  observation_sources: scan
+  observation_sources: scan depth_scan
   scan:
     data_type: LaserScan
     topic: /localization/scan
@@ -30,6 +30,16 @@ obstacles:
     observation_persistence: 0.30
     obstacle_range: 3.0
     raytrace_range: 4.0
+    inf_is_valid: false
+  depth_scan:
+    data_type: LaserScan
+    topic: /localization/depth_obstacle_scan
+    marking: true
+    clearing: false
+    expected_update_rate: 0.0
+    observation_persistence: 0.30
+    obstacle_range: 3.0
+    raytrace_range: 3.0
     inf_is_valid: false
 
 inflation:

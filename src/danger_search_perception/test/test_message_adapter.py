@@ -80,11 +80,30 @@ class TestP0MessageAdapter(unittest.TestCase):
         self.assertNotEqual(upper_floor.track_id, second.track_id)
         self.assertTrue(upper_floor.track_id.startswith("danger-f1-"))
 
+    def test_annotation_does_not_cross_map_epoch(self):
+        node = DangerDetectorNode.__new__(DangerDetectorNode)
+        node.tracker = MultiFrameDangerTracker(
+            TrackingConfig(confirmation_hits=2)
+        )
+
+        before_reset = self._danger(
+            0, rospy.Time(30, 0), x=1.0, map_epoch=4
+        )
+        node._annotate_tracks([before_reset], before_reset.source_time)
+        after_reset = self._danger(
+            0, rospy.Time(30, 100000000), x=1.0, map_epoch=5
+        )
+        node._annotate_tracks([after_reset], after_reset.source_time)
+
+        self.assertNotEqual(before_reset.track_id, after_reset.track_id)
+        self.assertFalse(after_reset.confirmed)
+
     @staticmethod
-    def _danger(floor_id, stamp, x=1.0, y=0.0, z=0.15):
+    def _danger(floor_id, stamp, x=1.0, y=0.0, z=0.15, map_epoch=0):
         danger = DangerSource()
         danger.detection_id = "{}.{}".format(stamp.secs, stamp.nsecs)
         danger.floor_id = floor_id
+        danger.map_epoch = map_epoch
         danger.confidence = 0.9
         danger.position.header.frame_id = "map"
         danger.position.header.stamp = stamp

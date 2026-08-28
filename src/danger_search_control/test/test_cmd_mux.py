@@ -58,6 +58,7 @@ def _install_rospy_stub():
         rospy = types.ModuleType("rospy")
         rospy.ROSException = RuntimeError
         rospy.ROSInterruptException = RuntimeError
+        rospy.is_shutdown = lambda: False
         sys.modules["rospy"] = rospy
 
 
@@ -92,11 +93,24 @@ def _normal_step(core, now, target=(1.0, 1.0, 1.0), nav_time=0.0):
 
 
 class FakePublisher:
-    def __init__(self):
+    def __init__(self, exception=None):
         self.messages = []
+        self.exception = exception
 
     def publish(self, message):
+        if self.exception is not None:
+            if callable(self.exception):
+                raise self.exception()
+            raise self.exception
         self.messages.append(message)
+
+
+class FakeTimer:
+    def __init__(self):
+        self.shutdown_calls = 0
+
+    def shutdown(self):
+        self.shutdown_calls += 1
 
 
 class FakeTime:
@@ -116,6 +130,12 @@ class FakeTime:
 class FakeRospy:
     Time = FakeTime
     warnings = []
+    shutdown_active = False
+    ROSException = RuntimeError
+
+    @classmethod
+    def is_shutdown(cls):
+        return cls.shutdown_active
 
     @classmethod
     def logwarn_throttle(cls, *args, **kwargs):
@@ -144,13 +164,21 @@ def _callback_test_node():
     node._invalid_elevator = False
     node._last_elevator_time_sec = None
     node.last_elevator_time = FakeTime(0.0)
+    node._entry_velocity = (0.0, 0.0, 0.0)
+    node._has_valid_entry = False
+    node._invalid_entry = False
+    node._last_entry_time_sec = None
+    node.last_entry_time = FakeTime(0.0)
     node.safety_stop = False
     node.last_output = Twist()
     node._core = CmdMuxCore(cmd_timeout_s=0.5)
     node.elevator_timeout_s = 0.25
+    node.entry_timeout_s = 0.25
     node._core.last_output_time = 0.0
     node.cmd_pub = FakePublisher()
     node.sent_cmd_pub = FakePublisher()
+    node.timer = FakeTimer()
+    node._shutdown_started = False
     return node
 
 
@@ -332,6 +360,120 @@ class CmdMuxCoreTest(unittest.TestCase):
         self.assertEqual(reason, "elevator")
         self.assertEqual(output, (0.0, 0.0, 0.0))
 
+    def test_entry_overrides_navigation_and_reaches_validated_gait_in_point_one_second(self):
+        core = CmdMuxCore(cmd_timeout_s=1.0)
+        core.step(
+            0.0, (0.4, 0.0, 0.8), True, 0.0,
+            entry_target=(0.4, 0.2, 0.3),
+            has_valid_entry=True,
+            last_entry_time=0.0,
+        )
+        output, reason = core.step(
+            0.1, (0.4, 0.0, 0.8), True, 0.1,
+            entry_target=(0.4, 0.2, 0.3),
+            has_valid_entry=True,
+            last_entry_time=0.1,
+        )
+        self.assertEqual(reason, "entry")
+        self.assertAlmostEqual(output[0], 0.40)
+        self.assertEqual(output[1], 0.0)
+        self.assertAlmostEqual(output[2], 0.15)
+
+    def test_entry_hard_clamps_velocity_and_forces_zero_lateral(self):
+        core = CmdMuxCore(
+            cmd_timeout_s=1.0,
+            entry_max_linear_accel=100.0,
+            entry_max_angular_accel=100.0,
+        )
+        core.step(
+            0.0, None, False, None,
+            entry_target=(9.0, -9.0, -9.0),
+            has_valid_entry=True,
+            last_entry_time=0.0,
+        )
+        output, reason = core.step(
+            0.1, None, False, None,
+            entry_target=(9.0, -9.0, -9.0),
+            has_valid_entry=True,
+            last_entry_time=0.1,
+        )
+        self.assertEqual((output, reason), ((0.40, 0.0, -0.30), "entry"))
+
+    def test_entry_hard_limit_applies_on_first_cycle_after_fast_navigation(self):
+        core = CmdMuxCore(cmd_timeout_s=1.0)
+        core.last_output = (0.4, 0.25, 0.8)
+        core.last_output_time = 0.0
+
+        output, reason = core.step(
+            0.1, (0.4, 0.25, 0.8), True, 0.1,
+            entry_target=(0.4, 0.0, 0.3),
+            has_valid_entry=True,
+            last_entry_time=0.1,
+        )
+
+        self.assertEqual(reason, "entry")
+        self.assertLessEqual(abs(output[0]), 0.40)
+        self.assertEqual(output[1], 0.0)
+        self.assertLessEqual(abs(output[2]), 0.30)
+
+    def test_fresh_entry_and_elevator_conflict_fails_closed(self):
+        core = CmdMuxCore(cmd_timeout_s=1.0)
+        output, reason = core.step(
+            0.1, (0.4, 0.0, 0.0), True, 0.1,
+            elevator_target=(0.1, 0.0, 0.0),
+            has_valid_elevator=True,
+            last_elevator_time=0.1,
+            entry_target=(0.4, 0.0, 0.0),
+            has_valid_entry=True,
+            last_entry_time=0.1,
+        )
+        self.assertEqual(
+            (output, reason),
+            ((0.0, 0.0, 0.0), "entry_elevator_conflict"),
+        )
+
+    def test_expired_entry_falls_back_to_fresh_navigation(self):
+        core = CmdMuxCore(cmd_timeout_s=1.0, entry_timeout_s=0.25)
+        output, reason = core.step(
+            0.26, (0.4, 0.0, 0.0), True, 0.2,
+            entry_target=(0.4, 0.0, 0.0),
+            has_valid_entry=True,
+            last_entry_time=0.0,
+        )
+        self.assertEqual(reason, "normal")
+        self.assertEqual(output, (0.0, 0.0, 0.0))
+        output, reason = core.step(
+            0.36, (0.4, 0.0, 0.0), True, 0.2,
+            entry_target=(0.4, 0.0, 0.0),
+            has_valid_entry=True,
+            last_entry_time=0.0,
+        )
+        self.assertEqual(reason, "normal")
+        self.assertGreater(output[0], 0.0)
+
+    def test_safety_stop_overrides_entry_and_resets_output(self):
+        core = CmdMuxCore(cmd_timeout_s=1.0)
+        core.step(
+            0.0, None, False, None,
+            entry_target=(0.4, 0.0, 0.3),
+            has_valid_entry=True,
+            last_entry_time=0.0,
+        )
+        core.step(
+            0.1, None, False, None,
+            entry_target=(0.4, 0.0, 0.3),
+            has_valid_entry=True,
+            last_entry_time=0.1,
+        )
+        output, reason = core.step(
+            0.2, None, False, None, safety_stop=True,
+            entry_target=(0.4, 0.0, 0.3),
+            has_valid_entry=True,
+            last_entry_time=0.2,
+        )
+        self.assertEqual((output, reason), ((0.0, 0.0, 0.0), "safety"))
+        self.assertEqual(core.last_output, (0.0, 0.0, 0.0))
+
 
 class CmdMuxInterfaceTest(unittest.TestCase):
     def test_invalid_navigation_cannot_preempt_active_elevator_lease(self):
@@ -458,6 +600,7 @@ class CmdMuxInterfaceTest(unittest.TestCase):
             node = _callback_test_node()
             node._core.last_output = (0.2, -0.1, 0.3)
             FakeTime.now_seconds = 1.0
+            FakeRospy.shutdown_active = False
             node.shutdown()
 
             self.assertEqual(len(node.cmd_pub.messages), 1)
@@ -467,7 +610,50 @@ class CmdMuxInterfaceTest(unittest.TestCase):
             self.assertEqual(output.linear.y, 0.0)
             self.assertEqual(output.angular.z, 0.0)
             self.assertEqual(node._core.last_output, (0.0, 0.0, 0.0))
+            self.assertEqual(node.timer.shutdown_calls, 1)
+            self.assertTrue(node._shutdown_started)
         finally:
+            FakeRospy.shutdown_active = False
+            cmd_mux_module.rospy = original_rospy
+
+    def test_shutdown_blocks_queued_callbacks_and_skips_publish_when_ros_is_closed(self):
+        original_rospy = cmd_mux_module.rospy
+        cmd_mux_module.rospy = FakeRospy
+        try:
+            node = _callback_test_node()
+            FakeRospy.shutdown_active = True
+            node.shutdown()
+            self.assertEqual(node.timer.shutdown_calls, 1)
+            self.assertEqual(node.cmd_pub.messages, [])
+
+            node.nav_cmd_callback(_target_message(0.4, 0.0, 0.0))
+            node.output_loop(None)
+            self.assertFalse(node._has_valid_nav)
+            self.assertEqual(node.cmd_pub.messages, [])
+        finally:
+            FakeRospy.shutdown_active = False
+            cmd_mux_module.rospy = original_rospy
+
+    def test_shutdown_race_ros_exception_is_suppressed_only_after_shutdown(self):
+        original_rospy = cmd_mux_module.rospy
+        cmd_mux_module.rospy = FakeRospy
+        try:
+            node = _callback_test_node()
+            FakeRospy.shutdown_active = False
+
+            def close_ros_then_fail():
+                FakeRospy.shutdown_active = True
+                return FakeRospy.ROSException("publisher closed")
+
+            node.cmd_pub = FakePublisher(exception=close_ros_then_fail)
+            self.assertFalse(node._publish_locked(_target_message()))
+
+            FakeRospy.shutdown_active = False
+            node.cmd_pub = FakePublisher(exception=FakeRospy.ROSException("unexpected"))
+            with self.assertRaises(FakeRospy.ROSException):
+                node._publish_locked(_target_message())
+        finally:
+            FakeRospy.shutdown_active = False
             cmd_mux_module.rospy = original_rospy
 
     def test_defaults_and_startup_validation(self):
@@ -479,18 +665,28 @@ class CmdMuxInterfaceTest(unittest.TestCase):
         self.assertEqual(DEFAULT_PARAMS["max_angular_accel"], 8.0)
         self.assertEqual(DEFAULT_PARAMS["max_dt_s"], 0.10)
         self.assertEqual(DEFAULT_PARAMS["elevator_timeout_s"], 0.25)
+        self.assertEqual(DEFAULT_PARAMS["entry_timeout_s"], 0.25)
+        self.assertEqual(DEFAULT_PARAMS["entry_max_linear_speed"], 0.40)
+        self.assertEqual(DEFAULT_PARAMS["entry_max_angular_speed"], 0.30)
+        self.assertEqual(DEFAULT_PARAMS["entry_max_linear_accel"], 4.0)
+        self.assertEqual(DEFAULT_PARAMS["entry_max_angular_accel"], 1.50)
         parameters = dict(DEFAULT_PARAMS, enable_safety=True)
         self.assertEqual(validate_parameters(parameters)["cmd_timeout_s"], 0.5)
         for name in (
             "output_rate",
             "cmd_timeout_s",
             "elevator_timeout_s",
+            "entry_timeout_s",
             "max_linear_accel",
             "max_lateral_accel",
             "max_angular_accel",
             "max_linear_speed",
             "max_lateral_speed",
             "max_angular_speed",
+            "entry_max_linear_speed",
+            "entry_max_angular_speed",
+            "entry_max_linear_accel",
+            "entry_max_angular_accel",
             "max_dt_s",
         ):
             invalid = dict(parameters, **{name: 0.0})
@@ -505,13 +701,19 @@ class CmdMuxInterfaceTest(unittest.TestCase):
         self.assertEqual(
             config["elevator_cmd_topic"], "/danger_search/elevator_cmd_vel"
         )
+        self.assertEqual(config["entry_cmd_topic"], "/danger_search/entry_cmd_vel")
         self.assertEqual(config["elevator_timeout_s"], 0.25)
+        self.assertEqual(config["entry_timeout_s"], 0.25)
         self.assertEqual(config["max_linear_speed"], 0.40)
         self.assertEqual(config["max_lateral_speed"], 0.25)
         self.assertEqual(config["max_angular_speed"], 0.80)
         self.assertEqual(config["max_linear_accel"], 3.0)
         self.assertEqual(config["max_lateral_accel"], 2.0)
         self.assertEqual(config["max_angular_accel"], 8.0)
+        self.assertEqual(config["entry_max_linear_speed"], 0.40)
+        self.assertEqual(config["entry_max_angular_speed"], 0.30)
+        self.assertEqual(config["entry_max_linear_accel"], 4.0)
+        self.assertEqual(config["entry_max_angular_accel"], 1.50)
         self.assertEqual(config["max_dt_s"], 0.10)
 
         launch = ElementTree.parse(os.path.join(package_dir, "launch", "cmd_mux.launch"))

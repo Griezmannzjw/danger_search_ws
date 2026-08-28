@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(danger_search_common)
 
+catkin_python_setup()
+
 find_package(catkin REQUIRED COMPONENTS
   actionlib_msgs
   message_generation
@@ -56,3 +58,8 @@ catkin_package(
 include_directories(
   ${catkin_INCLUDE_DIRS}
 )
+
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test/test_message_contract.py)
+  catkin_add_nosetests(test/test_short_range_safety.py)
+endif()

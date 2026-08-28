@@ -40,6 +40,10 @@ void UnitreeEscapeRecovery::initialize(
   ros::NodeHandle private_node("~/" + name_);
   private_node.param("backup_distance", backup_distance_, backup_distance_);
   private_node.param("backup_speed", backup_speed_, backup_speed_);
+  private_node.param("enable_arc", enable_arc_, enable_arc_);
+  private_node.param("arc_distance", arc_distance_, arc_distance_);
+  private_node.param("arc_linear_speed", arc_linear_speed_, arc_linear_speed_);
+  private_node.param("arc_angular_speed", arc_angular_speed_, arc_angular_speed_);
   private_node.param("enable_strafe", enable_strafe_, enable_strafe_);
   private_node.param("strafe_distance", strafe_distance_, strafe_distance_);
   private_node.param("strafe_speed", strafe_speed_, strafe_speed_);
@@ -71,8 +75,11 @@ void UnitreeEscapeRecovery::initialize(
   initialized_ = true;
   ROS_INFO(
       "[%s] Unitree escape recovery ready: backup=%.2fm@%.2fm/s "
-      "strafe=%s %.2fm@%.2fm/s max_attempts=%d",
+      "arc=%s %.2fm@%.2fm/s,%.2frad/s strafe=%s %.2fm@%.2fm/s "
+      "max_attempts=%d",
       name_.c_str(), backup_distance_, backup_speed_,
+      enable_arc_ ? "enabled" : "disabled", arc_distance_,
+      arc_linear_speed_, arc_angular_speed_,
       enable_strafe_ ? "enabled" : "disabled",
       strafe_distance_, strafe_speed_, max_attempts_per_goal_);
 }
@@ -80,7 +87,8 @@ void UnitreeEscapeRecovery::initialize(
 bool UnitreeEscapeRecovery::validConfiguration() const
 {
   const double values[] = {
-      backup_distance_, -backup_speed_, strafe_distance_, strafe_speed_,
+      backup_distance_, -backup_speed_, arc_distance_, arc_linear_speed_,
+      arc_angular_speed_, strafe_distance_, strafe_speed_,
       simulation_step_, frequency_, no_progress_timeout_, timeout_,
       progress_epsilon_};
   for (const double value : values)
@@ -96,13 +104,13 @@ bool UnitreeEscapeRecovery::validConfiguration() const
 void UnitreeEscapeRecovery::goalCallback(
     const move_base_msgs::MoveBaseActionGoal::ConstPtr& message)
 {
-  sharedState().acceptGoal(message->goal_id.id);
+  sharedState().acceptGoal(message->goal_id.id, message->goal_id.stamp);
 }
 
 void UnitreeEscapeRecovery::cancelCallback(
     const actionlib_msgs::GoalID::ConstPtr& message)
 {
-  sharedState().cancelGoal(message->id);
+  sharedState().cancelGoal(message->id, message->stamp);
 }
 
 void UnitreeEscapeRecovery::safetyCallback(
@@ -139,6 +147,14 @@ void UnitreeEscapeRecovery::publishCommand(EscapeManeuver maneuver)
   if (maneuver == EscapeManeuver::BACKUP)
   {
     command.linear.x = backup_speed_;
+  }
+  else if (maneuver == EscapeManeuver::ARC_LEFT ||
+           maneuver == EscapeManeuver::ARC_RIGHT)
+  {
+    command.linear.x = arc_linear_speed_;
+    command.angular.z = maneuver == EscapeManeuver::ARC_LEFT
+                            ? arc_angular_speed_
+                            : -arc_angular_speed_;
   }
   else if (maneuver == EscapeManeuver::STRAFE_LEFT)
   {
@@ -189,6 +205,8 @@ void UnitreeEscapeRecovery::runBehavior()
   }
 
   SweepResult backup;
+  SweepResult arc_left;
+  SweepResult arc_right;
   SweepResult left;
   SweepResult right;
   {
@@ -200,6 +218,16 @@ void UnitreeEscapeRecovery::runBehavior()
     backup = EscapeRecoveryCore::evaluateSweep(
         *costmap, footprint, start, EscapeManeuver::BACKUP,
         backup_distance_, simulation_step_);
+    if (enable_arc_)
+    {
+      const double curvature = arc_angular_speed_ / arc_linear_speed_;
+      arc_left = EscapeRecoveryCore::evaluateSweep(
+          *costmap, footprint, start, EscapeManeuver::ARC_LEFT,
+          arc_distance_, simulation_step_, curvature);
+      arc_right = EscapeRecoveryCore::evaluateSweep(
+          *costmap, footprint, start, EscapeManeuver::ARC_RIGHT,
+          arc_distance_, simulation_step_, curvature);
+    }
     if (enable_strafe_)
     {
       left = EscapeRecoveryCore::evaluateSweep(
@@ -212,7 +240,7 @@ void UnitreeEscapeRecovery::runBehavior()
   }
 
   const EscapeManeuver maneuver = EscapeRecoveryCore::selectManeuver(
-      backup, left, right, excluded);
+      backup, arc_left, arc_right, left, right, excluded);
   if (maneuver == EscapeManeuver::NONE)
   {
     ROS_ERROR(
@@ -221,8 +249,14 @@ void UnitreeEscapeRecovery::runBehavior()
     return;
   }
 
-  const double requested_distance =
-      maneuver == EscapeManeuver::BACKUP ? backup_distance_ : strafe_distance_;
+  const bool arc = maneuver == EscapeManeuver::ARC_LEFT ||
+                   maneuver == EscapeManeuver::ARC_RIGHT;
+  const double requested_distance = maneuver == EscapeManeuver::BACKUP
+                                        ? backup_distance_
+                                        : arc ? arc_distance_ : strafe_distance_;
+  const double arc_curvature = arc
+                                   ? arc_angular_speed_ / arc_linear_speed_
+                                   : 1.0;
   ROS_WARN(
       "[%s] recovery attempt %d: %s %.2fm",
       name_.c_str(), attempt, EscapeRecoveryCore::name(maneuver),
@@ -254,7 +288,8 @@ void UnitreeEscapeRecovery::runBehavior()
       ROS_ERROR("[%s] pose or local costmap became stale", name_.c_str());
       break;
     }
-    achieved = EscapeRecoveryCore::progressAlong(start, current, maneuver);
+    achieved = EscapeRecoveryCore::progressAlong(
+        start, current, maneuver, arc_curvature);
     if (achieved >= requested_distance)
     {
       succeeded = true;
@@ -280,7 +315,7 @@ void UnitreeEscapeRecovery::runBehavior()
           *costmap->getMutex());
       remaining_sweep = EscapeRecoveryCore::evaluateSweep(
           *costmap, local_costmap_->getRobotFootprint(), current,
-          maneuver, remaining, simulation_step_);
+          maneuver, remaining, simulation_step_, arc_curvature);
     }
     if (!remaining_sweep.safe)
     {

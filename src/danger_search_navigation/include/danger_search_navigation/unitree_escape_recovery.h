@@ -50,6 +50,10 @@ private:
 
   double backup_distance_{0.35};
   double backup_speed_{-0.30};
+  bool enable_arc_{true};
+  double arc_distance_{0.45};
+  double arc_linear_speed_{0.40};
+  double arc_angular_speed_{0.40};
   bool enable_strafe_{false};
   double strafe_distance_{0.30};
   double strafe_speed_{0.20};

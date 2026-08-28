@@ -5,6 +5,43 @@ import math
 import os
 
 
+DEFAULT_ENTRY_COMPLETION_TOLERANCE_M = 0.45
+
+
+def allocate_return_attempt_budget(
+        remaining_s, attempt_cap_s, retry_reserve_s,
+        terminal_reserve_s, attempts_left):
+    """Allocate one home-goal attempt without consuming the terminal budget.
+
+    ``attempts_left`` is the number of retries still available *after* the
+    attempt being allocated.  A first attempt therefore cannot occupy the
+    complete return window and starve a short, useful retry near home.
+    """
+    values = (
+        remaining_s,
+        attempt_cap_s,
+        retry_reserve_s,
+        terminal_reserve_s,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("return budget values must be finite")
+    if float(remaining_s) < 0.0:
+        raise ValueError("remaining return budget cannot be negative")
+    if float(attempt_cap_s) <= 0.0:
+        raise ValueError("return attempt cap must be positive")
+    if float(retry_reserve_s) < 0.0 or float(terminal_reserve_s) < 0.0:
+        raise ValueError("return reserves cannot be negative")
+    if int(attempts_left) < 0:
+        raise ValueError("attempts_left cannot be negative")
+    reserve = float(terminal_reserve_s)
+    if int(attempts_left) > 0:
+        reserve += float(retry_reserve_s)
+    return max(
+        0.0,
+        min(float(attempt_cap_s), float(remaining_s) - reserve),
+    )
+
+
 class MissionLifecycle:
     """Small explicit state machine used by the ROS mission manager."""
 
@@ -228,16 +265,82 @@ def next_entry_target(home_x, home_y, home_yaw, current_progress, distance, step
     )
 
 
-def normalize_result_file(path):
-    """Expand and normalize a configured absolute result path."""
+RUN_PROFILE_FORMAL = "formal"
+RUN_PROFILE_SIMULATION_TRUTH = "simulation_truth"
+RESULT_FILENAME_BY_RUN_PROFILE = {
+    RUN_PROFILE_FORMAL: "detected_danger.json",
+    RUN_PROFILE_SIMULATION_TRUTH: "detected_danger.simulation_truth.json",
+}
+
+
+def normalize_run_profile(run_profile):
+    """Return one of the explicitly supported runtime profiles."""
+    normalized = str(run_profile or RUN_PROFILE_FORMAL).strip().lower()
+    if normalized not in RESULT_FILENAME_BY_RUN_PROFILE:
+        raise ValueError("run_profile must be formal or simulation_truth")
+    return normalized
+
+
+def official_eligibility(run_profile):
+    """Only the fail-closed formal profile can produce an official result."""
+    return normalize_run_profile(run_profile) == RUN_PROFILE_FORMAL
+
+
+def result_profile_errors(document, official=False):
+    """Return profile/terminal-state violations for an evaluator result."""
+    if not isinstance(document, dict):
+        return ["result document must be a JSON object"]
+
+    errors = []
+    mission_status = document.get("mission_status")
+    localization_backend = document.get("localization_backend")
+    eligible = document.get("official_eligible")
+    raw_run_profile = document.get("run_profile")
+    if not isinstance(raw_run_profile, str) or not raw_run_profile.strip():
+        run_profile = None
+        errors.append("run_profile must be a non-empty string")
+    else:
+        try:
+            run_profile = normalize_run_profile(raw_run_profile)
+        except ValueError as exc:
+            run_profile = None
+            errors.append(str(exc))
+
+    if not isinstance(mission_status, str) or not mission_status.strip():
+        errors.append("mission_status must be a non-empty string")
+    if (not isinstance(localization_backend, str)
+            or not localization_backend.strip()):
+        errors.append("localization_backend must be a non-empty string")
+    if not isinstance(eligible, bool):
+        errors.append("official_eligible must be a boolean")
+    elif run_profile is not None and eligible != official_eligibility(run_profile):
+        errors.append("official_eligible is inconsistent with run_profile")
+
+    if official:
+        if mission_status != "FINISHED":
+            errors.append("official result requires mission_status=FINISHED")
+        if run_profile != RUN_PROFILE_FORMAL:
+            errors.append("official result requires run_profile=formal")
+        if localization_backend != "gicp":
+            errors.append("official result requires localization_backend=gicp")
+        if eligible is not True:
+            errors.append("official result requires official_eligible=true")
+    return errors
+
+
+def normalize_result_file(path, run_profile=RUN_PROFILE_FORMAL):
+    """Expand and normalize the profile-specific absolute result path."""
     expanded = os.path.expandvars(os.path.expanduser(str(path or "").strip()))
     if not expanded:
         raise ValueError("result_file is empty")
     if not os.path.isabs(expanded):
         raise ValueError("result_file must resolve to an absolute path")
     normalized = os.path.abspath(expanded)
-    if os.path.basename(normalized) != "detected_danger.json":
-        raise ValueError("result_file must end with detected_danger.json")
+    expected_basename = RESULT_FILENAME_BY_RUN_PROFILE[
+        normalize_run_profile(run_profile)
+    ]
+    if os.path.basename(normalized) != expected_basename:
+        raise ValueError("result_file must end with %s" % expected_basename)
     return normalized
 
 
@@ -248,6 +351,9 @@ def build_result_document(
     coordinate_frame="start_relative",
     robot_start=None,
     mission_status="FINISHED",
+    run_profile=RUN_PROFILE_FORMAL,
+    localization_backend="gicp",
+    finish_reason="",
 ):
     """Build the exact evaluator-facing JSON document."""
     if not math.isfinite(float(elapsed_s)) or float(elapsed_s) < 0.0:
@@ -255,6 +361,7 @@ def build_result_document(
     if len(home) != 4:
         raise ValueError("home must contain x, y, z and yaw")
     coordinate_frame = resolve_result_coordinate_frame(coordinate_frame)
+    run_profile = normalize_run_profile(run_profile)
     relative_positions = [
         task_relative_position(
             track.x,
@@ -280,6 +387,10 @@ def build_result_document(
         "exploration_time": round(float(elapsed_s), 2),
         "coordinate_frame": coordinate_frame,
         "mission_status": str(mission_status),
+        "finish_reason": str(finish_reason),
+        "run_profile": run_profile,
+        "localization_backend": str(localization_backend),
+        "official_eligible": official_eligibility(run_profile),
         "detected_danger_sources": [
             {"position": [round(x, 2), round(y, 2), round(z, 2)]}
             for x, y, z in positions

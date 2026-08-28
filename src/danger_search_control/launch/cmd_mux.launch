@@ -4,4 +4,7 @@
   <node name="cmd_mux" pkg="danger_search_control" type="cmd_mux.py" output="screen">
     <rosparam command="load" file="$(arg config_file)" />
   </node>
+  <node name="posture_safety_monitor" pkg="danger_search_control" type="posture_safety_monitor.py" output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+  </node>
 </launch>

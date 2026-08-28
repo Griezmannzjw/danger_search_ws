@@ -34,6 +34,8 @@ def make_planner(grid, resolution=1.0, min_frontier_length=1.0, free_threshold=2
     planner.free_threshold = free_threshold
     planner.connectivity_occupied_threshold = 65
     planner.connectivity_clearance_radius = 0.0
+    planner.current_floor = 0
+    planner.coverage_debt_by_floor = {}
     return planner
 
 
@@ -76,16 +78,58 @@ class SimpleFrontierTest(unittest.TestCase):
         self.assertAlmostEqual(config["connectivity_clearance_radius"], 0.30)
         self.assertAlmostEqual(config["min_frontier_length"], 0.40)
         self.assertAlmostEqual(config["goal_timeout"], 120.0)
-        self.assertAlmostEqual(config["observation_min_distance"], 0.30)
-        self.assertAlmostEqual(config["observation_target_distance"], 0.45)
-        self.assertAlmostEqual(config["observation_max_distance"], 0.70)
-        self.assertAlmostEqual(config["goal_clearance_margin"], 0.02)
+        self.assertAlmostEqual(config["max_frontier_goal_path_m"], 8.0)
+        self.assertLess(
+            MODULE.bounded_navigation_timeout(
+                config["max_frontier_goal_path_m"],
+                config["goal_timeout"],
+                config["goal_timeout_base_s"],
+                config["goal_timeout_per_path_m"],
+                config["goal_timeout_min_s"],
+            ),
+            config["goal_timeout"],
+        )
+        self.assertAlmostEqual(config["observation_min_distance"], 0.60)
+        self.assertAlmostEqual(config["observation_target_distance"], 0.70)
+        self.assertAlmostEqual(config["observation_max_distance"], 0.90)
+        self.assertFalse(config["entrance_boundary_guard_enabled"])
+        self.assertAlmostEqual(config["entrance_boundary_allowance_m"], 1.0)
+        self.assertAlmostEqual(config["goal_clearance_margin"], 0.15)
         self.assertAlmostEqual(config["path_clearance_weight"], 0.15)
         self.assertAlmostEqual(config["failed_goal_cooldown"], 15.0)
         self.assertAlmostEqual(config["failed_goal_radius"], 0.50)
+        self.assertAlmostEqual(config["min_goal_dispatch_distance_m"], 0.45)
         self.assertAlmostEqual(config["trap_blacklist_radius"], 0.70)
         self.assertAlmostEqual(config["trap_clearance_margin"], 0.08)
         self.assertEqual(config["blacklist_clear_revisions"], 2)
+        self.assertGreaterEqual(config["max_frontier_candidates"], 64)
+
+        navigation_path = (
+            pathlib.Path(__file__).parents[2]
+            / "danger_search_navigation"
+            / "config"
+            / "dwa_planner.yaml"
+        )
+        with navigation_path.open(encoding="utf-8") as stream:
+            dwa = yaml.safe_load(stream)["DWAPlannerROS"]
+        self.assertGreater(
+            config["min_goal_dispatch_distance_m"],
+            dwa["xy_goal_tolerance"],
+        )
+        self.assertLessEqual(
+            config["observation_target_distance"] + dwa["xy_goal_tolerance"],
+            config["observation_max_distance"],
+        )
+        footprint_radius = math.hypot(0.35, 0.15) + 0.04
+        self.assertGreaterEqual(
+            config["observation_min_distance"] - dwa["xy_goal_tolerance"],
+            footprint_radius,
+        )
+        self.assertGreaterEqual(
+            config["connectivity_clearance_radius"]
+            + config["goal_clearance_margin"],
+            footprint_radius,
+        )
 
     def test_recovery_trigger_is_diagnostic_and_failed_event_blacklists(self):
         planner = make_planner(np.zeros((5, 5), dtype=np.int8))
@@ -217,6 +261,48 @@ class SimpleFrontierTest(unittest.TestCase):
         self.assertGreaterEqual(frontier_x - goal["x"], 0.40 - 1e-6)
         self.assertLessEqual(frontier_x - goal["x"], 0.60 + 1e-6)
         self.assertAlmostEqual(goal["yaw"], 0.0, delta=0.25)
+
+    def test_close_frontier_clusters_do_not_starve_each_other(self):
+        planner = make_planner(
+            np.zeros((30, 30), dtype=np.int8),
+            resolution=0.10,
+            min_frontier_length=0.20,
+        )
+        planner.connectivity_clearance_radius = 0.20
+        planner.goal_clearance_margin = 0.04
+        planner.observation_min_distance = 0.60
+        planner.observation_target_distance = 0.70
+        planner.observation_max_distance = 0.80
+        planner.trap_blacklist = {}
+        planner.observation_goals_pub = None
+
+        # Two independently reachable frontier lines bound a one-metre-wide
+        # known corridor.  No cell can be 0.60 m from *both* lines, but each
+        # line still has a valid viewpoint relative to its own cluster.
+        frontier = np.zeros((30, 30), dtype=bool)
+        frontier[5:25, 9] = True
+        frontier[5:25, 19] = True
+        reachable = np.zeros_like(frontier)
+        reachable[5:25, 9:20] = True
+        global_distance = MODULE.cv2.distanceTransform(
+            (frontier == 0).astype(np.uint8),
+            MODULE.cv2.DIST_L2,
+            MODULE.cv2.DIST_MASK_PRECISE,
+        ) * planner.map_info.resolution
+        self.assertLess(float(global_distance[reachable].max()), 0.60)
+
+        goals = planner._observation_goals(frontier, reachable)
+
+        self.assertEqual(len(goals), 2)
+        required_clearance = (
+            planner.connectivity_clearance_radius
+            + planner.goal_clearance_margin
+        )
+        for goal in goals:
+            cell_x, cell_y = goal["cell"]
+            self.assertGreaterEqual(
+                float(global_distance[cell_y, cell_x]), required_clearance
+            )
 
     def test_recovery_trap_is_long_lived_and_clearance_scoped(self):
         grid = np.zeros((21, 21), dtype=np.int8)
@@ -402,6 +488,7 @@ class SimpleFrontierTest(unittest.TestCase):
 
         self.assertEqual(goal, (2.5, 0.5))
         self.assertEqual(reason, "reachable_frontier")
+        self.assertIn((0, 0, "cooldown"), planner.coverage_debt_by_floor[0])
 
     def test_reachable_frontiers_are_filtered_before_candidate_limit(self):
         grid = np.full((7, 12), 100, dtype=np.int8)
@@ -427,6 +514,147 @@ class SimpleFrontierTest(unittest.TestCase):
         self.assertEqual(goal, (9.5, 5.5))
         self.assertEqual(checked_goals, [(9.5, 5.5)])
         self.assertEqual(planner.remaining_frontier_count, 2)
+
+    def test_goal_inside_move_base_tolerance_does_not_hide_far_candidate(self):
+        planner = make_planner(np.zeros((1, 3), dtype=np.int8))
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=0.5, y=0.5)
+        )
+        planner.max_frontier_candidates = 1
+        planner.min_goal_dispatch_distance_m = 0.45
+        planner.failed_goals = []
+        planner._goal_is_cooled_down = lambda *_args: False
+        planner._frontier_mask = lambda: np.ones((1, 3), dtype=bool)
+        planner._reachable_free_mask = lambda: np.ones((1, 3), dtype=bool)
+        planner._frontier_representatives = lambda _frontier=None: [(0, 0), (2, 0)]
+        checked_goals = []
+        planner._check_path = lambda _sx, _sy, gx, gy: (
+            checked_goals.append((gx, gy)) or "reachable"
+        )
+
+        goal, reason = planner._select_goal()
+
+        self.assertEqual(reason, "reachable_frontier")
+        self.assertEqual(goal, (2.5, 0.5))
+        self.assertEqual(checked_goals, [(2.5, 0.5)])
+
+    def test_path_scoring_reaches_candidate_beyond_old_nearest_twenty(self):
+        """A geodesically short frontier must not lose to a Euclidean cutoff."""
+        planner = make_planner(np.zeros((2, 80), dtype=np.int8))
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=0.5, y=0.5)
+        )
+        planner.max_frontier_candidates = 64
+        planner.min_goal_dispatch_distance_m = 0.0
+        planner.observation_target_distance = 0.70
+        planner.failed_goals = []
+        planner.trap_blacklist = {}
+        planner._goal_is_cooled_down = lambda *_args: False
+        planner._frontier_mask = lambda: np.ones((2, 80), dtype=bool)
+        planner._reachable_free_mask = lambda: np.ones((2, 80), dtype=bool)
+        planner._frontier_representatives = lambda _frontier=None: [(1, 0)]
+        planner._observation_goals = lambda _frontier, _reachable: [
+            {
+                "x": float(index) + 0.5,
+                "y": 0.5,
+                "yaw": 0.0,
+                "gain": 0.0,
+                "clearance": 1.0,
+            }
+            for index in range(1, 22)
+        ]
+
+        def checked_path(_start_x, _start_y, goal_x, _goal_y):
+            # The first 20 straight-line-nearest candidates require a long
+            # detour.  Candidate 21 is slightly farther in Euclidean space but
+            # has the shortest valid global plan.
+            planner.last_checked_path_metrics = {
+                "path_length": 100.0 if goal_x < 21.5 else 2.0,
+                "min_clearance": 1.0,
+            }
+            return "reachable"
+
+        planner._check_path = checked_path
+
+        goal, reason = planner._select_goal()
+
+        self.assertEqual(reason, "reachable_frontier")
+        self.assertEqual(goal, (21.5, 0.5, 0.0))
+
+    def test_long_global_plan_is_dispatched_as_receding_horizon_waypoint(self):
+        planner = make_planner(np.zeros((2, 40), dtype=np.int8))
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=0.0, y=0.0)
+        )
+        planner.max_frontier_candidates = 64
+        planner.max_frontier_goal_path_m = 8.0
+        planner.min_goal_dispatch_distance_m = 0.0
+        planner.observation_target_distance = 0.70
+        planner.failed_goals = []
+        planner.trap_blacklist = {}
+        planner._goal_is_cooled_down = lambda *_args: False
+        planner._frontier_mask = lambda: np.ones((2, 40), dtype=bool)
+        planner._reachable_free_mask = lambda: np.ones((2, 40), dtype=bool)
+        planner._frontier_representatives = lambda _frontier=None: [(1, 0)]
+        planner._observation_goals = lambda _frontier, _reachable: [{
+            "x": 4.0,
+            "y": 8.0,
+            "yaw": 1.0,
+            "gain": 1.0,
+            "clearance": 1.0,
+        }]
+
+        def checked_path(*_args):
+            planner.last_checked_path_metrics = {
+                "path_length": 12.0,
+                "min_clearance": 1.0,
+                "points": [(0.0, 0.0), (6.0, 0.0), (6.0, 6.0)],
+            }
+            return "reachable"
+
+        planner._check_path = checked_path
+        goal, reason = planner._select_goal()
+
+        self.assertEqual(reason, "reachable_frontier_waypoint")
+        self.assertEqual(goal[:2], (6.0, 2.0))
+        self.assertAlmostEqual(goal[2], math.pi / 2.0)
+        self.assertEqual(planner.selected_goal_metrics["dispatch_path_length"], 8.0)
+        self.assertTrue(planner.selected_goal_metrics["truncated"])
+
+    def test_path_prefix_and_dynamic_timeout_validate_boundaries(self):
+        goal = MODULE.path_prefix_goal([(0.0, 0.0), (3.0, 4.0)], 2.5)
+        self.assertEqual(goal[:2], (1.5, 2.0))
+        self.assertAlmostEqual(goal[2], math.atan2(4.0, 3.0))
+        self.assertEqual(goal[3:], (2.5, True))
+        self.assertEqual(
+            MODULE.bounded_navigation_timeout(8.0, 120.0, 20.0, 4.0, 30.0),
+            52.0,
+        )
+        self.assertEqual(
+            MODULE.bounded_navigation_timeout(100.0, 120.0, 20.0, 4.0, 30.0),
+            120.0,
+        )
+        with self.assertRaises(ValueError):
+            MODULE.path_prefix_goal([], 8.0)
+
+    def test_only_near_frontier_waits_without_claiming_completion(self):
+        planner = make_planner(np.zeros((1, 1), dtype=np.int8))
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=0.5, y=0.5)
+        )
+        planner.max_frontier_candidates = 20
+        planner.min_goal_dispatch_distance_m = 0.45
+        planner.failed_goals = []
+        planner._goal_is_cooled_down = lambda *_args: False
+        planner._frontier_mask = lambda: np.ones((1, 1), dtype=bool)
+        planner._reachable_free_mask = lambda: np.ones((1, 1), dtype=bool)
+        planner._frontier_representatives = lambda _frontier=None: [(0, 0)]
+        planner._check_path = lambda *_args: self.fail("near goal reached make_plan")
+
+        goal, reason = planner._select_goal()
+
+        self.assertIsNone(goal)
+        self.assertEqual(reason, "frontier_already_in_observation_range")
 
     def test_inflation_disconnects_a_too_narrow_gap(self):
         grid = np.zeros((9, 9), dtype=np.int8)
@@ -480,18 +708,21 @@ class SimpleFrontierTest(unittest.TestCase):
         self.assertIsNone(goal)
         self.assertEqual(reason, "all_frontiers_unreachable_or_blacklisted")
         self.assertEqual(planner.remaining_frontier_count, 1)
+        self.assertIn((5, 1, "disconnected"), planner.coverage_debt_by_floor[0])
 
     def test_map_without_frontiers_reports_no_frontier(self):
         planner = make_planner(np.zeros((3, 3), dtype=np.int8))
         planner.current_pose = SimpleNamespace(
             position=SimpleNamespace(x=1.5, y=1.5)
         )
+        planner.coverage_debt_by_floor[0] = {(1, 1, "stale")}
 
         goal, reason = planner._select_goal()
 
         self.assertIsNone(goal)
         self.assertEqual(reason, "no_frontier")
         self.assertEqual(planner.remaining_frontier_count, 0)
+        self.assertNotIn(0, planner.coverage_debt_by_floor)
 
 
 if __name__ == "__main__":

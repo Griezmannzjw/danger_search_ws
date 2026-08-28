@@ -19,6 +19,18 @@
 真值后端、禁止话题订阅、禁止文件参数、错误服务类型、缺失传感器/TF、结果目录不可写或
 `/cmd_vel` 非唯一发布时会拒绝启动。
 
+需要先验证探索、电梯、感知和返航而暂不评估连续定位时，使用独立入口：
+
+```bash
+roslaunch danger_search_bringup simulation_truth.launch autostart:=true
+```
+
+它固定 `run_profile=simulation_truth`、`competition_mode=false`、
+`multifloor_enabled=true` 与 `localization_backend=gazebo_truth`。仅
+`/gazebo_truth_odometry` 可读取 `/gazebo/link_states` 的 `a1_gazebo::base`；楼层身份仍只
+来自电梯服务。真值模式输出到
+`SimEnv/results/detected_danger.simulation_truth.json`，绝不可作为正式通过证据。
+
 ## 系统闭环
 
 ```text
@@ -86,6 +98,8 @@ roslaunch danger_search_bringup competition.launch autostart:=true
 | 名称 | 类型 | 语义 |
 |---|---|---|
 | `/mapping/status` | `danger_search_common/MappingStatus` | 当前层、`transitioning`、`map_epoch`、`floor_z_m` 和稳定性 |
+| `/mapping/active_map` | `danger_search_common/FloorOccupancyGrid` | 与 `/map` 相同栅格的原子 floor/epoch/version envelope；多楼层探索以此为权威输入 |
+| `/navigation/health` | `danger_search_common/NavigationHealth` | 已核验的 floor/epoch/version 与 `transitioning` 门禁；未就绪时必须拒绝新 goal |
 | `/localization/switch_floor` | `danger_search_common/SwitchFloor` | 以 `transition_id` 幂等切换楼层地图并重置 GICP 参考 |
 | `/danger_search/transit_floor` | `danger_search_common/TransitFloorAction` | 复用的完整换层动作；探索和返航共同调用 |
 | `/move_base` | `move_base_msgs/MoveBaseAction` | 普通二维导航目标 |
@@ -124,6 +138,9 @@ roslaunch danger_search_bringup competition.launch autostart:=true
   "exploration_time": 98.76,
   "coordinate_frame": "world",
   "mission_status": "FINISHED",
+  "run_profile": "formal",
+  "localization_backend": "gicp",
+  "official_eligible": true,
   "detected_danger_sources": [
     {"position": [2.34, -1.56, 0.25]}
   ]

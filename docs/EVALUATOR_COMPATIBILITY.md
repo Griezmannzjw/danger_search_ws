@@ -11,8 +11,11 @@ SimEnv evaluator 的必要输入保持不变：
 }
 ```
 
-本实现新增顶层 `coordinate_frame` 和 `mission_status`，不修改必要字段。当前 SimEnv
-evaluator 以键读取上述必要字段，因此可忽略新增元数据。
+本实现新增顶层 `coordinate_frame`、`mission_status`、`run_profile`、
+`localization_backend` 和 `official_eligible`，不修改必要字段。当前 SimEnv evaluator 以键
+读取必要字段，因此可忽略新增元数据；但本队的正式验收入口必须先检查
+`official_eligible=true`、`run_profile=formal` 和 `localization_backend=gicp`。任何
+`simulation_truth` 结果即使能被通用 evaluator 评分，也不得标为正式通过。
 
 ## 坐标
 
@@ -29,6 +32,17 @@ evaluator 以键读取上述必要字段，因此可忽略新增元数据。
 ## 两套离线评估
 
 评估只能在算法进程退出后由独立测试端读取真值：
+
+```bash
+rosrun danger_search_mission validate_result.py --official \
+  /home/ruilinli/SimEnv/results/detected_danger.json
+```
+
+验收脚本必须先检查上述命令退出码；非 0 时不得继续正式评分。该门禁要求任务状态为
+`FINISHED`、profile 为 `formal`、后端为 `gicp` 且 `official_eligible=true`，因此
+`detected_danger.simulation_truth.json` 必然无法通过 `--official`。
+
+门禁通过后再运行 evaluator：
 
 ```bash
 python3 /home/ruilinli/SimEnv/src/building_obstacles/scripts/evaluate_danger.py \

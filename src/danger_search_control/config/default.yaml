@@ -4,14 +4,26 @@
 # 话题
 nav_cmd_topic: /danger_search/nav_cmd_vel
 elevator_cmd_topic: /danger_search/elevator_cmd_vel
+entry_cmd_topic: /danger_search/entry_cmd_vel
 output_cmd_topic: /cmd_vel
 sent_cmd_topic: /danger_search/cmd_vel_sent
 safety_stop_topic: /danger_search/safety_stop
+posture_fallen_topic: /danger_search/posture_fallen
+posture_reason_topic: /danger_search/posture_safety_reason
+posture_reset_service: /danger_search/reset_posture_safety
+imu_topic: /trunk_imu
 
 # 安全参数
 enable_safety: true
+posture_tilt_limit_deg: 30.0
+posture_trigger_hold_s: 0.18
+posture_recovery_tilt_deg: 15.0
+posture_recovery_hold_s: 2.0
+posture_imu_timeout_s: 0.25
+posture_monitor_rate: 50.0
 cmd_timeout_s: 0.5
 elevator_timeout_s: 0.25
+entry_timeout_s: 0.25
 
 # 速度和加速度上限
 max_linear_accel: 3.0
@@ -20,6 +32,14 @@ max_angular_accel: 8.0
 max_linear_speed: 0.40
 max_lateral_speed: 0.25
 max_angular_speed: 0.80
+# 8 cm 门槛实测闭环：vx=0.40、|wz|<=0.30；进场禁止横移。
+entry_max_linear_speed: 0.40
+entry_max_angular_speed: 0.30
+# Reach the validated 0.40m/s gait within 0.10s.  This remains acceleration
+# bounded, but avoids dwelling in the controller's experimentally unstable
+# 0.10--0.25m/s command band during apron crossing.
+entry_max_linear_accel: 4.0
+entry_max_angular_accel: 1.50
 max_dt_s: 0.10
 
 # 控制频率

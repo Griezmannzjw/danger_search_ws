@@ -13,14 +13,17 @@ oscillation_timeout: 8.0
 oscillation_distance: 0.10
 shutdown_costmaps: false
 recovery_behavior_enabled: true
-clearing_rotation_allowed: true
+# Never let move_base synthesize its stock full-circle RotateRecovery.  The
+# upstream behavior has no goal-preemption/safety-stop hook or execution
+# timeout.  Goal-facing turns remain footprint-checked inside DWA, using the
+# physically calibrated 0.40 rad/s in-place command.
+clearing_rotation_allowed: false
 make_plan_clear_costmap: false
 make_plan_add_unreachable_goal: false
 
 recovery_behaviors:
   - {name: conservative_reset, type: clear_costmap_recovery/ClearCostmapRecovery}
   - {name: escape_recovery_1, type: danger_search_navigation/UnitreeEscapeRecovery}
-  - {name: rotate_recovery, type: rotate_recovery/RotateRecovery}
   - {name: aggressive_reset, type: clear_costmap_recovery/ClearCostmapRecovery}
   - {name: escape_recovery_2, type: danger_search_navigation/UnitreeEscapeRecovery}
 
@@ -43,6 +46,13 @@ aggressive_reset:
 escape_recovery_1: &unitree_escape
   backup_distance: 0.35
   backup_speed: -0.30
+  # A footprint-swept forward arc changes heading without the corner sweep of
+  # an in-place rotation. Gazebo response calibration passed the combined
+  # 0.40m/s + 0.40rad/s command; the opposite arc is the second bounded try.
+  enable_arc: true
+  arc_distance: 0.45
+  arc_linear_speed: 0.40
+  arc_angular_speed: 0.40
   # The formal RL controller does not move measurably for the safe 0.20--0.25
   # m/s lateral range.  Never select a collision-free but physically inert
   # strafe as recovery progress.
@@ -58,10 +68,6 @@ escape_recovery_1: &unitree_escape
 
 escape_recovery_2:
   <<: *unitree_escape
-
-rotate_recovery:
-  sim_granularity: 0.025
-  frequency: 20.0
 
 NavfnROS:
   allow_unknown: false

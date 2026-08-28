@@ -89,6 +89,7 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_navigation_core.py)
   catkin_add_nosetests(test/test_navigation_monitor.py)
   catkin_add_nosetests(test/test_navigation_monitor_callbacks.py)
+  catkin_add_nosetests(test/test_navigation_config_guard.py)
   catkin_add_nosetests(test/test_standard_config.py)
   catkin_add_gtest(test_escape_recovery
     test/test_escape_recovery.cpp

@@ -16,6 +16,8 @@ from danger_search_common.msg import (
     MappingStatus,
     MissionStatus,
     NavigationHealth,
+    TransitFloorAction,
+    TransitFloorResult,
 )
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from move_base_msgs.msg import MoveBaseAction, MoveBaseResult
@@ -23,7 +25,7 @@ from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger, TriggerResponse
 
 
-RESULT_FILE = "/tmp/danger_search_mission_smoke/detected_danger.json"
+RESULT_FILE = "/tmp/danger_search_mission_smoke/detected_danger.simulation_truth.json"
 
 
 class MissionSmokeTest(unittest.TestCase):
@@ -81,6 +83,13 @@ class MissionSmokeTest(unittest.TestCase):
             auto_start=False,
         )
         self.move_base_server.start()
+        self.transit_floor_server = actionlib.SimpleActionServer(
+            "/danger_search/transit_floor",
+            TransitFloorAction,
+            execute_cb=self._execute_transit,
+            auto_start=False,
+        )
+        self.transit_floor_server.start()
         self.health_timer = rospy.Timer(rospy.Duration(0.05), self._publish_health)
 
     def tearDown(self):
@@ -112,6 +121,13 @@ class MissionSmokeTest(unittest.TestCase):
         self._publish_health(None)
         rospy.sleep(0.05)
         self.move_base_server.set_succeeded(MoveBaseResult())
+
+    def _execute_transit(self, _goal):
+        result = TransitFloorResult()
+        result.success = True
+        result.reached_floor = 0
+        result.message = "synthetic floor transit ready"
+        self.transit_floor_server.set_succeeded(result)
 
     def _publish_health(self, _event):
         now = rospy.Time.now()
@@ -229,6 +245,9 @@ class MissionSmokeTest(unittest.TestCase):
             [{"position": [1.0, 0.0, 0.15]}],
         )
         self.assertGreaterEqual(result["exploration_time"], 0.0)
+        self.assertEqual(result["run_profile"], "simulation_truth")
+        self.assertEqual(result["localization_backend"], "gazebo_truth")
+        self.assertFalse(result["official_eligible"])
 
 
 if __name__ == "__main__":

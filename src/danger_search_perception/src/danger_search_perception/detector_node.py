@@ -83,8 +83,11 @@ class DangerDetectorNode:
         self.verify_floor_height = bool(
             rospy.get_param(
                 "~verify_floor_height",
-                self.require_stable_mapping
-                and self.target_frame == self.map_frame,
+                # Floor identity is supplied by the explicit elevator/map
+                # transition contract.  A continuous pose z is at most a
+                # diagnostic cross-check, especially in Gazebo truth mode;
+                # it must not become an implicit floor-switching input.
+                False,
             )
         )
         self.floor_height_classifier = FloorHeightClassifier(
@@ -143,6 +146,12 @@ class DangerDetectorNode:
         self.last_floor_context_epoch = -1
         self.last_floor_context_reason = "WAITING_FOR_FLOOR_CONTEXT"
         self.state_lock = threading.Lock()
+        # A queued synchronizer/timer callback can run while roslaunch is
+        # closing publishers.  Keep a node-local latch in addition to
+        # rospy.is_shutdown() so those callbacks never publish through an
+        # already unregistered endpoint.
+        self._shutdown_requested = False
+        self.status_timer = None
 
         self.detections_pub = rospy.Publisher(
             self.detections_topic, DangerSourceArray, queue_size=10
@@ -177,6 +186,7 @@ class DangerDetectorNode:
         self.status_timer = rospy.Timer(
             rospy.Duration(0.5), self._publish_status
         )
+        rospy.on_shutdown(self._on_shutdown)
 
         rospy.loginfo(
             "[perception] danger_detector started: RGB=%s depth=%s "
@@ -190,7 +200,43 @@ class DangerDetectorNode:
             self.require_stable_mapping,
         )
 
+    def _is_shutting_down(self):
+        """Return whether callbacks must no longer touch ROS endpoints."""
+        return bool(getattr(self, "_shutdown_requested", False)) or rospy.is_shutdown()
+
+    def _on_shutdown(self):
+        """Stop the timer before ROS unregisters this node's publishers."""
+        self._shutdown_requested = True
+        timer = getattr(self, "status_timer", None)
+        if timer is None:
+            return
+        try:
+            timer.shutdown()
+        except rospy.ROSException:
+            # rospy may already have removed the timer while invoking this
+            # hook.  The local latch still prevents a queued callback publish.
+            pass
+
+    def _publish_if_running(self, publisher, message):
+        """Publish unless shutdown owns the endpoint.
+
+        Only the known race where shutdown begins after the initial check is
+        suppressed.  Transport failures during normal operation must remain
+        visible instead of being hidden as a shutdown condition.
+        """
+        if self._is_shutting_down():
+            return False
+        try:
+            publisher.publish(message)
+        except rospy.ROSException:
+            if self._is_shutting_down():
+                return False
+            raise
+        return True
+
     def _sensor_callback(self, rgb_msg, depth_msg, camera_info_msg):
+        if self._is_shutting_down():
+            return
         with self.state_lock:
             self.has_synchronized_input = True
             self.last_input_stamp = rgb_msg.header.stamp
@@ -416,6 +462,8 @@ class DangerDetectorNode:
         return danger
 
     def _mapping_status_callback(self, message):
+        if self._is_shutting_down():
+            return
         self.mapping_gate.update(
             message.ready,
             message.stable,
@@ -436,6 +484,8 @@ class DangerDetectorNode:
             self.current_floor = int(message.current_floor)
 
     def _localization_status_callback(self, message):
+        if self._is_shutting_down():
+            return
         changed = self.correction_gate.update(
             message.correction_version,
             rospy.Time.now().to_sec(),
@@ -457,6 +507,7 @@ class DangerDetectorNode:
                 ),
                 confidence=danger.confidence,
                 stamp_s=stamp.to_sec(),
+                map_epoch=int(danger.map_epoch),
             )
             for danger in dangers
         ]
@@ -507,10 +558,15 @@ class DangerDetectorNode:
             return None
 
     def _publish(self, output):
+        if self._is_shutting_down():
+            return False
         if self.pipeline_config.publish_empty_array or output.dangers:
-            self.detections_pub.publish(output)
+            return self._publish_if_running(self.detections_pub, output)
+        return False
 
     def _publish_status(self, _event=None):
+        if self._is_shutting_down():
+            return False
         now = rospy.Time.now()
         status = DetectionStatus()
         status.header.stamp = now
@@ -596,7 +652,7 @@ class DangerDetectorNode:
         else:
             status.status_reason = "OK"
 
-        self.status_pub.publish(status)
+        return self._publish_if_running(self.status_pub, status)
 
     @staticmethod
     def _camera_frame(rgb_msg, depth_msg, camera_info_msg):

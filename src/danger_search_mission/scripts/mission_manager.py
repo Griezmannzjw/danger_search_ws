@@ -20,18 +20,38 @@ from danger_search_common.msg import (
     TransitFloorAction,
     TransitFloorGoal,
 )
+from danger_search_common.short_range_safety import (
+    swept_arc_footprint_hit,
+    swept_footprint_hit,
+    swept_footprint_hits,
+)
+from danger_search_mission.entry_core import (
+    CrossingReference,
+    ProgressWatchdog,
+    YawErrorFilter,
+    command_is_zero,
+    crossing_command,
+    margin_avoidance_command,
+    normalize_angle,
+    quaternion_roll_pitch,
+    rolling_sweep_distance,
+)
 from danger_search_mission.mission_core import (
+    allocate_return_attempt_budget,
     build_result_document,
     DangerTrackStore,
+    DEFAULT_ENTRY_COMPLETION_TOLERANCE_M,
     entry_progress,
     MissionLifecycle,
     next_entry_target,
+    normalize_run_profile,
     normalize_result_file,
     parse_public_scene_contract,
     resolve_result_coordinate_frame,
 )
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger, TriggerResponse
 
@@ -77,6 +97,14 @@ class MissionManager:
         self.sent_cmd_topic = rospy.get_param(
             "~sent_cmd_topic", "/danger_search/cmd_vel_sent"
         )
+        self.entry_cmd_topic = rospy.get_param(
+            "~entry_cmd_topic", "/danger_search/entry_cmd_vel"
+        )
+        self.scan_topic = rospy.get_param("~scan_topic", "/localization/scan")
+        self.imu_topic = rospy.get_param("~imu_topic", "/trunk_imu")
+        self.safety_stop_topic = rospy.get_param(
+            "~safety_stop_topic", "/danger_search/safety_stop"
+        )
 
         self.start_exploration_service = rospy.get_param(
             "~start_exploration_service", "/danger_search/start_exploration"
@@ -101,8 +129,11 @@ class MissionManager:
         )
 
         try:
+            self.run_profile = normalize_run_profile(rospy.get_param(
+                "~run_profile", rospy.get_param("/run_profile", "formal")
+            ))
             self.result_file = normalize_result_file(
-                rospy.get_param("~result_file", "")
+                rospy.get_param("~result_file", ""), self.run_profile
             )
             self.tracker = DangerTrackStore(
                 dedup_distance_m=float(rospy.get_param("~dedup_distance", 0.8)),
@@ -116,6 +147,22 @@ class MissionManager:
             "~preflight_wait_timeout_s", 20.0
         )
         self.return_timeout_s = self._positive_param("~return_timeout_s", 120.0)
+        self.return_attempt_timeout_s = self._positive_param(
+            "~return_attempt_timeout_s", 150.0
+        )
+        self.return_retry_reserve_s = self._nonnegative_param(
+            "~return_retry_reserve_s", 15.0
+        )
+        self.return_terminal_reserve_s = self._positive_param(
+            "~return_terminal_reserve_s", 5.0
+        )
+        self.return_min_attempt_timeout_s = self._positive_param(
+            "~return_min_attempt_timeout_s", 5.0
+        )
+        if self.return_attempt_timeout_s > self.return_timeout_s:
+            raise rospy.ROSInitException(
+                "~return_attempt_timeout_s cannot exceed ~return_timeout_s"
+            )
         self.return_position_tolerance_m = self._positive_param(
             "~return_position_tolerance_m", 0.5
         )
@@ -127,6 +174,9 @@ class MissionManager:
         )
         self.return_verify_timeout_s = self._positive_param(
             "~return_verify_timeout_s", 15.0
+        )
+        self.return_retry_delay_s = self._positive_param(
+            "~return_retry_delay_s", 0.3
         )
         self.return_stationary_linear_mps = self._nonnegative_param(
             "~return_stationary_linear_mps", 0.02
@@ -164,10 +214,103 @@ class MissionManager:
             "~entry_health_settle_s", 0.3
         )
         self.entry_completion_tolerance_m = self._nonnegative_param(
-            "~entry_completion_tolerance_m", 0.25
+            "~entry_completion_tolerance_m", DEFAULT_ENTRY_COMPLETION_TOLERANCE_M
         )
         self.entry_min_progress_m = self._nonnegative_param(
             "~entry_min_progress_m", 0.10
+        )
+        self.entry_short_range_enabled = bool(rospy.get_param(
+            "~entry_short_range_enabled", True
+        ))
+        self.entry_crossing_distance_m = self._positive_param(
+            "~entry_crossing_distance_m", 3.75
+        )
+        self.entry_crossing_speed_mps = self._positive_param(
+            "~entry_crossing_speed_mps", 0.40
+        )
+        self.entry_crossing_max_angular_speed_rps = self._nonnegative_param(
+            "~entry_crossing_max_angular_speed_rps", 0.30
+        )
+        self.entry_crossing_yaw_gain = self._nonnegative_param(
+            "~entry_crossing_yaw_gain", 1.50
+        )
+        self.entry_crossing_yaw_deadband_rad = self._nonnegative_param(
+            "~entry_crossing_yaw_deadband_rad", 0.05
+        )
+        self.entry_crossing_yaw_lowpass_alpha = self._unit_interval_param(
+            "~entry_crossing_yaw_lowpass_alpha", 0.25
+        )
+        self.entry_crossing_lateral_gain = self._nonnegative_param(
+            "~entry_crossing_lateral_gain", 0.80
+        )
+        self.entry_crossing_max_lateral_error_m = self._positive_param(
+            "~entry_crossing_max_lateral_error_m", 0.35
+        )
+        self.entry_crossing_max_yaw_error_rad = self._positive_param(
+            "~entry_crossing_max_yaw_error_rad", 0.45
+        )
+        self.entry_crossing_max_tilt_rad = self._positive_param(
+            "~entry_crossing_max_tilt_rad", 0.30
+        )
+        self.entry_crossing_timeout_s = self._positive_param(
+            "~entry_crossing_timeout_s", 35.0
+        )
+        self.entry_crossing_input_timeout_s = self._positive_param(
+            "~entry_crossing_input_timeout_s", 0.75
+        )
+        self.entry_crossing_prepare_zero_s = self._positive_param(
+            "~entry_crossing_prepare_zero_s", 0.50
+        )
+        self.entry_crossing_handoff_zero_s = self._positive_param(
+            "~entry_crossing_handoff_zero_s", 0.50
+        )
+        self.entry_crossing_release_s = self._positive_param(
+            "~entry_crossing_release_s", 0.35
+        )
+        self.entry_crossing_stall_increment_m = self._positive_param(
+            "~entry_crossing_stall_increment_m", 0.03
+        )
+        self.entry_crossing_stall_timeout_s = self._positive_param(
+            "~entry_crossing_stall_timeout_s", 6.0
+        )
+        self.entry_crossing_sweep_enabled = bool(rospy.get_param(
+            "~entry_crossing_sweep_enabled", True
+        ))
+        self.entry_crossing_sweep_lookahead_m = self._positive_param(
+            "~entry_crossing_sweep_lookahead_m", 0.80
+        )
+        self.entry_footprint_min_x = float(rospy.get_param(
+            "~entry_footprint_min_x", -0.35
+        ))
+        self.entry_footprint_max_x = float(rospy.get_param(
+            "~entry_footprint_max_x", 0.30
+        ))
+        self.entry_footprint_min_y = float(rospy.get_param(
+            "~entry_footprint_min_y", -0.15
+        ))
+        self.entry_footprint_max_y = float(rospy.get_param(
+            "~entry_footprint_max_y", 0.15
+        ))
+        self.entry_footprint_margin_m = self._nonnegative_param(
+            "~entry_footprint_margin_m", 0.05
+        )
+        self.entry_margin_avoidance_speed_mps = self._positive_param(
+            "~entry_margin_avoidance_speed_mps", 0.25
+        )
+        self.entry_margin_avoidance_yaw_rps = self._positive_param(
+            "~entry_margin_avoidance_yaw_rps", 0.08
+        )
+        self.entry_margin_avoidance_lookahead_m = self._positive_param(
+            "~entry_margin_avoidance_lookahead_m", 0.30
+        )
+        self.entry_margin_min_side_clearance_m = self._positive_param(
+            "~entry_margin_min_side_clearance_m", 0.01
+        )
+        self.entry_margin_release_hysteresis_m = self._nonnegative_param(
+            "~entry_margin_release_hysteresis_m", 0.02
+        )
+        self.entry_arc_sweep_sample_spacing_m = self._positive_param(
+            "~entry_arc_sweep_sample_spacing_m", 0.01
         )
         self.entry_max_retries = int(rospy.get_param("~entry_max_retries", 8))
         if self.entry_max_retries < 0:
@@ -176,6 +319,55 @@ class MissionManager:
             raise rospy.ROSInitException(
                 "~entry_completion_tolerance_m must be smaller than entry distance"
             )
+        if self.entry_crossing_distance_m >= self.entry_distance_m:
+            raise rospy.ROSInitException(
+                "~entry_crossing_distance_m must be smaller than entry distance"
+            )
+        if (self.entry_short_range_enabled
+                and self.entry_crossing_distance_m + 1e-9
+                < self.entry_distance_m - self.entry_completion_tolerance_m):
+            raise rospy.ROSInitException(
+                "~entry_crossing_distance_m must reach the entry completion "
+                "boundary before move_base handoff"
+            )
+        if self.entry_crossing_yaw_deadband_rad >= self.entry_crossing_max_yaw_error_rad:
+            raise rospy.ROSInitException(
+                "~entry_crossing_yaw_deadband_rad must be smaller than "
+                "~entry_crossing_max_yaw_error_rad"
+            )
+        if self.entry_crossing_sweep_lookahead_m > self.entry_crossing_distance_m:
+            raise rospy.ROSInitException(
+                "~entry_crossing_sweep_lookahead_m must not exceed the "
+                "crossing distance"
+            )
+        if self.entry_margin_avoidance_speed_mps > self.entry_crossing_speed_mps:
+            raise rospy.ROSInitException(
+                "~entry_margin_avoidance_speed_mps must not exceed crossing speed"
+            )
+        if (self.entry_margin_avoidance_yaw_rps
+                > self.entry_crossing_max_angular_speed_rps):
+            raise rospy.ROSInitException(
+                "~entry_margin_avoidance_yaw_rps must not exceed crossing yaw limit"
+            )
+        if (self.entry_margin_avoidance_lookahead_m
+                > self.entry_crossing_sweep_lookahead_m):
+            raise rospy.ROSInitException(
+                "~entry_margin_avoidance_lookahead_m must not exceed sweep lookahead"
+            )
+        if self.entry_arc_sweep_sample_spacing_m > 0.01:
+            raise rospy.ROSInitException(
+                "~entry_arc_sweep_sample_spacing_m must be at most 0.01m"
+            )
+        footprint = (
+            self.entry_footprint_min_x,
+            self.entry_footprint_max_x,
+            self.entry_footprint_min_y,
+            self.entry_footprint_max_y,
+        )
+        if (not all(math.isfinite(value) for value in footprint)
+                or self.entry_footprint_min_x >= self.entry_footprint_max_x
+                or self.entry_footprint_min_y >= self.entry_footprint_max_y):
+            raise rospy.ROSInitException("entry footprint is invalid")
         self.mission_timeout_s = self._nonnegative_param("~mission_timeout_s", 0.0)
         self.input_timeout_s = self._positive_param("~input_timeout_s", 2.0)
         self.entry_enabled = bool(rospy.get_param("~entry_enabled", True))
@@ -194,12 +386,20 @@ class MissionManager:
         self.require_preflight_ready = bool(rospy.get_param(
             "~require_preflight_ready", self.competition_mode
         ))
-        if self.competition_mode and (
-                not self.multifloor_enabled or self.localization_backend != "gicp"):
+        if self.run_profile == "formal" and (
+                not self.competition_mode or not self.multifloor_enabled
+                or self.localization_backend != "gicp"):
             raise rospy.ROSInitException(
-                "competition mission requires multifloor GICP runtime"
+                "formal mission requires competition_mode=true, multifloor GICP runtime"
             )
-        if self.competition_mode and not self.scene_contract:
+        if self.run_profile == "simulation_truth" and (
+                self.competition_mode or not self.multifloor_enabled
+                or self.localization_backend != "gazebo_truth"):
+            raise rospy.ROSInitException(
+                "simulation_truth mission requires competition_mode=false, "
+                "multifloor gazebo_truth runtime"
+            )
+        if self.run_profile == "formal" and not self.scene_contract:
             raise rospy.ROSInitException(
                 "competition mission requires public team_scene_info.json"
             )
@@ -225,10 +425,15 @@ class MissionManager:
         self.last_detection_status_time = rospy.Time(0)
         self.remaining_frontier_count = 0
         self.map_coverage_summary = ""
+        self.topology_debt_summary = ""
         self.return_goal_active = False
         self.transit_goal_active = False
         self.return_goal_attempts = 0
+        self.return_goal_deadline = rospy.Time(0)
         self.return_epoch = 0
+        self.return_retry_at = rospy.Time(0)
+        self.return_retry_reason = ""
+        self.return_trigger_reason = ""
         self.return_verify_since = rospy.Time(0)
         self.return_verify_deadline = rospy.Time(0)
         self.entry_goal_active = False
@@ -238,11 +443,32 @@ class MissionManager:
         self.entry_retry_count = 0
         self.entry_retry_at = rospy.Time(0)
         self.entry_waiting_for_localization = False
+        self.entry_short_range_phase = "INACTIVE"
+        self.entry_short_range_epoch = 0
+        self.entry_short_range_phase_time = rospy.Time(0)
+        self.entry_short_range_started_at = rospy.Time(0)
+        self.entry_progress_watchdog = ProgressWatchdog(
+            self.entry_crossing_stall_increment_m,
+            self.entry_crossing_stall_timeout_s,
+        )
+        self.entry_crossing_reference = None
+        self.entry_margin_avoidance_side = 0.0
+        self.entry_crossing_yaw_filter = YawErrorFilter(
+            self.entry_crossing_yaw_deadband_rad,
+            self.entry_crossing_yaw_lowpass_alpha,
+        )
+        self.latest_entry_scan = None
+        self.last_entry_scan_time = rospy.Time(0)
+        self.latest_entry_imu = None
+        self.last_entry_imu_time = rospy.Time(0)
+        self.safety_stop_active = False
+        self.safety_abort_started = False
         self.entrance_ready = not self.require_entrance_ready
         self.preflight_ready = not self.require_preflight_ready
         self.last_sent_cmd = Twist()
         self.last_sent_cmd_time = rospy.Time(0)
         self.exploration_completion_armed = False
+        self.shutting_down = False
         self.finalized = False
         self.autostart_attempted = False
 
@@ -251,6 +477,9 @@ class MissionManager:
         )
         self.active_pub = rospy.Publisher(
             self.mission_active_topic, Bool, queue_size=10, latch=True
+        )
+        self.entry_cmd_pub = rospy.Publisher(
+            self.entry_cmd_topic, Twist, queue_size=2
         )
         self.entrance_ready_sub = rospy.Subscriber(
             self.entrance_ready_topic, Bool, self._entrance_ready_callback, queue_size=2
@@ -263,6 +492,15 @@ class MissionManager:
         )
         self.sent_cmd_sub = rospy.Subscriber(
             self.sent_cmd_topic, Twist, self._sent_cmd_callback, queue_size=10
+        )
+        self.entry_scan_sub = rospy.Subscriber(
+            self.scan_topic, LaserScan, self._entry_scan_callback, queue_size=2
+        )
+        self.entry_imu_sub = rospy.Subscriber(
+            self.imu_topic, Imu, self._entry_imu_callback, queue_size=10
+        )
+        self.safety_stop_sub = rospy.Subscriber(
+            self.safety_stop_topic, Bool, self._safety_stop_callback, queue_size=5
         )
 
         self.start_explore_client = rospy.ServiceProxy(
@@ -332,6 +570,9 @@ class MissionManager:
         )
 
         self.status_timer = rospy.Timer(rospy.Duration(0.5), self._timer_callback)
+        self.entry_control_timer = rospy.Timer(
+            rospy.Duration(0.05), self._entry_control_timer_callback
+        )
         rospy.on_shutdown(self._on_shutdown)
         self._publish_status()
         self.active_pub.publish(Bool(data=False))
@@ -378,6 +619,13 @@ class MissionManager:
             raise rospy.ROSInitException("%s must be non-negative and finite" % name)
         return value
 
+    @staticmethod
+    def _unit_interval_param(name, default):
+        value = float(rospy.get_param(name, default))
+        if not math.isfinite(value) or not 0.0 < value <= 1.0:
+            raise rospy.ROSInitException("%s must be in (0, 1]" % name)
+        return value
+
     @property
     def mission_state(self):
         return self.lifecycle.state
@@ -415,6 +663,72 @@ class MissionManager:
             self.last_sent_cmd = copy.deepcopy(message)
             self.last_sent_cmd_time = rospy.Time.now()
 
+    def _entry_scan_callback(self, message):
+        values = (
+            message.angle_min,
+            message.angle_increment,
+            message.range_min,
+            message.range_max,
+        )
+        if (not message.ranges
+                or not all(math.isfinite(float(value)) for value in values)
+                or message.angle_increment == 0.0
+                or message.range_min < 0.0
+                or message.range_max <= message.range_min):
+            return
+        with self.lock:
+            self.latest_entry_scan = copy.deepcopy(message)
+            self.last_entry_scan_time = rospy.Time.now()
+
+    def _entry_imu_callback(self, message):
+        orientation = message.orientation
+        try:
+            quaternion_roll_pitch(
+                orientation.x,
+                orientation.y,
+                orientation.z,
+                orientation.w,
+            )
+        except ValueError:
+            return
+        with self.lock:
+            self.latest_entry_imu = copy.deepcopy(message)
+            self.last_entry_imu_time = rospy.Time.now()
+
+    def _safety_stop_callback(self, message):
+        abort = False
+        with self.lock:
+            self.safety_stop_active = bool(message.data)
+            abort = (
+                self.safety_stop_active
+                and not self.safety_abort_started
+                and not self.finalized
+                and self.mission_state in (
+                    MissionLifecycle.ENTERING,
+                    MissionLifecycle.EXPLORING,
+                    MissionLifecycle.RETURNING,
+                )
+            )
+            if abort:
+                self.safety_abort_started = True
+        if abort:
+            thread = threading.Thread(
+                target=self._abort_for_safety_stop,
+                name="mission_safety_abort",
+            )
+            thread.daemon = True
+            thread.start()
+
+    def _abort_for_safety_stop(self):
+        self._stop_entry_crossing()
+        self.move_base_client.cancel_all_goals()
+        self.transit_floor_client.cancel_all_goals()
+        try:
+            self.stop_explore_client()
+        except (rospy.ROSException, rospy.ServiceException) as exc:
+            rospy.logwarn("[mission] safety stop exploration failed: %s", str(exc))
+        self._finalize("posture_safety_stop", error=True)
+
     def _mapping_status_callback(self, message):
         with self.lock:
             self.mapping_status = copy.deepcopy(message)
@@ -447,6 +761,10 @@ class MissionManager:
                 "known_grid_ratio=%.3f" % float(ratio)
                 if ratio is not None and math.isfinite(float(ratio))
                 else ""
+            )
+            debt_count = max(0, int(payload.get("coverage_debt_count", 0)))
+            self.topology_debt_summary = (
+                "coverage_debt=%d" % debt_count if debt_count else ""
             )
 
     def _detections_callback(self, message):
@@ -508,6 +826,9 @@ class MissionManager:
             detection_time = self.last_detection_status_time
             entrance_ready = self.entrance_ready
             preflight_ready = self.preflight_ready
+            safety_stop = self.safety_stop_active
+        if safety_stop:
+            return "safety_stop_active"
         if self.require_preflight_ready and not preflight_ready:
             return "competition_preflight_not_ready"
         if self.require_entrance_ready and not entrance_ready:
@@ -592,6 +913,10 @@ class MissionManager:
             self.return_goal_active = False
             self.transit_goal_active = False
             self.return_goal_attempts = 0
+            self.return_goal_deadline = rospy.Time(0)
+            self.return_retry_at = rospy.Time(0)
+            self.return_retry_reason = ""
+            self.return_trigger_reason = ""
             self.return_epoch += 1
             self.return_verify_since = rospy.Time(0)
             self.return_verify_deadline = rospy.Time(0)
@@ -602,10 +927,19 @@ class MissionManager:
             self.entry_retry_count = 0
             self.entry_retry_at = rospy.Time(0)
             self.entry_waiting_for_localization = False
+            self.entry_short_range_phase = "INACTIVE"
+            self.entry_short_range_epoch += 1
+            self.entry_short_range_phase_time = rospy.Time(0)
+            self.entry_short_range_started_at = rospy.Time(0)
+            self.entry_crossing_reference = None
+            self.entry_margin_avoidance_side = 0.0
+            self.entry_crossing_yaw_filter.reset()
             self.exploration_completion_armed = False
             self.finalized = False
+            self.safety_abort_started = False
             self.remaining_frontier_count = 0
             self.map_coverage_summary = ""
+            self.topology_debt_summary = ""
         try:
             self._write_result_file(
                 mission_status="RUNNING", finish_override=self.start_time
@@ -616,12 +950,15 @@ class MissionManager:
         self.active_pub.publish(Bool(data=True))
         self._publish_status()
         if self.entry_enabled:
-            success, message = self._advance_entry()
+            if self.entry_short_range_enabled:
+                success, message = self._start_entry_crossing()
+            else:
+                success, message = self._advance_entry()
             if not success:
                 self._finalize("entry_start_failed:" + message, error=True)
                 return TriggerResponse(False, message)
             rospy.loginfo(
-                "[mission] ENTERING; home captured, rolling target %.2f m ahead",
+                "[mission] ENTERING; guarded crossing then rolling target %.2f m ahead",
                 self.entry_distance_m,
             )
             return TriggerResponse(True, "Mission started; entering building")
@@ -647,12 +984,447 @@ class MissionManager:
             current.x, current.y, home.x, home.y, self._pose_yaw(home_pose)
         )
 
+    def _publish_entry_command(self, linear_x=0.0, angular_z=0.0):
+        command = Twist()
+        command.linear.x = float(linear_x)
+        command.angular.z = float(angular_z)
+        self.entry_cmd_pub.publish(command)
+
+    def _start_entry_crossing(self):
+        with self.lock:
+            if self.mission_state != MissionLifecycle.ENTERING or self.finalized:
+                return False, "Mission is not entering"
+            if self.home_pose is None or self.latest_pose is None:
+                return False, "Entry pose unavailable"
+            self.entry_short_range_epoch += 1
+            self.entry_short_range_phase = "PREPARE"
+            self.entry_short_range_phase_time = rospy.Time.now()
+            self.entry_short_range_started_at = rospy.Time(0)
+            self.entry_crossing_reference = None
+            self.entry_margin_avoidance_side = 0.0
+            self.entry_crossing_yaw_filter.reset()
+            self.entry_retry_at = rospy.Time(0)
+            self.entry_goal_active = False
+            self.entry_goal_sequence += 1
+        # The short-range lease and move_base must never own motion together.
+        self.move_base_client.cancel_all_goals()
+        self._publish_entry_command()
+        rospy.loginfo(
+            "[mission] entry short-range PREPARE: target=%.2fm vx<=%.2f wz<=%.2f",
+            self.entry_crossing_distance_m,
+            self.entry_crossing_speed_mps,
+            self.entry_crossing_max_angular_speed_rps,
+        )
+        return True, "Entry crossing preparing"
+
+    def _stop_entry_crossing(self):
+        self._publish_entry_command()
+        with self.lock:
+            if self.entry_short_range_phase in ("PREPARE", "CROSS", "HANDOFF"):
+                self.entry_short_range_epoch += 1
+                self.entry_short_range_phase = "INACTIVE"
+                self.entry_short_range_phase_time = rospy.Time.now()
+                self.entry_crossing_reference = None
+                self.entry_margin_avoidance_side = 0.0
+                self.entry_crossing_yaw_filter.reset()
+
+    def _fail_entry_crossing(self, code, detail):
+        self.move_base_client.cancel_all_goals()
+        self._publish_entry_command()
+        with self.lock:
+            if self.entry_short_range_phase not in ("PREPARE", "CROSS", "HANDOFF"):
+                return
+            self.entry_short_range_phase = "FAILED"
+            self.entry_short_range_epoch += 1
+            self.entry_short_range_phase_time = rospy.Time.now()
+            self.entry_crossing_reference = None
+            self.entry_margin_avoidance_side = 0.0
+            self.entry_crossing_yaw_filter.reset()
+        rospy.logerr("[mission] entry short-range failed: %s: %s", code, detail)
+        self._finalize("entry_short_range_%s:%s" % (code, detail), error=True)
+
+    def _entry_control_timer_callback(self, _event=None):
+        now = rospy.Time.now()
+        with self.lock:
+            phase = self.entry_short_range_phase
+            state = self.mission_state
+            finalized = self.finalized
+            phase_time = self.entry_short_range_phase_time
+            started_at = self.entry_short_range_started_at
+            home_pose = copy.deepcopy(self.home_pose)
+            current_pose = copy.deepcopy(self.latest_pose)
+            crossing_reference = self.entry_crossing_reference
+            avoidance_side = self.entry_margin_avoidance_side
+            pose_time = self.last_pose_time
+            scan = copy.deepcopy(self.latest_entry_scan)
+            scan_time = self.last_entry_scan_time
+            imu = copy.deepcopy(self.latest_entry_imu)
+            imu_time = self.last_entry_imu_time
+            navigation = copy.deepcopy(self.navigation_health)
+            navigation_time = self.last_navigation_health_time
+            last_command = copy.deepcopy(self.last_sent_cmd)
+            last_command_time = self.last_sent_cmd_time
+            safety_stop = self.safety_stop_active
+        if phase not in ("PREPARE", "CROSS", "HANDOFF"):
+            return
+        if state != MissionLifecycle.ENTERING or finalized:
+            self._stop_entry_crossing()
+            return
+
+        if phase in ("PREPARE", "HANDOFF"):
+            self._publish_entry_command()
+        if safety_stop:
+            self._fail_entry_crossing("SAFETY_STOP", "safety stop is active")
+            return
+        inputs = (
+            ("pose", current_pose, pose_time),
+            ("scan", scan, scan_time),
+            ("imu", imu, imu_time),
+        )
+        for name, value, stamp in inputs:
+            if (value is None or stamp == rospy.Time(0)
+                    or (now - stamp).to_sec() > self.entry_crossing_input_timeout_s):
+                self._fail_entry_crossing("STALE_INPUT", name + " is stale")
+                return
+        if home_pose is None:
+            self._fail_entry_crossing("NO_HOME", "captured home pose is unavailable")
+            return
+        orientation = imu.orientation
+        try:
+            roll, pitch = quaternion_roll_pitch(
+                orientation.x,
+                orientation.y,
+                orientation.z,
+                orientation.w,
+            )
+        except ValueError as exc:
+            self._fail_entry_crossing("INVALID_IMU", str(exc))
+            return
+        if max(abs(roll), abs(pitch)) > self.entry_crossing_max_tilt_rad:
+            self._fail_entry_crossing(
+                "TILT",
+                "roll=%.3f pitch=%.3f" % (roll, pitch),
+            )
+            return
+
+        if phase == "PREPARE":
+            forward, lateral = self._entry_progress(current_pose, home_pose)
+            yaw_error = normalize_angle(
+                self._pose_yaw(current_pose) - self._pose_yaw(home_pose)
+            )
+            navigation_fresh = (
+                navigation is not None
+                and navigation_time != rospy.Time(0)
+                and (now - navigation_time).to_sec()
+                <= self.entry_crossing_input_timeout_s
+            )
+            command_zero = (
+                last_command_time != rospy.Time(0)
+                and (now - last_command_time).to_sec()
+                <= self.entry_crossing_input_timeout_s
+                and command_is_zero(last_command)
+            )
+            nav_idle = (
+                navigation_fresh
+                and not navigation.has_active_goal
+                and not navigation.controller_active
+            )
+            if not nav_idle or not command_zero:
+                return
+            if (now - phase_time).to_sec() < self.entry_crossing_prepare_zero_s:
+                return
+            if abs(lateral) > 0.10 or abs(yaw_error) > 0.20:
+                self._fail_entry_crossing(
+                    "NOT_ALIGNED",
+                    "lateral=%.3f yaw=%.3f" % (lateral, yaw_error),
+                )
+                return
+            current = current_pose.pose.pose.position
+            try:
+                reference = CrossingReference(
+                    current.x,
+                    current.y,
+                    self._pose_yaw(current_pose),
+                )
+            except ValueError as exc:
+                self._fail_entry_crossing("INVALID_POSE", str(exc))
+                return
+            with self.lock:
+                if self.entry_short_range_phase != "PREPARE":
+                    return
+                self.entry_short_range_phase = "CROSS"
+                self.entry_short_range_phase_time = now
+                self.entry_short_range_started_at = now
+                # This is deliberately distinct from home_pose: home remains
+                # the immutable return/output origin for the entire mission.
+                self.entry_crossing_reference = reference
+                self.entry_margin_avoidance_side = 0.0
+                self.entry_crossing_yaw_filter.reset()
+                self.entry_progress_watchdog.reset(0.0, now.to_sec())
+            rospy.loginfo(
+                "[mission] entry short-range CROSS started at local reference "
+                "(%.2f, %.2f, %.2f)",
+                reference.x_m,
+                reference.y_m,
+                reference.yaw_rad,
+            )
+            return
+
+        if crossing_reference is None:
+            self._fail_entry_crossing(
+                "INTERNAL", "crossing reference is unset"
+            )
+            return
+        current = current_pose.pose.pose.position
+        try:
+            forward, lateral, yaw_error = crossing_reference.errors(
+                current.x,
+                current.y,
+                self._pose_yaw(current_pose),
+            )
+        except ValueError as exc:
+            self._fail_entry_crossing("INVALID_POSE", str(exc))
+            return
+
+        if phase == "HANDOFF":
+            command_zero = (
+                last_command_time != rospy.Time(0)
+                and (now - last_command_time).to_sec()
+                <= self.entry_crossing_input_timeout_s
+                and command_is_zero(last_command)
+            )
+            if (not command_zero
+                    or (now - phase_time).to_sec()
+                    < self.entry_crossing_handoff_zero_s):
+                return
+            with self.lock:
+                if self.entry_short_range_phase != "HANDOFF":
+                    return
+                self.entry_short_range_phase = "COMPLETE"
+                self.entry_short_range_phase_time = now
+                self.entry_retry_at = now + rospy.Duration(
+                    self.entry_crossing_release_s
+                )
+            rospy.loginfo(
+                "[mission] entry short-range handoff complete at %.2fm", forward
+            )
+            return
+
+        if started_at == rospy.Time(0):
+            self._fail_entry_crossing("INTERNAL", "crossing start time is unset")
+            return
+        if (now - started_at).to_sec() > self.entry_crossing_timeout_s:
+            self._fail_entry_crossing("TIMEOUT", "crossing deadline exceeded")
+            return
+        if abs(lateral) > self.entry_crossing_max_lateral_error_m:
+            self._fail_entry_crossing(
+                "LATERAL_ERROR", "lateral=%.3f" % lateral
+            )
+            return
+        if abs(yaw_error) > self.entry_crossing_max_yaw_error_rad:
+            self._fail_entry_crossing("YAW_ERROR", "yaw=%.3f" % yaw_error)
+            return
+        if forward >= self.entry_crossing_distance_m:
+            with self.lock:
+                if self.entry_short_range_phase != "CROSS":
+                    return
+                self.entry_short_range_phase = "HANDOFF"
+                self.entry_short_range_phase_time = now
+            self._publish_entry_command()
+            rospy.loginfo(
+                "[mission] entry short-range target reached: forward=%.2f lateral=%.2f",
+                forward,
+                lateral,
+            )
+            return
+        if not self.entry_progress_watchdog.update(forward, now.to_sec()):
+            self._fail_entry_crossing(
+                "STALLED", "forward progress stopped at %.3fm" % forward
+            )
+            return
+        margin_side = None
+        soft_hits = ()
+        if self.entry_crossing_sweep_enabled:
+            remaining = max(0.0, self.entry_crossing_distance_m - forward)
+            try:
+                sweep_distance = rolling_sweep_distance(
+                    remaining,
+                    self.entry_crossing_sweep_lookahead_m,
+                )
+                scan_geometry = (
+                    scan.ranges,
+                    scan.angle_min,
+                    scan.angle_increment,
+                    scan.range_min,
+                    scan.range_max,
+                    1.0,
+                    sweep_distance,
+                    (
+                        self.entry_footprint_min_x,
+                        self.entry_footprint_max_x,
+                        self.entry_footprint_min_y,
+                        self.entry_footprint_max_y,
+                    ),
+                )
+                hard_hit = swept_footprint_hit(*scan_geometry, margin=0.0)
+                if hard_hit is None and self.entry_footprint_margin_m > 0.0:
+                    soft_distance = min(
+                        remaining,
+                        self.entry_margin_avoidance_lookahead_m,
+                    )
+                    soft_margin = self.entry_footprint_margin_m
+                    if abs(avoidance_side) > 0.5:
+                        soft_margin += self.entry_margin_release_hysteresis_m
+                    soft_hits = swept_footprint_hits(
+                        scan.ranges,
+                        scan.angle_min,
+                        scan.angle_increment,
+                        scan.range_min,
+                        scan.range_max,
+                        1.0,
+                        soft_distance,
+                        (
+                            self.entry_footprint_min_x,
+                            self.entry_footprint_max_x,
+                            self.entry_footprint_min_y,
+                            self.entry_footprint_max_y,
+                        ),
+                        margin=soft_margin,
+                    )
+            except ValueError as exc:
+                self._fail_entry_crossing("INVALID_SCAN", str(exc))
+                return
+            if hard_hit is not None:
+                self._fail_entry_crossing(
+                    "OBSTACLE",
+                    "physical footprint hit at %.3fm" % hard_hit.distance_m,
+                )
+                return
+            forward_soft_hits = tuple(hit for hit in soft_hits if hit.x_m > 0.0)
+            unsafe_soft_hits = tuple(
+                hit for hit in forward_soft_hits
+                if (self.entry_footprint_min_y
+                    - self.entry_margin_min_side_clearance_m
+                    < hit.y_m
+                    < self.entry_footprint_max_y
+                    + self.entry_margin_min_side_clearance_m)
+            )
+            if unsafe_soft_hits:
+                nearest = min(unsafe_soft_hits, key=lambda hit: hit.distance_m)
+                # A point in the center corridor, or with less than the
+                # explicit 1cm lateral clearance, has no safe turn direction.
+                self._fail_entry_crossing(
+                    "OBSTACLE",
+                    "center corridor safety margin hit at %.3fm"
+                    % nearest.distance_m,
+                )
+                return
+            left_hits = tuple(
+                hit for hit in forward_soft_hits
+                if hit.y_m >= (
+                    self.entry_footprint_max_y
+                    + self.entry_margin_min_side_clearance_m
+                )
+            )
+            right_hits = tuple(
+                hit for hit in forward_soft_hits
+                if hit.y_m <= (
+                    self.entry_footprint_min_y
+                    - self.entry_margin_min_side_clearance_m
+                )
+            )
+            if left_hits and right_hits:
+                margin_side = 0.0
+            elif left_hits:
+                margin_side = 1.0
+            elif right_hits:
+                margin_side = -1.0
+        try:
+            with self.lock:
+                if (self.entry_short_range_phase != "CROSS"
+                        or self.entry_crossing_reference is not crossing_reference):
+                    return
+                filtered_yaw_error = self.entry_crossing_yaw_filter.update(
+                    yaw_error
+                )
+            linear, angular = crossing_command(
+                lateral,
+                filtered_yaw_error,
+                self.entry_crossing_speed_mps,
+                self.entry_crossing_yaw_gain,
+                self.entry_crossing_lateral_gain,
+                self.entry_crossing_max_angular_speed_rps,
+            )
+            if margin_side is not None:
+                linear, angular = margin_avoidance_command(
+                    linear,
+                    angular,
+                    margin_side,
+                    self.entry_margin_avoidance_speed_mps,
+                    self.entry_margin_avoidance_yaw_rps,
+                    self.entry_crossing_max_angular_speed_rps,
+                )
+            if self.entry_crossing_sweep_enabled:
+                arc_distance = min(
+                    max(0.0, self.entry_crossing_distance_m - forward),
+                    self.entry_margin_avoidance_lookahead_m,
+                )
+                curvature = angular / linear
+                arc_hit = swept_arc_footprint_hit(
+                    scan.ranges,
+                    scan.angle_min,
+                    scan.angle_increment,
+                    scan.range_min,
+                    scan.range_max,
+                    1.0,
+                    arc_distance,
+                    curvature,
+                    (
+                        self.entry_footprint_min_x,
+                        self.entry_footprint_max_x,
+                        self.entry_footprint_min_y,
+                        self.entry_footprint_max_y,
+                    ),
+                    margin=0.0,
+                    sample_spacing_m=self.entry_arc_sweep_sample_spacing_m,
+                )
+                if arc_hit is not None:
+                    self._fail_entry_crossing(
+                        "OBSTACLE",
+                        "commanded arc footprint hit at %.3fm"
+                        % arc_hit.distance_m,
+                    )
+                    return
+        except ValueError as exc:
+            self._fail_entry_crossing("INVALID_COMMAND", str(exc))
+            return
+        with self.lock:
+            if (self.entry_short_range_phase != "CROSS"
+                    or self.entry_crossing_reference is not crossing_reference):
+                return
+            self.entry_margin_avoidance_side = (
+                0.0 if margin_side is None else margin_side
+            )
+        if margin_side is not None:
+            rospy.logwarn_throttle(
+                1.0,
+                "[mission] entry lateral margin avoidance: side=%+.0f "
+                "vx=%.2f wz=%.2f",
+                margin_side,
+                linear,
+                angular,
+            )
+        self._publish_entry_command(linear, angular)
+
     def _advance_entry(self):
         with self.lock:
             if self.mission_state != MissionLifecycle.ENTERING or self.finalized:
                 return False, "Mission is not entering"
             if self.entry_goal_active:
                 return True, "Entry goal already active"
+            if (self.entry_short_range_enabled
+                    and self.entry_short_range_phase != "COMPLETE"):
+                return False, "Entry short-range crossing is not complete"
             home_pose = copy.deepcopy(self.home_pose)
             current_pose = copy.deepcopy(self.latest_pose)
         if home_pose is None or current_pose is None:
@@ -805,6 +1577,7 @@ class MissionManager:
         )
 
     def _start_exploration(self):
+        self._publish_entry_command()
         try:
             response = self.start_explore_client()
         except rospy.ServiceException as exc:
@@ -817,6 +1590,7 @@ class MissionManager:
             self.entry_start_time = None
             self.entry_retry_at = rospy.Time(0)
             self.entry_waiting_for_localization = False
+            self.entry_short_range_phase = "DONE"
             # A successful start service response establishes a new exploration
             # session even when its latched false marker arrives asynchronously.
             self.exploration_completion_armed = True
@@ -872,9 +1646,13 @@ class MissionManager:
             home_pose = copy.deepcopy(self.home_pose)
             self.return_start_time = rospy.Time.now()
             self.finish_reason = reason
+            self.return_trigger_reason = str(reason)
             self.return_goal_active = False
             self.transit_goal_active = False
             self.return_goal_attempts = 0
+            self.return_goal_deadline = rospy.Time(0)
+            self.return_retry_at = rospy.Time(0)
+            self.return_retry_reason = ""
             self.return_epoch += 1
             return_epoch = self.return_epoch
             self.return_verify_since = rospy.Time(0)
@@ -884,6 +1662,8 @@ class MissionManager:
             self.entry_retry_at = rospy.Time(0)
             self.entry_waiting_for_localization = False
             self.exploration_completion_armed = False
+        self._stop_entry_crossing()
+        self.move_base_client.cancel_all_goals()
         try:
             self.stop_explore_client()
         except rospy.ServiceException as exc:
@@ -945,9 +1725,30 @@ class MissionManager:
                 self._finalize("return_goal_attempts_exhausted", error=True)
                 return False, "Return attempts exhausted"
             self.return_goal_attempts += 1
+            now = rospy.Time.now()
+            return_deadline = (
+                self.return_start_time + rospy.Duration(self.return_timeout_s)
+            )
+            remaining_s = max(0.0, (return_deadline - now).to_sec())
+            attempts_left = max(
+                0, self.return_max_goal_attempts - self.return_goal_attempts
+            )
+            attempt_budget_s = allocate_return_attempt_budget(
+                remaining_s,
+                self.return_attempt_timeout_s,
+                self.return_retry_reserve_s,
+                self.return_terminal_reserve_s,
+                attempts_left,
+            )
+            if attempt_budget_s < self.return_min_attempt_timeout_s:
+                self._finalize("return_budget_exhausted", error=True)
+                return False, "Return budget exhausted"
             return_epoch = self.return_epoch
+            self.return_retry_at = rospy.Time(0)
+            self.return_retry_reason = ""
             self.return_verify_since = rospy.Time(0)
             self.return_verify_deadline = rospy.Time(0)
+            self.return_goal_deadline = now + rospy.Duration(attempt_budget_s)
         if not self.move_base_client.wait_for_server(rospy.Duration(1.0)):
             self._finalize("move_base_unavailable_for_return", error=True)
             return False, "move_base unavailable"
@@ -965,8 +1766,9 @@ class MissionManager:
             self.return_goal_active = True
         self._publish_status()
         rospy.loginfo(
-            "[mission] RETURNING to home pose attempt=%d: %s",
+            "[mission] RETURNING to home pose attempt=%d budget=%.1fs: %s",
             self.return_goal_attempts,
+            attempt_budget_s,
             reason,
         )
         return True, "Return home goal sent"
@@ -977,6 +1779,7 @@ class MissionManager:
                     or return_epoch != self.return_epoch):
                 return
             self.return_goal_active = False
+            self.return_goal_deadline = rospy.Time(0)
         if state == GoalStatus.SUCCEEDED:
             with self.lock:
                 self.return_verify_deadline = (
@@ -986,7 +1789,16 @@ class MissionManager:
             with self.lock:
                 attempts = self.return_goal_attempts
             if attempts < self.return_max_goal_attempts:
-                self._send_home_goal("retry_action_state_%d" % state)
+                # SimpleActionClient is still unwinding this callback.  Sending
+                # another goal here races its DONE transition and produced
+                # "ACTIVE when in simple state DONE" in Gazebo.  The mission
+                # timer owns retry dispatch after a short settling interval.
+                with self.lock:
+                    self.return_retry_reason = "retry_action_state_%d" % state
+                    self.return_retry_at = (
+                        rospy.Time.now()
+                        + rospy.Duration(self.return_retry_delay_s)
+                    )
             else:
                 self._finalize("return_failed_action_state_%d" % state, error=True)
 
@@ -1038,6 +1850,10 @@ class MissionManager:
             entry_retry_at = self.entry_retry_at
             entry_goal_active = self.entry_goal_active
             entry_waiting_for_localization = self.entry_waiting_for_localization
+            return_goal_active = self.return_goal_active
+            return_goal_deadline = self.return_goal_deadline
+            return_retry_at = self.return_retry_at
+            return_retry_reason = self.return_retry_reason
             return_verify_deadline = self.return_verify_deadline
             should_autostart = (
                 self.autostart
@@ -1057,6 +1873,7 @@ class MissionManager:
         ):
             if entry_goal_active:
                 self.move_base_client.cancel_goal()
+            self._stop_entry_crossing()
             self._finalize("entry_timeout", error=True)
         elif (
             state == MissionLifecycle.ENTERING
@@ -1094,6 +1911,33 @@ class MissionManager:
             self._finalize("return_timeout", error=True)
         elif (
             state == MissionLifecycle.RETURNING
+            and return_goal_active
+            and not return_goal_deadline.is_zero()
+            and now >= return_goal_deadline
+        ):
+            # Cancel once.  The action done callback records a delayed retry
+            # after SimpleActionClient has fully unwound its DONE transition.
+            with self.lock:
+                self.return_goal_deadline = rospy.Time(0)
+            rospy.logwarn(
+                "[mission] home goal attempt %d exhausted its action budget",
+                self.return_goal_attempts,
+            )
+            self.move_base_client.cancel_goal()
+        elif (
+            state == MissionLifecycle.RETURNING
+            and not return_goal_active
+            and not return_retry_at.is_zero()
+            and now >= return_retry_at
+        ):
+            with self.lock:
+                # Clear before dispatch so a synchronous failure cannot cause
+                # the same retry epoch to be sent twice.
+                self.return_retry_at = rospy.Time(0)
+                self.return_retry_reason = ""
+            self._send_home_goal(return_retry_reason or "action_retry")
+        elif (
+            state == MissionLifecycle.RETURNING
             and not return_verify_deadline.is_zero()
         ):
             if self._return_pose_within_tolerance():
@@ -1102,7 +1946,11 @@ class MissionManager:
                         self.return_verify_since = now
                     held_for = (now - self.return_verify_since).to_sec()
                 if held_for >= self.return_stationary_hold_s:
-                    self._finalize("completed", error=False)
+                    with self.lock:
+                        trigger = self.return_trigger_reason
+                    self._finalize(
+                        "completed:" + (trigger or "return"), error=False
+                    )
             else:
                 with self.lock:
                     self.return_verify_since = rospy.Time(0)
@@ -1141,6 +1989,9 @@ class MissionManager:
         )
 
     def _finalize(self, reason, error):
+        self._stop_entry_crossing()
+        self.move_base_client.cancel_all_goals()
+        self.transit_floor_client.cancel_all_goals()
         with self.lock:
             if self.finalized:
                 return
@@ -1175,6 +2026,7 @@ class MissionManager:
             start_time = self.start_time
             finish_time = finish_override or self.finish_time or rospy.Time.now()
             status = mission_status or self.mission_state
+            finish_reason = self.finish_reason
         if home is None or start_time is None:
             raise ValueError("mission start pose/time unavailable")
         orientation = home.pose.pose.orientation
@@ -1190,6 +2042,9 @@ class MissionManager:
             coordinate_frame=self.output_coordinate_frame,
             robot_start=self.scene_contract.get("robot_start"),
             mission_status=status,
+            run_profile=self.run_profile,
+            localization_backend=self.localization_backend,
+            finish_reason=finish_reason,
         )
         directory = os.path.dirname(self.result_file)
         os.makedirs(directory, exist_ok=True)
@@ -1201,6 +2056,8 @@ class MissionManager:
         os.replace(temporary, self.result_file)
 
     def _publish_status(self):
+        if self.shutting_down or rospy.is_shutdown():
+            return
         now = rospy.Time.now()
         with self.lock:
             state = self.mission_state
@@ -1210,6 +2067,7 @@ class MissionManager:
             current_floor = self.current_floor
             remaining = self.remaining_frontier_count
             coverage = self.map_coverage_summary
+            topology_debt = self.topology_debt_summary
             finish_reason = self.finish_reason
         message = MissionStatus()
         message.header.stamp = now
@@ -1225,18 +2083,29 @@ class MissionManager:
         if navigation is not None:
             message.active_goal_id = navigation.active_goal_id
         message.map_coverage_summary = coverage
+        message.topology_debt_summary = topology_debt
         message.remaining_frontier_count = remaining
         message.finish_reason = finish_reason
-        self.status_pub.publish(message)
+        try:
+            self.status_pub.publish(message)
+        except rospy.ROSException:
+            # A timer can cross rospy's publisher teardown during Ctrl-C.
+            if not (self.shutting_down or rospy.is_shutdown()):
+                raise
 
     def _on_shutdown(self):
         with self.lock:
+            self.shutting_down = True
             active = self.mission_state in (
                 MissionLifecycle.EXPLORING,
                 MissionLifecycle.ENTERING,
                 MissionLifecycle.RETURNING,
             )
         if active:
+            try:
+                self._stop_entry_crossing()
+            except rospy.ROSException:
+                pass
             self.move_base_client.cancel_all_goals()
             self.transit_floor_client.cancel_all_goals()
 

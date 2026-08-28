@@ -7,23 +7,36 @@ DWAPlannerROS:
   max_vel_trans: 0.40
   min_vel_trans: 0.30
   max_vel_x: 0.40
-  min_vel_x: 0.0
+  # Do not sample the 0.01--0.29 m/s translational commands that the RL gait
+  # predicts as motion but physically treats as standing/shuffling.  DWA's
+  # separate stop/rotate controller still provides zero-x goal orientation.
+  min_vel_x: 0.30
   # The deployed RL policy shows no measurable response at the mux-safe
   # +/-0.25 m/s lateral command.  Advertising holonomic samples makes DWA
   # predict motion the robot cannot execute and amplifies cross-track error.
   max_vel_y: 0.0
   min_vel_y: 0.0
-  max_vel_theta: 0.80
-  min_vel_theta: 0.80
+  # Gazebo response calibration on the deployed Unitree RL controller found
+  # that pure yaw at <=0.30 rad/s remains in the standing deadband, while
+  # +/-0.40 rad/s and the combined 0.40 m/s + 0.40 rad/s arc are stable.
+  # Upstream DWA uses min_vel_theta only when translation is below
+  # min_vel_trans, so this forces a physically effective stop/rotate command
+  # without removing the smaller angular samples from moving arcs.
+  max_vel_theta: 0.40
+  min_vel_theta: 0.40
 
-  # At 10 Hz these limits put 0.30/0.20/0.80 in the first dynamic window.
+  # At 10 Hz these limits put the complete 0.40/0.20/0.30 target domain in
+  # the first dynamic window.  cmd_mux remains the final per-axis limiter.
   # danger_search_control/cmd_mux uses the same per-axis acceleration contract.
   acc_lim_x: 3.0
   acc_lim_y: 2.0
   acc_lim_theta: 8.0
   acc_lim_trans: 3.0
 
-  xy_goal_tolerance: 0.40
+  # Frontier goals are at least 0.60m inside known space. A 0.15m XY
+  # tolerance keeps the padded 0.421m A1 rotation envelope out of unknown
+  # cells before stopRotateController takes ownership.
+  xy_goal_tolerance: 0.15
   yaw_goal_tolerance: 0.80
   trans_stopped_vel: 0.05
   theta_stopped_vel: 0.10
@@ -36,7 +49,10 @@ DWAPlannerROS:
   # Treat the A1 as nonholonomic until a separately calibrated lateral gait
   # passes the physical response test.
   vy_samples: 1
-  vth_samples: 5
+  # Full [-0.40, 0.40] window at 0.10 rad/s spacing.  Moving trajectories can
+  # still use +/-0.10, +/-0.20 and +/-0.30; pure rotations below 0.40 are
+  # rejected by the minimum-magnitude contract above.
+  vth_samples: 9
   use_dwa: true
 
   path_distance_bias: 32.0

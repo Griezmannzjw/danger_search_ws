@@ -5,6 +5,10 @@
   <arg name="result_file" default="$(arg simenv_root)/results/detected_danger.json" />
   <arg name="scene_info_file" default="$(arg simenv_root)/generated_building/team_scene_info.json" />
   <arg name="result_coordinate_frame" default="auto" />
+  <arg name="run_profile" default="formal" />
+  <arg name="competition_mode" default="true" />
+  <arg name="multifloor_enabled" default="true" />
+  <arg name="localization_backend" default="gicp" />
   <arg name="autostart" default="false" />
   <!-- 独立调试通常不启动 bringup 的开门节点；正式 competition.launch 仍强制等待。 -->
   <arg name="require_entrance_ready" default="false" />
@@ -16,6 +20,10 @@
     <param name="result_file" value="$(arg result_file)" />
     <param name="scene_info_file" value="$(arg scene_info_file)" />
     <param name="result_coordinate_frame" value="$(arg result_coordinate_frame)" />
+    <param name="run_profile" value="$(arg run_profile)" />
+    <param name="competition_mode" value="$(arg competition_mode)" />
+    <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
+    <param name="localization_backend" value="$(arg localization_backend)" />
     <param name="autostart" value="$(arg autostart)" />
     <param name="require_entrance_ready" value="$(arg require_entrance_ready)" />
     <param name="require_preflight_ready" value="$(arg require_preflight_ready)" />

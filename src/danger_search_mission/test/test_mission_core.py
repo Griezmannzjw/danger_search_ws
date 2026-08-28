@@ -6,18 +6,45 @@ import tempfile
 import unittest
 
 from danger_search_mission.mission_core import (
+    allocate_return_attempt_budget,
     build_result_document,
     DangerTrack,
     DangerTrackStore,
     entry_progress,
     MissionLifecycle,
     next_entry_target,
+    normalize_run_profile,
     normalize_result_file,
     parse_public_scene_contract,
     resolve_result_coordinate_frame,
+    result_profile_errors,
     task_relative_position,
     task_to_world_position,
 )
+
+
+class ReturnBudgetTest(unittest.TestCase):
+    def test_first_attempt_preserves_retry_and_terminal_time(self):
+        self.assertEqual(
+            allocate_return_attempt_budget(170.0, 150.0, 15.0, 5.0, 1),
+            150.0,
+        )
+
+    def test_last_attempt_only_preserves_terminal_time(self):
+        self.assertEqual(
+            allocate_return_attempt_budget(18.0, 150.0, 15.0, 5.0, 0),
+            13.0,
+        )
+
+    def test_exhausted_window_returns_zero(self):
+        self.assertEqual(
+            allocate_return_attempt_budget(4.0, 150.0, 15.0, 5.0, 0),
+            0.0,
+        )
+
+    def test_invalid_budget_is_rejected(self):
+        with self.assertRaises(ValueError):
+            allocate_return_attempt_budget(-1.0, 150.0, 15.0, 5.0, 1)
 
 
 class MissionLifecycleTest(unittest.TestCase):
@@ -97,6 +124,10 @@ class ResultContractTest(unittest.TestCase):
         self.assertEqual(result["exploration_time"], 12.35)
         self.assertEqual(result["coordinate_frame"], "start_relative")
         self.assertEqual(result["mission_status"], "FINISHED")
+        self.assertEqual(result["finish_reason"], "")
+        self.assertEqual(result["run_profile"], "formal")
+        self.assertEqual(result["localization_backend"], "gicp")
+        self.assertTrue(result["official_eligible"])
         self.assertEqual(
             result["detected_danger_sources"],
             [{"position": [2.35, -1.23, 0.16]}],
@@ -145,6 +176,52 @@ class ResultContractTest(unittest.TestCase):
             normalized = normalize_result_file(raw)
             self.assertTrue(os.path.isabs(normalized))
             self.assertEqual(os.path.basename(normalized), "detected_danger.json")
+
+    def test_simulation_truth_result_is_non_official_and_separate(self):
+        result = build_result_document(
+            [], (0.0, 0.0, 0.0, 0.0), 1.0,
+            run_profile="simulation_truth",
+            localization_backend="gazebo_truth",
+        )
+        self.assertEqual(result["run_profile"], "simulation_truth")
+        self.assertEqual(result["localization_backend"], "gazebo_truth")
+        self.assertFalse(result["official_eligible"])
+        path = normalize_result_file(
+            "/tmp/detected_danger.simulation_truth.json", "simulation_truth"
+        )
+        self.assertTrue(path.endswith("detected_danger.simulation_truth.json"))
+        with self.assertRaises(ValueError):
+            normalize_result_file("/tmp/detected_danger.json", "simulation_truth")
+
+    def test_unknown_run_profile_is_rejected(self):
+        with self.assertRaises(ValueError):
+            normalize_run_profile("development")
+
+    def test_official_result_profile_gate_is_fail_closed(self):
+        formal = build_result_document(
+            [], (0.0, 0.0, 0.0, 0.0), 1.0,
+            mission_status="FINISHED",
+            run_profile="formal",
+            localization_backend="gicp",
+        )
+        self.assertEqual(result_profile_errors(formal, official=True), [])
+
+        truth = build_result_document(
+            [], (0.0, 0.0, 0.0, 0.0), 1.0,
+            mission_status="FINISHED",
+            run_profile="simulation_truth",
+            localization_backend="gazebo_truth",
+        )
+        errors = result_profile_errors(truth, official=True)
+        self.assertTrue(any("run_profile=formal" in error for error in errors))
+        self.assertTrue(any("official_eligible=true" in error for error in errors))
+
+    def test_result_profile_gate_rejects_missing_metadata(self):
+        errors = result_profile_errors({}, official=True)
+        self.assertTrue(any("mission_status" in error for error in errors))
+        self.assertTrue(any("run_profile" in error for error in errors))
+        self.assertTrue(any("localization_backend" in error for error in errors))
+        self.assertTrue(any("official_eligible" in error for error in errors))
 
     def test_wrong_result_filename_is_rejected(self):
         with self.assertRaises(ValueError):

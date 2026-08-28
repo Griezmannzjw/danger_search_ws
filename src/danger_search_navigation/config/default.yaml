@@ -12,6 +12,7 @@ mapping_status_topic: /mapping/status
 health_topic: /navigation/health
 obstacle_cloud_topic: /scan
 safety_stop_topic: /danger_search/safety_stop
+posture_fallen_topic: /danger_search/posture_fallen
 move_base_action_name: /move_base
 make_plan_service: /move_base/make_plan
 clear_costmaps_service: /move_base/clear_costmaps

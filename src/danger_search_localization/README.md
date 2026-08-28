@@ -102,6 +102,8 @@ GICP 位姿和地图更新建立后，`/mapping/status` 应变为 `ready: True`�
 | `/tf`、`/tf_static` | TF | `map -> odom -> base` |
 | `/localization/pose` | `geometry_msgs/PoseWithCovarianceStamped` | `map` 中的当前位姿 |
 | `/map` | `nav_msgs/OccupancyGrid` | 当前楼层二维占据地图；换层稳定前暂停更新 |
+| `/mapping/active_map` | `danger_search_common/FloorOccupancyGrid` | 与 `/map` 同一快照的 floor/epoch/version 原子 envelope |
+| `/localization/depth_obstacle_scan` | `sensor_msgs/LaserScan` | RealSense 深度生成的地面相对近场障碍，仅供 navigation costmap 补盲 |
 | `/mapping/current_floor` | `std_msgs/Int32` | 当前确认楼层，编号从 0 开始 |
 | `/mapping/floors/<id>/map` | `nav_msgs/OccupancyGrid` | 已访问楼层的独立、latched 地图 |
 | `/localization/switch_floor` | `danger_search_common/SwitchFloor` | 以 `transition_id` 幂等切换活动楼层地图 |
@@ -118,11 +120,13 @@ GICP 位姿和地图更新建立后，`/mapping/status` 应变为 `ready: True`�
 
 ### 探索模块实际收到的地图
 
-`/map` 通过 ROS 发布为 `nav_msgs/OccupancyGrid`，不是截图或点云。消息包含地图坐标
+`/map` 供 move_base StaticLayer 使用；探索规划则只以
+`/mapping/active_map` 为权威输入。其中的 `OccupancyGrid` 不是截图或点云，消息包含地图坐标
 系、分辨率、宽高、原点以及一维栅格数组 `data`。每个栅格的含义是：`-1` 未知、
 `0` 自由、`1..100` 为递增的占用概率。探索模块将 `data` 按 `height x width`
 还原成二维数组，并结合 `/localization/pose` 中的机器人坐标选择自由栅格目标；它
-还会读取 `/mapping/status`，只有地图 `ready && stable && !lost` 时才允许规划。
+还会读取 `/mapping/status`，只有 floor/epoch/version 完全匹配且
+`ready && stable && !lost && !transitioning` 时才允许规划。
 
 默认正常状态原因为 `TRACKING_GICP_ODOMETRY_WITH_LOCAL_OCCUPANCY_MAP`。只有可选
 Hector 模式正常时才显示 `TRACKING_FUSED_GICP_ODOMETRY_WITH_BOUNDED_HECTOR_CORRECTION`。

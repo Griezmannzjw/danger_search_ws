@@ -14,6 +14,74 @@ from dynamic_reconfigure.client import Client
 from std_msgs.msg import Bool
 
 
+def validate_dwa_velocity_domain(
+    config,
+    safe_max_angular_speed_rps=0.40,
+    effective_min_in_place_angular_speed_rps=0.40,
+):
+    """Reject a DWA config that would recreate unsafe Unitree yaw samples.
+
+    ``cmd_mux`` retains a broader final hard limit for all producers, while
+    ordinary move_base operation has a smaller, validated policy domain.  An
+    odd symmetric sample count is required so moving arcs still evaluate zero
+    and the small/mid yaw candidates.  Pure rotations must clear the measured
+    Unitree policy deadband.
+    Upstream DWA treats ``min_vel_theta`` as a non-negative minimum magnitude;
+    it derives the signed sample interval from ``max_vel_theta``.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("DWA configuration must be a mapping")
+    required = (
+        "min_vel_trans",
+        "min_vel_x",
+        "min_vel_y",
+        "max_vel_y",
+        "min_vel_theta",
+        "max_vel_theta",
+        "vth_samples",
+    )
+    missing = [name for name in required if name not in config]
+    if missing:
+        raise ValueError("DWA configuration missing " + ", ".join(missing))
+    try:
+        min_trans = float(config["min_vel_trans"])
+        min_x = float(config["min_vel_x"])
+        min_y = float(config["min_vel_y"])
+        max_y = float(config["max_vel_y"])
+        min_theta = float(config["min_vel_theta"])
+        max_theta = float(config["max_vel_theta"])
+        safe_limit = float(safe_max_angular_speed_rps)
+        effective_minimum = float(effective_min_in_place_angular_speed_rps)
+        samples = int(config["vth_samples"])
+    except (TypeError, ValueError) as error:
+        raise ValueError("DWA velocity domain is not numeric") from error
+    values = (
+        min_trans, min_x, min_y, max_y, min_theta, max_theta, safe_limit,
+        effective_minimum,
+    )
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("DWA velocity domain must be finite")
+    if abs(min_y) > 1e-9 or abs(max_y) > 1e-9:
+        raise ValueError("DWA must remain nonholonomic (min/max_vel_y == 0)")
+    if min_trans <= 0.0 or min_x + 1e-9 < min_trans:
+        raise ValueError("DWA min_vel_x must exclude the translational policy deadband")
+    if safe_limit <= 0.0 or effective_minimum <= 0.0:
+        raise ValueError("safe DWA angular speeds must be positive")
+    if effective_minimum > safe_limit + 1e-9:
+        raise ValueError("effective in-place minimum exceeds the safe policy limit")
+    if min_theta <= 0.0 or max_theta <= 0.0 or min_theta > max_theta:
+        raise ValueError("DWA angular magnitudes must satisfy 0 < min <= max")
+    if max_theta > safe_limit + 1e-9:
+        raise ValueError("DWA angular domain exceeds the safe policy limit")
+    if min_theta + 1e-9 < effective_minimum:
+        raise ValueError("DWA in-place yaw magnitude remains inside the policy deadband")
+    if samples < 9 or samples % 2 == 0:
+        raise ValueError("DWA requires an odd >=9 angular sample count")
+    step = 2.0 * max_theta / float(samples - 1)
+    if step > 0.10 + 1e-9:
+        raise ValueError("DWA moving-arc yaw sample spacing exceeds 0.10 rad/s")
+
+
 class NavigationConfigGuard:
     def __init__(self):
         rospy.init_node("navigation_config_guard", anonymous=False)
@@ -33,6 +101,21 @@ class NavigationConfigGuard:
             raise rospy.ROSInitException(
                 "%s configuration is empty" % self.planner_config_key
             )
+        self.safe_max_angular_speed_rps = float(rospy.get_param(
+            "~safe_max_angular_speed_rps", 0.40
+        ))
+        self.effective_min_in_place_angular_speed_rps = float(rospy.get_param(
+            "~effective_min_in_place_angular_speed_rps", 0.40
+        ))
+        try:
+            if self.planner_config_key == "DWAPlannerROS":
+                validate_dwa_velocity_domain(
+                    self.expected,
+                    self.safe_max_angular_speed_rps,
+                    self.effective_min_in_place_angular_speed_rps,
+                )
+        except ValueError as error:
+            raise rospy.ROSInitException("unsafe DWA velocity domain: %s" % error)
 
         self.publisher = rospy.Publisher(self.ready_topic, Bool, queue_size=1, latch=True)
         self.client = None

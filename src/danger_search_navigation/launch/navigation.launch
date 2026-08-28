@@ -1,5 +1,9 @@
 <launch>
   <arg name="config_dir" default="$(find danger_search_navigation)/config" />
+  <arg name="run_profile" default="formal" />
+  <arg name="competition_mode" default="true" />
+  <arg name="multifloor_enabled" default="true" />
+  <arg name="localization_backend" default="gicp" />
 
   <!-- Standard ROS navigation owns /move_base.  Its velocity output remains
        behind danger_search_control/cmd_mux. -->
@@ -10,6 +14,10 @@
     <rosparam command="load" file="$(arg config_dir)/costmap_common.yaml" ns="local_costmap" />
     <rosparam command="load" file="$(arg config_dir)/global_costmap.yaml" ns="global_costmap" />
     <rosparam command="load" file="$(arg config_dir)/local_costmap.yaml" ns="local_costmap" />
+    <param name="run_profile" value="$(arg run_profile)" />
+    <param name="competition_mode" value="$(arg competition_mode)" />
+    <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
+    <param name="localization_backend" value="$(arg localization_backend)" />
     <remap from="cmd_vel" to="/danger_search/nav_cmd_vel" />
   </node>
 
@@ -21,7 +29,13 @@
         output="screen">
     <param name="planner_name" value="/move_base/DWAPlannerROS" />
     <param name="planner_config_key" value="DWAPlannerROS" />
+    <param name="safe_max_angular_speed_rps" value="0.40" />
+    <param name="effective_min_in_place_angular_speed_rps" value="0.40" />
     <rosparam command="load" file="$(arg config_dir)/dwa_planner.yaml" />
+    <param name="run_profile" value="$(arg run_profile)" />
+    <param name="competition_mode" value="$(arg competition_mode)" />
+    <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
+    <param name="localization_backend" value="$(arg localization_backend)" />
   </node>
 
   <!-- Compatibility only: converts standard action/recovery state to the
@@ -31,5 +45,9 @@
         type="navigation_monitor.py"
         output="screen">
     <rosparam command="load" file="$(arg config_dir)/monitor.yaml" />
+    <param name="run_profile" value="$(arg run_profile)" />
+    <param name="competition_mode" value="$(arg competition_mode)" />
+    <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
+    <param name="localization_backend" value="$(arg localization_backend)" />
   </node>
 </launch>

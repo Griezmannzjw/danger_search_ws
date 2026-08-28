@@ -1,5 +1,6 @@
 map_frame: map
 map_topic: /map
+active_map_topic: /mapping/active_map
 pose_topic: /localization/pose
 scan_topic: /localization/scan
 mapping_status_topic: /mapping/status
@@ -11,8 +12,11 @@ health_topic: /navigation/health
 recovery_event_topic: /navigation/recovery_event
 move_base_status_topic: /move_base/status
 move_base_goal_topic: /move_base/goal
+move_base_cancel_topic: /move_base/cancel
 move_base_result_topic: /move_base/result
 move_base_recovery_topic: /move_base/recovery_status
+clear_costmaps_service: /move_base/clear_costmaps
+clear_costmaps_timeout_s: 2.0
 global_plan_topic: /move_base/NavfnROS/plan
 health_rate: 5.0
 input_timeout: 2.0

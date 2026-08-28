@@ -87,6 +87,28 @@ class TestDepthGeometryValidator(unittest.TestCase):
 
         self.assertIsNone(self._validate_first_candidate(image, depth))
 
+    def test_lightly_occluded_known_sphere_is_localized(self):
+        image, depth = self._synthetic_sphere(2.0, 0.15)
+        cv2.rectangle(image, (340, 200), (370, 280), (0, 0, 0), -1)
+
+        result = self._validate_first_candidate(image, depth)
+
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result.center_camera[2], 2.0, delta=0.05)
+
+    def test_known_sphere_is_localized_at_near_and_far_ranges(self):
+        # These bounds are deliberately away from the image/depth hard
+        # limits.  The end-to-end node applies PipelineConfig's reliable
+        # range gate after this geometry check.
+        for center_z in (0.60, 4.50):
+            with self.subTest(center_z=center_z):
+                image, depth = self._synthetic_sphere(center_z, 0.15)
+                result = self._validate_first_candidate(image, depth)
+                self.assertIsNotNone(result)
+                self.assertAlmostEqual(
+                    result.center_camera[2], center_z, delta=0.06
+                )
+
     def test_invalid_camera_intrinsics_are_rejected(self):
         image, depth = self._synthetic_sphere(2.0, 0.15)
         self.camera = FakeCameraModel(fx=0.0)

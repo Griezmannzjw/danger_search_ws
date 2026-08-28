@@ -27,11 +27,24 @@ free_threshold: 40
 # 前沿连通性使用与 navigation 静态规划一致的 0.30 m 本体净空。
 connectivity_occupied_threshold: 65
 connectivity_clearance_radius: 0.30
-max_frontier_candidates: 20
+# Candidates are initially ordered by Euclidean distance but ranked by Navfn
+# path length.  A 64-entry bound prevents a wall/doorway detour from hiding a
+# slightly farther candidate while retaining a finite make_plan budget.
+max_frontier_candidates: 64
 goal_timeout: 120.0
+# Navfn 可能为一个近处 frontier 生成绕完整楼层的长路径。最多下发 8m
+# 已知自由路径前缀，到达后用新地图重新做 WFD/路径排序，避免单一陈旧目标
+# 独占固定 120s。超时按实际下发路径估算，并始终受 goal_timeout 硬上限约束。
+max_frontier_goal_path_m: 8.0
+goal_timeout_base_s: 20.0
+goal_timeout_per_path_m: 4.0
+goal_timeout_min_s: 30.0
 plan_tolerance: 0.5
 failed_goal_cooldown: 15.0
 failed_goal_radius: 0.50
+# move_base 在 xy_goal_tolerance 内即可返回成功；更近的候选不能再次下发，
+# 否则会形成“立即成功 -> 原目标重发”的探索活锁。
+min_goal_dispatch_distance_m: 0.45
 dependency_check_timeout: 0.1
 input_timeout: 3.0
 no_frontier_cycles_required: 5
@@ -39,11 +52,20 @@ floor_no_frontier_hold_s: 10.0
 map_stable_time: 8.0
 map_change_cell_threshold: 5
 
-# 前沿目标放在已知区内侧，并朝向未知区。
-observation_min_distance: 0.30
-observation_target_distance: 0.45
-observation_max_distance: 0.70
-goal_clearance_margin: 0.02
+# 前沿目标留在已知区内侧，并朝向未知区。A1 固定 footprint 加 padding
+# 的外接半径约 0.421m；与 DWA 0.15m 到达容差组成联合合同：
+# min-tolerance >= 0.421 且 target+tolerance <= max。这样进入 stop/rotate
+# 阶段时 footprint 不会伸入未知区，避免近墙原地旋转永久碰撞。
+observation_min_distance: 0.60
+observation_target_distance: 0.70
+observation_max_distance: 0.90
+# Entry-enabled sessions capture their localization start pose and reject only
+# observation goals more than this distance behind it on the anchor floor.
+# system.launch enables this with entry_enabled; direct launches stay disabled.
+entrance_boundary_guard_enabled: false
+entrance_boundary_allowance_m: 1.0
+# connectivity 0.30m + margin 0.15m 同时覆盖上述旋转 footprint。
+goal_clearance_margin: 0.15
 # 使用真实路径长度、前沿信息量和路径最小净空综合排序。
 path_length_weight: 1.0
 frontier_gain_weight: 0.30
@@ -65,7 +87,9 @@ elevator_service: /call_elevator
 door_service: /set_door_state
 switch_floor_service: /localization/switch_floor
 mapping_pause_topic: /localization/mapping_pause
-clear_costmaps_service: /move_base/clear_costmaps
+active_map_topic: /mapping/active_map
+safety_stop_topic: /danger_search/safety_stop
+sent_cmd_topic: /danger_search/cmd_vel_sent
 transit_floor_action_name: /danger_search/transit_floor
 elevator_cmd_topic: /danger_search/elevator_cmd_vel
 scan_topic: /localization/scan
@@ -93,6 +117,11 @@ elevator_crossing_speed_mps: 0.20
 elevator_crossing_distance_m: 1.40
 elevator_crossing_min_progress_m: 0.80
 elevator_crossing_clearance_m: 0.32
+elevator_footprint_min_x: -0.35
+elevator_footprint_max_x: 0.30
+elevator_footprint_min_y: -0.15
+elevator_footprint_max_y: 0.15
+elevator_footprint_margin_m: 0.08
 floor_map_stable_time_s: 15.0
 floor_min_new_map_versions: 2
 floor_height_m: 2.6

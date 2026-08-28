@@ -83,7 +83,9 @@ angle_max: 3.141592653589793
 angle_increment: 0.008726646259972  # 0.5 deg
 range_min: 0.20
 range_max: 12.0
-min_height: -0.10                # 允许 lidar 平面以下的点，避免过滤地面
+# Planar navigation consumes a gravity-level obstacle slice, not the floor.
+# This removes ground/apron top returns while retaining supported wall points.
+min_height: 0.05
 max_height: 1.50
 self_exclusion_min_x: -0.55
 self_exclusion_max_x: 0.55
@@ -121,6 +123,25 @@ mapping_pause_exit_yaw_rate_rps: 0.20
 mapping_pause_stable_hold_s: 0.50
 mapping_resume_min_frames: 3
 
+# RealSense 只补充导航近场障碍，不写入长期 OccupancyGrid。先在重力水平
+# base 坐标中估计地面，再保留高出地面至少 6cm 的点，避免低箱盲区同时
+# 不把地板当障碍。相机 0.4m 近裁剪与 0.55m costmap inflation 联合使用。
+depth_obstacle_depth_topic: /real_sense/depth/image_raw
+depth_obstacle_camera_info_topic: /real_sense/depth/camera_info
+depth_obstacle_scan_topic: /localization/depth_obstacle_scan
+depth_obstacle_image_stride: 4
+depth_obstacle_min_range_m: 0.40
+depth_obstacle_max_range_m: 3.00
+depth_obstacle_floor_search_min_z_m: -0.65
+depth_obstacle_floor_search_max_z_m: -0.08
+depth_obstacle_floor_histogram_bin_m: 0.02
+depth_obstacle_floor_min_support_points: 40
+depth_obstacle_floor_max_jump_m: 0.08
+depth_obstacle_floor_cache_timeout_s: 2.0
+depth_obstacle_fallback_floor_z_m: -0.30
+depth_obstacle_min_height_m: 0.06
+depth_obstacle_max_height_m: 1.20
+
 # P0 默认使用可信 GICP 位姿直接构建占据栅格，避免稀疏 Livox 的第二套位姿漂移。
 occupancy_mapper_max_rays: 360
 occupancy_mapper_free_update: 1
@@ -133,7 +154,11 @@ occupancy_mapper_clear_radius_m: 0.50
 # Hector 2D 扫描匹配与地图
 map_resolution: 0.05
 map_size: 1024                    # 51.2 m x 51.2 m
-map_start_x: 0.5
+# The task origin is outside the south entrance and exploration proceeds
+# predominantly forward.  On a 1024 x 0.05 m grid, centering the origin leaves
+# only 25.6 m forward and clips a 36 m building.  Ten percent keeps 46 m ahead
+# without increasing WFD/map memory; lateral space remains centered.
+map_start_x: 0.1
 map_start_y: 0.5
 map_multi_res_levels: 2
 map_update_distance_thresh: 0.10

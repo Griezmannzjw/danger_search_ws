@@ -27,6 +27,23 @@ class TestLocalizationConfig(unittest.TestCase):
         self.assertEqual(scan_config.mapping_resume_min_frames, 3)
         AdapterConfig()
 
+    def test_runtime_projection_excludes_floor_and_low_apron_surfaces(self):
+        config_path = self.package_dir / "config" / "default.yaml"
+        runtime = yaml.safe_load(config_path.read_text())
+        self.assertGreaterEqual(runtime["min_height"], 0.05)
+        self.assertGreater(runtime["max_height"], runtime["min_height"])
+
+    def test_runtime_map_covers_long_building_forward_of_task_origin(self):
+        config_path = self.package_dir / "config" / "default.yaml"
+        runtime = yaml.safe_load(config_path.read_text())
+        map_extent_m = runtime["map_size"] * runtime["map_resolution"]
+        forward_extent_m = (1.0 - runtime["map_start_x"]) * map_extent_m
+        lateral_half_extent_m = min(
+            runtime["map_start_y"], 1.0 - runtime["map_start_y"]
+        ) * map_extent_m
+        self.assertGreaterEqual(forward_extent_m, 45.0)
+        self.assertGreaterEqual(lateral_half_extent_m, 20.0)
+
     def test_gicp_rebaseline_threshold_is_positive(self):
         config_path = self.package_dir / "config" / "default.yaml"
         config = yaml.safe_load(config_path.read_text())
@@ -117,6 +134,11 @@ class TestLocalizationConfig(unittest.TestCase):
             node for node in nodes if node.attrib["name"] == "local_occupancy_mapper"
         )
         self.assertEqual(mapper_node.attrib["type"], "occupancy_mapper.py")
+        depth_node = next(
+            node for node in nodes
+            if node.attrib["name"] == "depth_obstacle_projector"
+        )
+        self.assertEqual(depth_node.attrib["type"], "depth_obstacle_projector.py")
         self.assertFalse(config["use_hector_correction"])
 
     def test_gazebo_truth_source_is_explicit_and_exclusive(self):
@@ -205,7 +227,10 @@ class TestLocalizationConfig(unittest.TestCase):
 
         self.assertIn("PoseStabilizer", adapter_source)
         self.assertIn("self.pose_stabilizer.update", adapter_source)
-        self.assertIn("self.validated_pose_pub.publish", adapter_source)
+        self.assertIn(
+            "self._publish_if_running(self.validated_pose_pub", adapter_source
+        )
+        self.assertIn("rospy.on_shutdown(self._on_shutdown)", adapter_source)
         self.assertIn("~validated_gicp_pose_topic", mapper_source)
         projector_source = (
             self.package_dir / "src" / "danger_search_localization" / "scan_projector_node.py"

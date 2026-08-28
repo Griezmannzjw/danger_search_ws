@@ -1,11 +1,11 @@
-# 标准 move_base + TrajectoryPlannerROS 完整仿真测试
+# 标准 move_base + DWAPlannerROS 完整仿真测试
 
 本文用于测试当前完整 `danger_search` 系统。测试链路为：
 
 ```text
 SimEnv Gazebo + Unitree RL 控制器
     -> localization 真值位姿与建图
-    -> 标准 move_base / NavfnROS / TrajectoryPlannerROS
+    -> 标准 move_base / NavfnROS / DWAPlannerROS
     -> /danger_search/nav_cmd_vel
     -> cmd_mux
     -> /cmd_vel
@@ -60,7 +60,7 @@ CONTROLLER_FOREGROUND=1 \
 这里必须保持：
 
 - `ENABLE_REFEREE_ODOM=0`：不启动会重复发布 `map -> odom -> base` 的 `state_from_gazebo`。
-- `localization_source:=gazebo_truth` 后端仍可直接读取 `/gazebo/link_states`，不依赖 `/Odometry_gazebo`。
+- `simulation_truth.launch` 的固定真值后端直接读取 `/gazebo/link_states`，不依赖 `/Odometry_gazebo`。
 - `CONTROLLER_FOREGROUND=1`：终端保留键盘输入能力。
 
 等待 Gazebo 完全启动、机器人落地且终端出现 Unitree 控制提示后：
@@ -91,13 +91,12 @@ Switched from passive to fixed stand
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash
 source devel/setup.bash
 
-roslaunch danger_search_bringup competition.launch \
+roslaunch danger_search_bringup simulation_truth.launch \
   autostart:=false \
   entry_enabled:=false \
-  localization_source:=gazebo_truth \
-  gazebo_base_link:=a1_gazebo::base \
   simenv_root:=/home/ruilinli/SimEnv
 ```
 
@@ -107,7 +106,7 @@ roslaunch danger_search_bringup competition.launch \
 - 激光投影与 OccupancyGrid 建图。
 - 标准 `move_base`。
 - `navfn/NavfnROS` 全局规划器。
-- `base_local_planner/TrajectoryPlannerROS` 局部规划器。
+- `dwa_local_planner/DWAPlannerROS` 局部规划器。
 - 标准 costmap 和有限 recovery。
 - 探索规划。
 - `cmd_mux` 控制仲裁。
@@ -120,7 +119,7 @@ roslaunch danger_search_bringup competition.launch \
 ```text
 [localization] TEST MODE: Gazebo truth ...
 Created global_planner navfn/NavfnROS
-Created local_planner base_local_planner/TrajectoryPlannerROS
+Created local_planner dwa_local_planner/DWAPlannerROS
 [navigation_monitor] standard move_base compatibility ready
 ```
 
@@ -140,26 +139,32 @@ raw GICP covariance is unhealthy
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash
 source devel/setup.bash
 
 rosparam get /move_base/base_global_planner
 rosparam get /move_base/base_local_planner
-rosparam get /move_base/TrajectoryPlannerROS/odom_topic
-rosparam get /move_base/TrajectoryPlannerROS/min_vel_x
-rosparam get /move_base/TrajectoryPlannerROS/min_in_place_vel_theta
-rosparam get /move_base/TrajectoryPlannerROS/max_vel_theta
+rosparam get /move_base/DWAPlannerROS/odom_topic
+rosparam get /move_base/DWAPlannerROS/min_vel_x
+rosparam get /move_base/DWAPlannerROS/min_vel_theta
+rosparam get /move_base/DWAPlannerROS/max_vel_theta
+rosparam get /move_base/local_costmap/obstacles/observation_sources
+rosparam get /move_base/global_costmap/obstacles/observation_sources
 rostopic echo -n 1 /navigation/config_ready
+timeout 5 rostopic hz /localization/depth_obstacle_scan
 ```
 
 预期输出：
 
 ```text
 navfn/NavfnROS
-base_local_planner/TrajectoryPlannerROS
+dwa_local_planner/DWAPlannerROS
 /localization/odom
 0.3
-0.8
-0.8
+0.4
+0.4
+scan depth_scan
+scan depth_scan
 data: True
 ```
 
@@ -176,7 +181,7 @@ rostopic echo -n 1 /danger_detector/status
 
 - `/localization/odom` 的 `header.frame_id` 为 `odom`，`child_frame_id` 为 `base`。
 - `/mapping/status`：`ready: True`、`stable: True`、`lost: False`。
-- 使用 `localization_source:=gazebo_truth` 时，正常 `status_reason` 应为
+- 使用 `simulation_truth.launch` 时，正常 `status_reason` 应为
   `TRACKING_GAZEBO_TRUTH_WITH_LOCAL_OCCUPANCY_MAP`，不得显示为 GICP tracking。
 - `/navigation/health`：`ready: True`。
 - `/danger_detector/status`：`ready: True`。
@@ -241,7 +246,7 @@ rostopic echo /cmd_vel
 
 ### 4.2 原地旋转预检
 
-直线预检目标结束后，向相同位置发送约 `90°` 的最终朝向。由于 `xy_goal_tolerance=0.40`，局部规划器会进入标准终点旋转控制：
+直线预检目标结束后，向相同位置发送约 `90°` 的最终朝向。由于 `xy_goal_tolerance=0.15`，局部规划器会进入标准终点旋转控制：
 
 ```bash
 rostopic pub -1 /move_base_simple/goal geometry_msgs/PoseStamped \
@@ -250,8 +255,8 @@ rostopic pub -1 /move_base_simple/goal geometry_msgs/PoseStamped \
 
 验收要求：
 
-- `/danger_search/nav_cmd_vel` 应出现 `|angular.z|=0.80 rad/s` 的原地旋转命令。
-- `/cmd_vel.angular.z` 平滑上升且不超过 `0.80 rad/s`。
+- `/danger_search/nav_cmd_vel` 应出现接近 `|angular.z|=0.40 rad/s` 的原地旋转命令。
+- `/cmd_vel.angular.z` 平滑上升且不超过 `0.40 rad/s`。
 - Gazebo 真值 yaw 应在 `3 s` 内变化至少 `0.20 rad`。
 - 高速转向时长期建图可以暂停，但 `/localization/scan` 和局部 costmap 必须继续更新。
 
@@ -293,6 +298,7 @@ message: "Mission started"
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash
 source devel/setup.bash
 
 rviz
@@ -313,11 +319,12 @@ map
 | Map | `/move_base/local_costmap/costmap` | 局部 rolling costmap |
 | PoseWithCovariance | `/localization/pose` | 当前 map 位姿 |
 | LaserScan | `/localization/scan` | costmap 实际使用的二维激光 |
+| LaserScan | `/localization/depth_obstacle_scan` | RealSense 地面过滤后的低矮近场障碍补盲 |
 | PointCloud | `/scan` | Gazebo 原始点云 |
 | PointCloud2 | `/livox/Pointcloud2` | 转换后的 Livox 点云 |
 | Path | `/move_base/NavfnROS/plan` | Navfn 全局路径 |
-| Path | `/move_base/TrajectoryPlannerROS/global_plan` | 局部规划器接收的全局路径 |
-| Path | `/move_base/TrajectoryPlannerROS/local_plan` | TrajectoryPlannerROS 当前局部轨迹 |
+| Path | `/move_base/DWAPlannerROS/global_plan` | 局部规划器接收的全局路径 |
+| Path | `/move_base/DWAPlannerROS/local_plan` | DWAPlannerROS 当前局部轨迹 |
 | Polygon | `/move_base/local_costmap/footprint` | 当前固定保守 footprint |
 | TF | 无 | 检查 `map -> odom -> base` 和传感器 TF |
 
@@ -330,6 +337,7 @@ map
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash
 source devel/setup.bash
 
 rostopic hz /danger_search/nav_cmd_vel
@@ -391,10 +399,11 @@ rosbag record \
   /localization/pose \
   /localization/odom \
   /localization/scan \
+  /localization/depth_obstacle_scan \
   /move_base/status \
   /move_base/recovery_status \
   /move_base/NavfnROS/plan \
-  /move_base/TrajectoryPlannerROS/local_plan \
+  /move_base/DWAPlannerROS/local_plan \
   /danger_search/nav_cmd_vel \
   /danger_search/cmd_vel_sent \
   /cmd_vel \
@@ -473,6 +482,7 @@ rostopic echo -n 1 /mapping/status
 rostopic echo -n 1 /navigation/health
 rostopic echo -n 1 /localization/pose
 rostopic echo -n 1 /localization/scan
+timeout 5 rostopic hz /localization/depth_obstacle_scan
 rostopic echo -n 1 /move_base/status
 ```
 
@@ -494,6 +504,7 @@ rostopic echo -n 5 /cmd_vel
 
 ```bash
 rostopic hz /localization/scan
+rostopic hz /localization/depth_obstacle_scan
 rostopic hz /localization/odom
 rosrun tf tf_echo odom base
 rosrun tf tf_echo map odom

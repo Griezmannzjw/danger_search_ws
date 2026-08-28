@@ -44,13 +44,16 @@ IDLE -> ENTERING -> EXPLORING -> RETURNING -> FINISHED
 
 ## 结果和坐标
 
-必要 evaluator 字段之外增加 `coordinate_frame` 和 `mission_status`：
+必要 evaluator 字段之外增加 `coordinate_frame`、`mission_status`、运行 profile 和定位后端：
 
 ```json
 {
   "exploration_time": 98.76,
   "coordinate_frame": "world",
   "mission_status": "FINISHED",
+  "run_profile": "formal",
+  "localization_backend": "gicp",
+  "official_eligible": true,
   "detected_danger_sources": []
 }
 ```
@@ -63,15 +66,30 @@ IDLE -> ENTERING -> EXPLORING -> RETURNING -> FINISHED
 默认结果路径由 bringup 解析到同级 `SimEnv/results/detected_danger.json`，也可通过绝对
 `result_file` 覆盖。
 
+正式调用 evaluator 前先运行 fail-closed profile 门禁：
+
+```bash
+rosrun danger_search_mission validate_result.py --official \
+  /home/ruilinli/SimEnv/results/detected_danger.json
+```
+
+只有 `mission_status=FINISHED`、`run_profile=formal`、`localization_backend=gicp` 且
+`official_eligible=true` 时退出码为 0。字段缺失、任务失败、元数据自相矛盾或
+`simulation_truth` 均以退出码 2 拒绝，验收脚本必须在退出码非 0 时停止评分。
+
 ## 正式与隔离运行
 
-正式模式要求 `competition_mode=true`、`multifloor_enabled=true`、GICP 后端、公开 scene
-contract 和 preflight ready。隔离 smoke 可显式关闭这些守卫，但不能作为正式验收结果。
+正式 profile 要求 `competition_mode=true`、`multifloor_enabled=true`、GICP 后端、公开
+scene contract 和 preflight ready。真值 profile 固定要求
+`competition_mode=false`、`multifloor_enabled=true` 和 `gazebo_truth` 后端；其结果文件名必须
+为 `detected_danger.simulation_truth.json`，并始终写出 `official_eligible=false`。两个 profile
+均需 preflight ready；请通过 bringup 的对应 wrapper 启动，而不是混用参数。
 
 ```bash
 roslaunch danger_search_mission mission.launch autostart:=false
 ```
 
-入口分段和返航参数见 `config/default.yaml`。600 秒是比赛硬门槛/评分口径；默认
-`mission_timeout_s=0` 不主动中断。若赛事要求强制超时返航，应在正式 launch 明确设置该
-参数，超时后仍走 RETURNING，不直接写成功结果。
+入口分段和返航参数见 `config/default.yaml`。默认 `mission_timeout_s=0`，探索期间不会
+因为累计耗时自动触发返航；探索自然完成或收到 FinishMission/ReturnHome 请求后才进入
+RETURNING 闭环。600 秒仍是比赛硬门槛/评分口径，由测试端统计；只有实际回到起点并
+满足位置、朝向和连续静止门槛才写 FINISHED。

@@ -8,6 +8,7 @@
 
 #include <costmap_2d/costmap_2d.h>
 #include <geometry_msgs/Point.h>
+#include <ros/time.h>
 
 namespace danger_search_navigation
 {
@@ -18,6 +19,8 @@ enum class EscapeManeuver
   BACKUP = 1,
   STRAFE_LEFT = 2,
   STRAFE_RIGHT = 3,
+  ARC_LEFT = 4,
+  ARC_RIGHT = 5,
 };
 
 struct Pose2D
@@ -47,8 +50,12 @@ struct RecoveryAttemptLease
 class RecoveryAttemptTracker
 {
 public:
-  void acceptGoal(const std::string& goal_id);
-  void cancelGoal(const std::string& goal_id);
+  // GoalID.id is normally unique, but GoalID.stamp is also part of the
+  // actionlib cancellation contract.  Keeping both prevents a late
+  // cancel-before-time message from an older goal invalidating a newer epoch.
+  void acceptGoal(const std::string& goal_id, const ros::Time& goal_stamp);
+  void cancelGoal(
+      const std::string& goal_id, const ros::Time& cancel_before_stamp);
   bool beginAttempt(int max_attempts, RecoveryAttemptLease& lease);
   bool interrupted(
       const RecoveryAttemptLease& lease, bool safety_stop) const;
@@ -59,6 +66,7 @@ private:
   mutable std::mutex mutex_;
   std::uint64_t goal_epoch_{0};
   std::string goal_id_;
+  ros::Time goal_stamp_;
   int attempts_{0};
   bool has_goal_{false};
   bool canceled_{false};
@@ -69,20 +77,23 @@ class EscapeRecoveryCore
 {
 public:
   static Pose2D poseAt(
-      const Pose2D& start, EscapeManeuver maneuver, double distance);
+      const Pose2D& start, EscapeManeuver maneuver, double distance,
+      double arc_curvature = 1.0);
 
   static double progressAlong(
       const Pose2D& start, const Pose2D& current,
-      EscapeManeuver maneuver);
+      EscapeManeuver maneuver, double arc_curvature = 1.0);
 
   static SweepResult evaluateSweep(
       const costmap_2d::Costmap2D& costmap,
       const std::vector<geometry_msgs::Point>& footprint,
       const Pose2D& start, EscapeManeuver maneuver,
-      double distance, double step);
+      double distance, double step, double arc_curvature = 1.0);
 
   static EscapeManeuver selectManeuver(
       const SweepResult& backup,
+      const SweepResult& arc_left,
+      const SweepResult& arc_right,
       const SweepResult& left,
       const SweepResult& right,
       EscapeManeuver excluded = EscapeManeuver::NONE);

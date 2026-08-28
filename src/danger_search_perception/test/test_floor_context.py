@@ -62,6 +62,20 @@ class TestMappingGate(unittest.TestCase):
         )
         self.assertTrue(self.gate.snapshot(2.3).allowed)
 
+    def test_new_map_epoch_invalidates_same_floor_sensor_snapshot(self):
+        self.gate.update(
+            True, True, False, 0, received_s=1.0, map_epoch=10
+        )
+        captured = self.gate.snapshot(1.1)
+        self.assertTrue(captured.allowed)
+
+        # A reset/load can keep every boolean and the floor id unchanged;
+        # map_epoch is still a new coordinate context.
+        self.gate.update(
+            True, True, False, 0, received_s=1.2, map_epoch=11
+        )
+        self.assertFalse(self.gate.is_current(captured, 1.3))
+
 
 class TestFloorHeightClassifier(unittest.TestCase):
     def setUp(self):

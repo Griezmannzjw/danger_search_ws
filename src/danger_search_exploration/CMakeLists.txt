@@ -42,6 +42,7 @@ catkin_install_python(PROGRAMS
 )
 
 if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test/test_entrance_boundary.py)
   catkin_add_nosetests(test/test_simple_frontier.py)
   catkin_add_nosetests(test/test_multifloor.py)
 endif()

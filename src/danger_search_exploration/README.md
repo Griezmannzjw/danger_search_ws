@@ -7,7 +7,8 @@ P1 分层前沿探索和电梯换层执行模块。它只决定目标并调用 n
 
 - 以 `map_epoch/map_version` 为缓存键，用 OpenCV 连通域/WFD 只遍历机器人所在的已知
   可达区域，避免每周期全图 Python BFS。
-- 前沿簇的目标放在已知区内侧，检查完整落点净空，再调用 `/move_base/make_plan`。
+- 前沿簇的目标按“到当前簇”的观察距离放在已知区内侧；到任意未知边界和占用障碍的
+  footprint 净空分别检查，避免相邻前沿错误地互相筛空，再调用 `/move_base/make_plan`。
 - 目标按路径长度、路径最小净空和信息量排序；Action 终态按 goal epoch 隔离，失败采用
   显式 backoff，不允许迟到结果污染新目标。
 - 恢复失败按原始 stuck pose 写入 trap blacklist，并在安全净空连续恢复后解除；不存在
@@ -34,7 +35,7 @@ P1 分层前沿探索和电梯换层执行模块。它只决定目标并调用 n
 
 ```text
 TO_HALL -> OPEN_CURRENT -> VERIFY_HALL -> ENTER -> CLOSE_CURRENT
--> CALL_TARGET -> SWITCH_FLOOR -> EXIT -> CLEAR_COSTMAP -> WAIT_STABLE
+-> CALL_TARGET -> SWITCH_FLOOR -> EXIT -> WAIT_STABLE
 ```
 
 - 厅导航超时按 `make_plan` 路径长度计算，上限 180 秒。
@@ -42,8 +43,9 @@ TO_HALL -> OPEN_CURRENT -> VERIFY_HALL -> ENTER -> CLOSE_CURRENT
   取消、超时或新 action generation 会忽略迟到响应。
 - 进入和退出轿厢各限 20 秒，使用局部激光避障，速度只发布到
   `/danger_search/elevator_cmd_vel`；control 以短租约仲裁。
-- `/localization/switch_floor` 成功后要求 epoch 增加，清空 costmap，并等待至少两个目标层
-  新地图版本、定位健康、地图稳定和 15 秒稳定保持。
+- `/localization/switch_floor` 成功后要求 epoch 增加，并等待至少两个目标层
+  新地图版本、active-map 原子身份、定位健康以及 navigation 完成当前 epoch
+  的 costmap reset，再进行 15 秒稳定保持。探索不直接调用清图服务。
 - 任何失败都取消普通导航、停止局部控制并返回固定失败码；候选索引只递增一次。
 
 电梯厅候选结合门宽、墙面方向、净空和 `make_plan`。靠近候选后通过允许的门服务和局部
@@ -59,10 +61,11 @@ CANCELED STALE_EPOCH
 
 ## ROS 接口
 
-订阅：`/map`、`/localization/pose`、`/mapping/status`、`/navigation/health`、
-`/navigation/recovery_event`、`/localization/scan`。
+订阅：`/map`（仅核对）、`/mapping/active_map`（规划权威）、`/localization/pose`、
+`/mapping/status`、`/navigation/health`、`/navigation/recovery_event`、`/localization/scan`、
+`/danger_search/safety_stop` 和 `/danger_search/cmd_vel_sent`。
 
-调用：`/move_base`、`/move_base/make_plan`、`/move_base/clear_costmaps`、
+调用：`/move_base`、`/move_base/make_plan`、
 `/call_elevator`、`/set_door_state`、`/localization/switch_floor`。
 
 发布：`/exploration/status`、`/exploration/complete`、观察目标/黑名单诊断话题、

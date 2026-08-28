@@ -98,8 +98,43 @@ TEST(EscapeRecoveryCoreTest, BlockedBackupSelectsLowerCostStrafe)
   EXPECT_TRUE(left.safe);
   EXPECT_TRUE(right.safe);
   EXPECT_EQ(
-      EscapeRecoveryCore::selectManeuver(backup, left, right),
+      EscapeRecoveryCore::selectManeuver(
+          backup, SweepResult{}, SweepResult{}, left, right),
       EscapeManeuver::STRAFE_RIGHT);
+}
+
+TEST(EscapeRecoveryCoreTest, ArcSweepChangesHeadingAndIsPreferred)
+{
+  costmap_2d::Costmap2D map = freeMap();
+  const Pose2D start{};
+  const Pose2D end = EscapeRecoveryCore::poseAt(
+      start, EscapeManeuver::ARC_LEFT, 0.45, 1.0);
+  EXPECT_GT(end.x, 0.40);
+  EXPECT_GT(end.y, 0.0);
+  EXPECT_NEAR(end.yaw, 0.45, 1e-9);
+  const SweepResult arc_left = EscapeRecoveryCore::evaluateSweep(
+      map, footprint(), start, EscapeManeuver::ARC_LEFT,
+      0.45, 0.025, 1.0);
+  const SweepResult arc_right = EscapeRecoveryCore::evaluateSweep(
+      map, footprint(), start, EscapeManeuver::ARC_RIGHT,
+      0.45, 0.025, 1.0);
+  ASSERT_TRUE(arc_left.safe);
+  ASSERT_TRUE(arc_right.safe);
+  EXPECT_EQ(
+      EscapeRecoveryCore::selectManeuver(
+          SweepResult{true, 0.0}, arc_left, arc_right,
+          SweepResult{}, SweepResult{}),
+      EscapeManeuver::ARC_LEFT);
+}
+
+TEST(EscapeRecoveryCoreTest, ExcludedArcUsesOppositeArc)
+{
+  const SweepResult safe{true, 0.0};
+  const SweepResult blocked{false, 255.0};
+  EXPECT_EQ(
+      EscapeRecoveryCore::selectManeuver(
+          safe, safe, safe, blocked, blocked, EscapeManeuver::ARC_LEFT),
+      EscapeManeuver::ARC_RIGHT);
 }
 
 TEST(EscapeRecoveryCoreTest, ExcludedDirectionIsNotRetried)
@@ -108,7 +143,8 @@ TEST(EscapeRecoveryCoreTest, ExcludedDirectionIsNotRetried)
   const SweepResult blocked{false, 255.0};
   EXPECT_EQ(
       EscapeRecoveryCore::selectManeuver(
-          safe, blocked, blocked, EscapeManeuver::BACKUP),
+          safe, blocked, blocked, blocked, blocked,
+          EscapeManeuver::BACKUP),
       EscapeManeuver::NONE);
 }
 
@@ -128,12 +164,12 @@ TEST(EscapeRecoveryCoreTest, ProgressUsesSelectedRobotAxis)
 TEST(RecoveryAttemptTrackerTest, NewGoalInterruptsOldLeaseAndResetsBudget)
 {
   RecoveryAttemptTracker tracker;
-  tracker.acceptGoal("goal-a");
+  tracker.acceptGoal("goal-a", ros::Time(10, 0));
   RecoveryAttemptLease old_lease;
   ASSERT_TRUE(tracker.beginAttempt(2, old_lease));
   EXPECT_EQ(old_lease.attempt, 1);
 
-  tracker.acceptGoal("goal-b");
+  tracker.acceptGoal("goal-b", ros::Time(20, 0));
   EXPECT_TRUE(tracker.interrupted(old_lease, false));
   tracker.finishAttempt(old_lease, EscapeManeuver::BACKUP);
 
@@ -146,12 +182,12 @@ TEST(RecoveryAttemptTrackerTest, NewGoalInterruptsOldLeaseAndResetsBudget)
 TEST(RecoveryAttemptTrackerTest, CancelOnlyInterruptsMatchingGoal)
 {
   RecoveryAttemptTracker tracker;
-  tracker.acceptGoal("goal-a");
+  tracker.acceptGoal("goal-a", ros::Time(10, 0));
   RecoveryAttemptLease lease;
   ASSERT_TRUE(tracker.beginAttempt(2, lease));
-  tracker.cancelGoal("another-goal");
+  tracker.cancelGoal("another-goal", ros::Time());
   EXPECT_FALSE(tracker.interrupted(lease, false));
-  tracker.cancelGoal("goal-a");
+  tracker.cancelGoal("goal-a", ros::Time());
   EXPECT_TRUE(tracker.interrupted(lease, false));
   RecoveryAttemptLease blocked;
   EXPECT_FALSE(tracker.beginAttempt(2, blocked));
@@ -160,19 +196,56 @@ TEST(RecoveryAttemptTrackerTest, CancelOnlyInterruptsMatchingGoal)
 TEST(RecoveryAttemptTrackerTest, EmptyCancelAndSafetyStopAreImmediate)
 {
   RecoveryAttemptTracker tracker;
-  tracker.acceptGoal("goal-a");
+  tracker.acceptGoal("goal-a", ros::Time(10, 0));
   RecoveryAttemptLease lease;
   ASSERT_TRUE(tracker.beginAttempt(2, lease));
   EXPECT_TRUE(tracker.interrupted(lease, true));
   EXPECT_FALSE(tracker.interrupted(lease, false));
-  tracker.cancelGoal("");
+  tracker.cancelGoal("", ros::Time());
   EXPECT_TRUE(tracker.interrupted(lease, false));
+}
+
+TEST(RecoveryAttemptTrackerTest, LateCancelBeforeTimeCannotCancelNewGoalEpoch)
+{
+  RecoveryAttemptTracker tracker;
+  tracker.acceptGoal("goal-a", ros::Time(10, 0));
+  RecoveryAttemptLease old_lease;
+  ASSERT_TRUE(tracker.beginAttempt(2, old_lease));
+
+  tracker.acceptGoal("goal-b", ros::Time(20, 0));
+  RecoveryAttemptLease new_lease;
+  ASSERT_TRUE(tracker.beginAttempt(2, new_lease));
+  EXPECT_TRUE(tracker.interrupted(old_lease, false));
+
+  // This is actionlib's cancel-all-before-time form.  It may cancel goal-a,
+  // but must not cancel the goal accepted after its timestamp.
+  tracker.cancelGoal("", ros::Time(10, 0));
+  EXPECT_FALSE(tracker.interrupted(new_lease, false));
+
+  tracker.cancelGoal("", ros::Time(20, 0));
+  EXPECT_TRUE(tracker.interrupted(new_lease, false));
+}
+
+TEST(RecoveryAttemptTrackerTest, SameIdWithNewStampStartsFreshEpoch)
+{
+  RecoveryAttemptTracker tracker;
+  tracker.acceptGoal("reused-id", ros::Time(10, 0));
+  RecoveryAttemptLease old_lease;
+  ASSERT_TRUE(tracker.beginAttempt(2, old_lease));
+
+  tracker.acceptGoal("reused-id", ros::Time(20, 0));
+  RecoveryAttemptLease new_lease;
+  ASSERT_TRUE(tracker.beginAttempt(2, new_lease));
+  EXPECT_TRUE(tracker.interrupted(old_lease, false));
+
+  tracker.cancelGoal("", ros::Time(10, 0));
+  EXPECT_FALSE(tracker.interrupted(new_lease, false));
 }
 
 TEST(RecoveryAttemptTrackerTest, TwoInstancesShareAttemptAndExclusionState)
 {
   RecoveryAttemptTracker tracker;
-  tracker.acceptGoal("goal-a");
+  tracker.acceptGoal("goal-a", ros::Time(10, 0));
   RecoveryAttemptLease first;
   ASSERT_TRUE(tracker.beginAttempt(2, first));
   tracker.finishAttempt(first, EscapeManeuver::BACKUP);

@@ -1,5 +1,6 @@
 <launch>
   <arg name="config_file" default="$(find danger_search_localization)/config/default.yaml" />
+  <arg name="run_profile" default="formal" />
   <arg name="competition_mode" default="true" />
   <arg name="multifloor_enabled" default="true" />
   <arg name="localization_backend" default="gicp" />
@@ -17,6 +18,20 @@
         type="scan_projector.py"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
+    <param name="run_profile" value="$(arg run_profile)" />
+    <param name="competition_mode" value="$(arg competition_mode)" />
+    <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
+    <param name="localization_backend" value="$(arg localization_backend)" />
+  </node>
+
+  <!-- Front depth camera fills the Livox near/low blind zone for costmaps only. -->
+  <node name="depth_obstacle_projector"
+        pkg="danger_search_localization"
+        type="depth_obstacle_projector.py"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="run_profile" value="$(arg run_profile)" />
+    <param name="competition_mode" value="$(arg competition_mode)" />
   </node>
 
   <!-- GICP 提供连续局部里程计，其健康状态参与 P0 readiness。 -->
@@ -26,6 +41,10 @@
           type="lidar_odometry_node"
           output="screen">
       <rosparam command="load" file="$(arg config_file)" />
+      <param name="run_profile" value="$(arg run_profile)" />
+      <param name="competition_mode" value="$(arg competition_mode)" />
+      <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
+      <param name="localization_backend" value="$(arg localization_backend)" />
     </node>
   </group>
 
@@ -36,6 +55,10 @@
           type="gazebo_truth_odometry.py"
           output="screen">
       <rosparam command="load" file="$(arg config_file)" />
+      <param name="run_profile" value="$(arg run_profile)" />
+      <param name="competition_mode" value="$(arg competition_mode)" />
+      <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
+      <param name="localization_backend" value="$(arg localization_backend)" />
       <!-- Test-only truth parameters are never loaded into formal nodes. -->
       <param name="gazebo_link_states_topic" value="/gazebo/link_states" />
       <param name="gazebo_base_link" value="$(arg gazebo_base_link)" />
@@ -53,10 +76,12 @@
           type="occupancy_mapper.py"
           output="screen">
       <rosparam command="load" file="$(arg config_file)" />
+      <param name="run_profile" value="$(arg run_profile)" />
+      <param name="competition_mode" value="$(arg competition_mode)" />
       <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
       <param name="localization_backend" value="$(arg localization_backend)" />
       <param name="explicit_floor_switching"
-             value="$(eval arg('localization_backend') == 'gicp' and arg('multifloor_enabled'))" />
+             value="$(arg multifloor_enabled)" />
     </node>
   </group>
 
@@ -82,9 +107,11 @@
         type="pose_estimator.py"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
+    <param name="run_profile" value="$(arg run_profile)" />
     <param name="competition_mode" value="$(arg competition_mode)" />
     <param name="localization_backend" value="$(arg localization_backend)" />
     <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
+    <param name="explicit_floor_switching" value="$(arg multifloor_enabled)" />
     <!-- Truth scans and poses share timestamps; do not extrapolate TF into the future. -->
     <param name="tf_publish_future_tolerance_s"
            value="$(eval 0.0 if arg('localization_backend') == 'gazebo_truth' else 0.5)" />

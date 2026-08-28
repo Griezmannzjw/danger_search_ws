@@ -2,10 +2,12 @@
 """Fail-closed runtime contract check for formal competition launches."""
 
 import json
+import math
 import os
 import sys
 import time
 
+from geometry_msgs.msg import PoseWithCovarianceStamped
 import rosgraph
 import rosservice
 import rospy
@@ -26,6 +28,19 @@ FORBIDDEN_TOPICS = {
     "/ground_truth/RL_foot",
     "/ground_truth/RR_foot",
 }
+RUN_PROFILE_FORMAL = "formal"
+RUN_PROFILE_SIMULATION_TRUTH = "simulation_truth"
+TRUTH_LINK_STATES_TOPIC = "/gazebo/link_states"
+TRUTH_ODOMETRY_NODE = "/gazebo_truth_odometry"
+TRUTH_LINK_STATES_TYPE = "gazebo_msgs/LinkStates"
+TRUTH_GAZEBO_BASE_LINK = "a1_gazebo::base"
+TRUTH_PARAMETER_PATH = "/gazebo_truth_odometry/gazebo_link_states_topic"
+TRUTH_RAW_POSE_TOPIC = "/localization/raw_pose"
+TRUTH_RAW_POSE_TYPE = "geometry_msgs/PoseWithCovarianceStamped"
+RESULT_FILENAME_BY_RUN_PROFILE = {
+    RUN_PROFILE_FORMAL: "detected_danger.json",
+    RUN_PROFILE_SIMULATION_TRUTH: "detected_danger.simulation_truth.json",
+}
 FORBIDDEN_FILE_BASENAMES = {
     "layout_metadata.json",
     "building_config.json",
@@ -37,12 +52,41 @@ FORMAL_FALSE_ENVIRONMENT = (
     "ENABLE_GROUND_TRUTH",
     "POINTCLOUD_USE_GROUND_TRUTH_ODOM",
 )
+REQUIRED_TOPIC_TYPES = {
+    "/scan": "sensor_msgs/PointCloud",
+    "/trunk_imu": "sensor_msgs/Imu",
+    "/real_sense/rgb/image_raw": "sensor_msgs/Image",
+    "/real_sense/depth/image_raw": "sensor_msgs/Image",
+    "/real_sense/depth/camera_info": "sensor_msgs/CameraInfo",
+    "/real_sense/rgb/camera_info": "sensor_msgs/CameraInfo",
+    "/localization/depth_obstacle_scan": "sensor_msgs/LaserScan",
+    "/mapping/status": "danger_search_common/MappingStatus",
+    # These make the floor/map/navigation envelope observable before mission
+    # can consume a preflight READY latch.
+    "/mapping/active_map": "danger_search_common/FloorOccupancyGrid",
+    "/navigation/health": "danger_search_common/NavigationHealth",
+}
 ALGORITHM_NODES = {
     "/competition_preflight",
     "/control",
     "/entrance_door",
     "/exploration",
     "/lidar_odometry",
+    "/local_occupancy_mapper",
+    "/depth_obstacle_projector",
+    "/local_scan_projector",
+    "/localization_adapter",
+    TRUTH_ODOMETRY_NODE,
+    "/mission",
+    "/move_base",
+    "/navigation_config_guard",
+    "/navigation_monitor",
+    "/perception",
+    "/posture_safety_monitor",
+}
+RUNTIME_IDENTITY_NODES = {
+    "/control",
+    "/exploration",
     "/local_occupancy_mapper",
     "/local_scan_projector",
     "/localization_adapter",
@@ -54,19 +98,63 @@ ALGORITHM_NODES = {
 }
 
 
+def normalize_run_profile(run_profile):
+    normalized = str(run_profile or RUN_PROFILE_FORMAL).strip().lower()
+    if normalized not in {RUN_PROFILE_FORMAL, RUN_PROFILE_SIMULATION_TRUTH}:
+        raise ValueError("run_profile must be formal or simulation_truth")
+    return normalized
+
+
+def expected_result_filename(run_profile):
+    return RESULT_FILENAME_BY_RUN_PROFILE[normalize_run_profile(run_profile)]
+
+
 def validate_runtime_contract(competition_mode, multifloor_enabled,
-                              localization_backend, environment):
+                              localization_backend, environment,
+                              run_profile=RUN_PROFILE_FORMAL):
     errors = []
-    if competition_mode and not multifloor_enabled:
-        errors.append("competition_mode requires multifloor_enabled=true")
-    if competition_mode and localization_backend != "gicp":
-        errors.append("competition_mode requires localization_backend=gicp")
-    if competition_mode:
+    try:
+        run_profile = normalize_run_profile(run_profile)
+    except ValueError as exc:
+        return [str(exc)]
+    if run_profile == RUN_PROFILE_FORMAL:
+        if not competition_mode:
+            errors.append("formal profile requires competition_mode=true")
+        if not multifloor_enabled:
+            errors.append("formal profile requires multifloor_enabled=true")
+        if localization_backend != "gicp":
+            errors.append("formal profile requires localization_backend=gicp")
         for name in FORMAL_FALSE_ENVIRONMENT:
             value = str(environment.get(name, "0")).strip().lower()
             if value not in {"0", "false", "off", "no"}:
-                errors.append("%s must be disabled in competition mode" % name)
+                errors.append("%s must be disabled in formal profile" % name)
+    else:
+        if competition_mode:
+            errors.append("simulation_truth profile requires competition_mode=false")
+        if not multifloor_enabled:
+            errors.append("simulation_truth profile requires multifloor_enabled=true")
+        if localization_backend != "gazebo_truth":
+            errors.append(
+                "simulation_truth profile requires localization_backend=gazebo_truth"
+            )
     return errors
+
+
+def validate_truth_base_link(run_profile, gazebo_base_link):
+    """Keep the simulation truth adapter scoped to the competition robot.
+
+    ``system.launch`` is deliberately an internal assembly entry point, but
+    it still must not become a generic ``/gazebo/link_states`` adapter when
+    invoked directly.  The formal profile does not consume this parameter.
+    """
+    if normalize_run_profile(run_profile) != RUN_PROFILE_SIMULATION_TRUTH:
+        return []
+    if str(gazebo_base_link).strip() != TRUTH_GAZEBO_BASE_LINK:
+        return [
+            "simulation_truth profile requires gazebo_base_link=%s"
+            % TRUTH_GAZEBO_BASE_LINK
+        ]
+    return []
 
 
 def load_public_scene_contract(path):
@@ -83,21 +171,22 @@ def load_public_scene_contract(path):
     return normalized, document
 
 
-def effective_forbidden_topics(public_scene_contract=None):
+def effective_forbidden_topics(public_scene_contract=None,
+                               run_profile=RUN_PROFILE_FORMAL):
     """Combine fail-closed built-ins with optional referee additions."""
     topics = set(FORBIDDEN_TOPICS)
-    if not public_scene_contract:
-        return topics
-    declared = public_scene_contract.get("referee_only", {}).get(
-        "forbidden_topics", []
-    )
-    if declared is None:
-        return topics
-    if not isinstance(declared, list) or not all(
-            isinstance(topic, str) and topic.startswith("/")
-            for topic in declared):
-        raise ValueError("referee_only.forbidden_topics must be a topic list")
-    topics.update(declared)
+    if public_scene_contract:
+        declared = public_scene_contract.get("referee_only", {}).get(
+            "forbidden_topics", []
+        )
+        if declared is not None:
+            if not isinstance(declared, list) or not all(
+                    isinstance(topic, str) and topic.startswith("/")
+                    for topic in declared):
+                raise ValueError("referee_only.forbidden_topics must be a topic list")
+            topics.update(declared)
+    if normalize_run_profile(run_profile) == RUN_PROFILE_SIMULATION_TRUTH:
+        topics.discard(TRUTH_LINK_STATES_TOPIC)
     return topics
 
 
@@ -124,6 +213,64 @@ def forbidden_parameter_references(parameter_tree, forbidden_topics=None):
             violations.append("%s references forbidden file %s" % (path, basename))
 
     visit("", parameter_tree)
+    return violations
+
+
+def truth_parameter_reference_violations(parameter_tree):
+    """Allow the Gazebo link-state parameter only on the dedicated test node."""
+    violations = []
+
+    def visit(path, value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                visit(path + "/" + str(key), child)
+            return
+        if isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                visit(path + "/" + str(index), child)
+            return
+        if isinstance(value, str) and value.strip() == TRUTH_LINK_STATES_TOPIC:
+            if path != TRUTH_PARAMETER_PATH:
+                violations.append(
+                    "%s references %s outside %s" % (
+                        path, TRUTH_LINK_STATES_TOPIC, TRUTH_PARAMETER_PATH
+                    )
+                )
+
+    visit("", parameter_tree)
+    return violations
+
+
+def runtime_identity_parameter_violations(
+        parameter_tree, run_profile, competition_mode,
+        multifloor_enabled, localization_backend):
+    """Require every assembled algorithm component to share one identity."""
+    run_profile = normalize_run_profile(run_profile)
+    nodes = set(RUNTIME_IDENTITY_NODES)
+    nodes.add(
+        TRUTH_ODOMETRY_NODE
+        if run_profile == RUN_PROFILE_SIMULATION_TRUTH
+        else "/lidar_odometry"
+    )
+    expected = {
+        "run_profile": run_profile,
+        "competition_mode": bool(competition_mode),
+        "multifloor_enabled": bool(multifloor_enabled),
+        "localization_backend": str(localization_backend),
+    }
+    violations = []
+    for node in sorted(nodes):
+        params = parameter_tree.get(node.lstrip("/"), {})
+        if not isinstance(params, dict):
+            params = {}
+        for key, expected_value in expected.items():
+            actual = params.get(key, None)
+            if actual != expected_value:
+                violations.append(
+                    "%s/%s is %r, expected %r" % (
+                        node, key, actual, expected_value
+                    )
+                )
     return violations
 
 
@@ -167,9 +314,37 @@ def forbidden_algorithm_subscriptions(subscribers, forbidden_topics,
     return violations
 
 
+def truth_subscription_violations(subscribers, algorithm_nodes=None):
+    """The simulation profile gives exactly one algorithm node truth access."""
+    algorithm_nodes = set(algorithm_nodes or ALGORITHM_NODES)
+    owners = set(subscribers.get(TRUTH_LINK_STATES_TOPIC, []))
+    algorithm_owners = owners.intersection(algorithm_nodes)
+    violations = []
+    unexpected = sorted(algorithm_owners - {TRUTH_ODOMETRY_NODE})
+    if unexpected:
+        violations.append(
+            "simulation truth subscription %s by %s" % (
+                TRUTH_LINK_STATES_TOPIC, unexpected
+            )
+        )
+    if TRUTH_ODOMETRY_NODE not in algorithm_owners:
+        violations.append(
+            "%s must subscribe to %s" % (
+                TRUTH_ODOMETRY_NODE, TRUTH_LINK_STATES_TOPIC
+            )
+        )
+    return violations
+
+
 class CompetitionPreflight:
     def __init__(self):
         rospy.init_node("competition_preflight", anonymous=False)
+        try:
+            self.run_profile = normalize_run_profile(
+                rospy.get_param("~run_profile", RUN_PROFILE_FORMAL)
+            )
+        except ValueError as exc:
+            raise rospy.ROSInitException(str(exc))
         self.competition_mode = bool(rospy.get_param("~competition_mode", True))
         self.multifloor_enabled = bool(rospy.get_param("~multifloor_enabled", True))
         self.localization_backend = str(rospy.get_param(
@@ -184,6 +359,27 @@ class CompetitionPreflight:
         self.base_frame = str(rospy.get_param("~base_frame", "base"))
         self.cmd_topic = str(rospy.get_param("~cmd_topic", "/cmd_vel"))
         self.cmd_owner = str(rospy.get_param("~cmd_owner", "/control"))
+        self.gazebo_base_link = str(rospy.get_param(
+            "~gazebo_base_link", "a1_gazebo::base"
+        ))
+        self.truth_link_max_age_s = float(rospy.get_param(
+            "~truth_link_max_age_s", 1.0
+        ))
+        if (not math.isfinite(self.truth_link_max_age_s)
+                or self.truth_link_max_age_s <= 0.0):
+            raise rospy.ROSInitException("~truth_link_max_age_s must be positive")
+        self._truth_raw_pose_received_at = None
+        self._truth_raw_pose_subscriber = None
+        if self.run_profile == RUN_PROFILE_SIMULATION_TRUTH:
+            # Do not subscribe to LinkStates here: only gazebo_truth_odometry
+            # is allowed to consume it. Its raw-pose output proves that the
+            # configured link is present and fresh for the current scan.
+            self._truth_raw_pose_subscriber = rospy.Subscriber(
+                TRUTH_RAW_POSE_TOPIC,
+                PoseWithCovarianceStamped,
+                self._truth_raw_pose_callback,
+                queue_size=1,
+            )
         self.forbidden_topics = set(FORBIDDEN_TOPICS)
         self.ready_pub = rospy.Publisher(
             "/danger_search/preflight_ready", Bool, queue_size=1, latch=True
@@ -193,29 +389,59 @@ class CompetitionPreflight:
         )
         self.ready_pub.publish(Bool(data=False))
 
+    def _truth_raw_pose_callback(self, _message):
+        self._truth_raw_pose_received_at = time.monotonic()
+
     def _static_checks(self):
         errors = validate_runtime_contract(
             self.competition_mode,
             self.multifloor_enabled,
             self.localization_backend,
             os.environ,
+            self.run_profile,
         )
+        errors.extend(validate_truth_base_link(
+            self.run_profile, self.gazebo_base_link
+        ))
         try:
             _path, scene = load_public_scene_contract(self.scene_info_file)
-            self.forbidden_topics = effective_forbidden_topics(scene)
+            self.forbidden_topics = effective_forbidden_topics(
+                scene, self.run_profile
+            )
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             errors.append("invalid team_scene_info.json: %s" % exc)
         if not self.result_file:
             errors.append("result_file is empty")
         else:
+            try:
+                expected_basename = expected_result_filename(self.run_profile)
+            except ValueError:
+                expected_basename = None
+            if (expected_basename is not None
+                    and os.path.basename(self.result_file) != expected_basename):
+                errors.append(
+                    "result_file must end with %s for %s profile" % (
+                        expected_basename, self.run_profile
+                    )
+                )
             directory = os.path.dirname(self.result_file)
             if not os.path.isdir(directory):
                 errors.append("result directory does not exist: %s" % directory)
             elif not os.access(directory, os.W_OK):
                 errors.append("result directory is not writable: %s" % directory)
-        errors.extend(forbidden_parameter_references(
-            rospy.get_param("/", {}), self.forbidden_topics
+        parameter_tree = rospy.get_param("/", {})
+        errors.extend(runtime_identity_parameter_violations(
+            parameter_tree,
+            self.run_profile,
+            self.competition_mode,
+            self.multifloor_enabled,
+            self.localization_backend,
         ))
+        errors.extend(forbidden_parameter_references(
+            parameter_tree, self.forbidden_topics
+        ))
+        if self.run_profile == RUN_PROFILE_SIMULATION_TRUTH:
+            errors.extend(truth_parameter_reference_violations(parameter_tree))
         # Importing generated classes above proves the source order; checking
         # _type also guards against a shadow package with the same module name.
         if CallElevator._type != "building_generator_interfaces/CallElevator":
@@ -237,6 +463,8 @@ class CompetitionPreflight:
         errors.extend(forbidden_algorithm_subscriptions(
             subscribers, self.forbidden_topics
         ))
+        if self.run_profile == RUN_PROFILE_SIMULATION_TRUTH:
+            errors.extend(truth_subscription_violations(subscribers))
         owner_error = command_owner_error(
             publishers.get(self.cmd_topic, []), self.cmd_owner
         )
@@ -260,20 +488,39 @@ class CompetitionPreflight:
                 )
 
         topic_types = dict(rospy.get_published_topics())
-        required_topics = {
-            "/scan": "sensor_msgs/PointCloud",
-            "/trunk_imu": "sensor_msgs/Imu",
-            "/real_sense/rgb/image_raw": "sensor_msgs/Image",
-            "/real_sense/depth/image_raw": "sensor_msgs/Image",
-            "/real_sense/rgb/camera_info": "sensor_msgs/CameraInfo",
-            "/mapping/status": "danger_search_common/MappingStatus",
-        }
-        for topic, expected_type in required_topics.items():
+        for topic, expected_type in REQUIRED_TOPIC_TYPES.items():
             actual_type = topic_types.get(topic)
             if actual_type != expected_type:
                 errors.append(
                     "%s type is %s, expected %s" % (
                         topic, actual_type or "unavailable", expected_type
+                    )
+                )
+        if self.run_profile == RUN_PROFILE_SIMULATION_TRUTH:
+            actual_type = topic_types.get(TRUTH_LINK_STATES_TOPIC)
+            if actual_type != TRUTH_LINK_STATES_TYPE:
+                errors.append(
+                    "%s type is %s, expected %s" % (
+                        TRUTH_LINK_STATES_TOPIC,
+                        actual_type or "unavailable",
+                        TRUTH_LINK_STATES_TYPE,
+                    )
+                )
+            raw_pose_type = topic_types.get(TRUTH_RAW_POSE_TOPIC)
+            if raw_pose_type != TRUTH_RAW_POSE_TYPE:
+                errors.append(
+                    "%s type is %s, expected %s" % (
+                        TRUTH_RAW_POSE_TOPIC,
+                        raw_pose_type or "unavailable",
+                        TRUTH_RAW_POSE_TYPE,
+                    )
+                )
+            received_at = self._truth_raw_pose_received_at
+            if received_at is None or (
+                    time.monotonic() - received_at > self.truth_link_max_age_s):
+                errors.append(
+                    "%s has no fresh pose from Gazebo link %s" % (
+                        TRUTH_RAW_POSE_TOPIC, self.gazebo_base_link
                     )
                 )
         try:
@@ -301,7 +548,7 @@ class CompetitionPreflight:
             if not last_errors:
                 self.ready_pub.publish(Bool(data=True))
                 self.status_pub.publish(String(data="READY"))
-                rospy.loginfo("[preflight] competition runtime contract READY")
+                rospy.loginfo("[preflight] %s runtime contract READY", self.run_profile)
                 rospy.spin()
                 return
             self.status_pub.publish(String(data="WAITING: " + "; ".join(last_errors)))

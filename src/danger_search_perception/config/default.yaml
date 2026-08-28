@@ -14,8 +14,9 @@ mapping_status_timeout_s: 1.5
 # 每个检测都携带采集期间的定位修正版本；版本变化中的帧整帧丢弃。
 require_localization_status: true
 localization_status_timeout_s: 1.5
-# 用图像采集时刻的 map->base 高度复核楼层，避免换层瞬间错标。
-verify_floor_height: true
+# 楼层身份只来自显式 SwitchFloor/MappingStatus；连续位姿 z（包括
+# Gazebo 真值 z）只能作为可选诊断复核，不能推进或决定楼层。
+verify_floor_height: false
 floor_heights: [0.0, 2.6, 5.2]
 floor_height_tolerance_m: 0.45
 

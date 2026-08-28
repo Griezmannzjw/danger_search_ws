@@ -40,10 +40,10 @@ from nav_msgs.msg import GridCells, OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from std_srvs.srv import Trigger, TriggerResponse
-from std_srvs.srv import Empty
 from std_msgs.msg import Bool, Header, Int32, String
 from nav_msgs.srv import GetPlan
 from danger_search_common.msg import (
+    FloorOccupancyGrid,
     MappingStatus,
     NavigationHealth,
     RecoveryEvent,
@@ -52,6 +52,7 @@ from danger_search_common.msg import (
     TransitFloorResult,
 )
 from danger_search_common.srv import SwitchFloor
+from danger_search_common.short_range_safety import swept_footprint_obstacle
 
 try:
     from building_generator_interfaces.srv import (
@@ -216,6 +217,146 @@ def scan_door_changed(open_ranges, closed_ranges, change_threshold_m=0.20,
     )
 
 
+def entrance_boundary_anchor_from_pose(pose, floor_id):
+    """Return a start-pose anchor for the entrance-side frontier guard.
+
+    The guard deliberately uses only the localization pose that is already
+    available to exploration.  It never consumes a building layout or an
+    entrance truth pose.  ``yaw`` defines the forward half-plane at the point
+    exploration is started.
+    """
+    position = getattr(pose, "position", None)
+    orientation = getattr(pose, "orientation", None)
+    if position is None or orientation is None:
+        raise ValueError("pose must contain position and orientation")
+    values = (
+        position.x, position.y,
+        orientation.x, orientation.y, orientation.z, orientation.w,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("entrance boundary pose must be finite")
+    qx, qy, qz, qw = (float(value) for value in values[2:])
+    norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if norm < 1e-6:
+        raise ValueError("entrance boundary orientation is invalid")
+    qx, qy, qz, qw = (value / norm for value in (qx, qy, qz, qw))
+    yaw = math.atan2(
+        2.0 * (qw * qz + qx * qy),
+        1.0 - 2.0 * (qy * qy + qz * qz),
+    )
+    return (float(position.x), float(position.y), yaw, int(floor_id))
+
+
+def entrance_boundary_allows_goal(anchor, goal_x, goal_y, allowance_m):
+    """Whether a goal is not behind an entrance start-pose boundary."""
+    if anchor is None:
+        return True
+    if len(anchor) != 4:
+        raise ValueError("entrance boundary anchor must have four fields")
+    anchor_x, anchor_y, anchor_yaw, _floor_id = anchor
+    values = (anchor_x, anchor_y, anchor_yaw, goal_x, goal_y, allowance_m)
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("entrance boundary values must be finite")
+    allowance_m = float(allowance_m)
+    if allowance_m < 0.0:
+        raise ValueError("entrance boundary allowance must be non-negative")
+    forward_m = (
+        math.cos(float(anchor_yaw)) * (float(goal_x) - float(anchor_x))
+        + math.sin(float(anchor_yaw)) * (float(goal_y) - float(anchor_y))
+    )
+    return forward_m >= -allowance_m
+
+
+def path_prefix_goal(points, maximum_length_m):
+    """Return a pose no farther than ``maximum_length_m`` along a path.
+
+    Long Navfn detours are split into bounded receding-horizon waypoints.  The
+    next planning cycle can then use the newly observed map instead of holding
+    one stale frontier action for the complete building-scale detour.
+    """
+    maximum_length_m = float(maximum_length_m)
+    if not math.isfinite(maximum_length_m) or maximum_length_m <= 0.0:
+        raise ValueError("maximum path prefix length must be positive")
+    normalized = [tuple(float(value) for value in point[:2]) for point in points]
+    if not normalized or not all(
+            len(point) == 2 and all(math.isfinite(value) for value in point)
+            for point in normalized):
+        raise ValueError("path points must be finite x/y pairs")
+    if len(normalized) == 1:
+        return normalized[0][0], normalized[0][1], 0.0, 0.0, False
+
+    traversed = 0.0
+    last_yaw = 0.0
+    for index in range(1, len(normalized)):
+        start_x, start_y = normalized[index - 1]
+        end_x, end_y = normalized[index]
+        delta_x = end_x - start_x
+        delta_y = end_y - start_y
+        segment = math.hypot(delta_x, delta_y)
+        if segment <= 1e-9:
+            continue
+        last_yaw = math.atan2(delta_y, delta_x)
+        if traversed + segment >= maximum_length_m:
+            ratio = (maximum_length_m - traversed) / segment
+            return (
+                start_x + ratio * delta_x,
+                start_y + ratio * delta_y,
+                last_yaw,
+                maximum_length_m,
+                True,
+            )
+        traversed += segment
+    end_x, end_y = normalized[-1]
+    return end_x, end_y, last_yaw, traversed, False
+
+
+def bounded_navigation_timeout(
+        path_length_m, maximum_timeout_s, base_timeout_s,
+        seconds_per_meter, minimum_timeout_s):
+    """Allocate a deterministic action timeout from the dispatched path."""
+    values = tuple(float(value) for value in (
+        path_length_m,
+        maximum_timeout_s,
+        base_timeout_s,
+        seconds_per_meter,
+        minimum_timeout_s,
+    ))
+    if (not all(math.isfinite(value) for value in values)
+            or path_length_m < 0.0 or maximum_timeout_s <= 0.0
+            or base_timeout_s < 0.0 or seconds_per_meter <= 0.0
+            or minimum_timeout_s <= 0.0
+            or minimum_timeout_s > maximum_timeout_s):
+        raise ValueError("navigation timeout parameters are invalid")
+    estimate = base_timeout_s + seconds_per_meter * path_length_m
+    return min(maximum_timeout_s, max(minimum_timeout_s, estimate))
+
+
+def map_context_is_committed(mapping_context, consumer_context):
+    """Whether a same-epoch consumer snapshot is safe to use.
+
+    MappingStatus, the active-map envelope and NavigationHealth travel over
+    independent ROS connections.  Requiring their content versions to be
+    equal at one instant can permanently starve planning while a live mapper
+    keeps publishing.  Floor and epoch are coordinate-frame identity and must
+    remain exact; a positive consumer version may lag the latest mapping
+    status within that epoch, but may never lead it.
+    """
+    if mapping_context is None or consumer_context is None:
+        return False
+    try:
+        mapping = tuple(int(value) for value in mapping_context)
+        consumer = tuple(int(value) for value in consumer_context)
+    except (TypeError, ValueError):
+        return False
+    if len(mapping) != 3 or len(consumer) != 3:
+        return False
+    return (
+        mapping[:2] == consumer[:2]
+        and mapping[2] >= 1
+        and 1 <= consumer[2] <= mapping[2]
+    )
+
+
 class ExplorationPlanner:
     def __init__(self):
         rospy.init_node("exploration_planner", anonymous=False)
@@ -224,6 +365,9 @@ class ExplorationPlanner:
         self.map_frame = rospy.get_param("~map_frame", "map")
 
         self.map_topic = rospy.get_param("~map_topic", "/map")
+        self.active_map_topic = rospy.get_param(
+            "~active_map_topic", "/mapping/active_map"
+        )
         self.pose_topic = rospy.get_param("~pose_topic", "/localization/pose")
         self.mapping_status_topic = rospy.get_param("~mapping_status_topic", "/mapping/status")
         self.navigation_health_topic = rospy.get_param("~navigation_health_topic", "/navigation/health")
@@ -267,11 +411,53 @@ class ExplorationPlanner:
             raise rospy.ROSInitException(
                 "~connectivity_clearance_radius must be finite and non-negative"
             )
-        self.max_frontier_candidates = rospy.get_param("~max_frontier_candidates", 20)
+        # Straight-line order is only a cheap prefilter: the final ranking uses
+        # Navfn path length.  Keep a sufficiently broad bounded pool so a
+        # candidate just beyond a doorway/wall detour is not discarded before
+        # its true path cost can be measured.
+        self.max_frontier_candidates = int(
+            rospy.get_param("~max_frontier_candidates", 64)
+        )
+        if self.max_frontier_candidates < 1:
+            raise rospy.ROSInitException(
+                "~max_frontier_candidates must be a positive integer"
+            )
         self.goal_timeout = rospy.get_param("~goal_timeout", 60.0)
+        self.max_frontier_goal_path_m = float(rospy.get_param(
+            "~max_frontier_goal_path_m", 8.0
+        ))
+        self.goal_timeout_base_s = float(rospy.get_param(
+            "~goal_timeout_base_s", 20.0
+        ))
+        self.goal_timeout_per_path_m = float(rospy.get_param(
+            "~goal_timeout_per_path_m", 4.0
+        ))
+        self.goal_timeout_min_s = float(rospy.get_param(
+            "~goal_timeout_min_s", 30.0
+        ))
+        timeout_values = (
+            self.goal_timeout,
+            self.max_frontier_goal_path_m,
+            self.goal_timeout_base_s,
+            self.goal_timeout_per_path_m,
+            self.goal_timeout_min_s,
+        )
+        if (not all(math.isfinite(float(value)) for value in timeout_values)
+                or self.goal_timeout <= 0.0
+                or self.max_frontier_goal_path_m <= 0.0
+                or self.goal_timeout_base_s < 0.0
+                or self.goal_timeout_per_path_m <= 0.0
+                or self.goal_timeout_min_s <= 0.0
+                or self.goal_timeout_min_s > self.goal_timeout):
+            raise rospy.ROSInitException(
+                "frontier path horizon and timeout parameters are invalid"
+            )
         self.plan_tolerance = rospy.get_param("~plan_tolerance", 0.5)
         self.failed_goal_cooldown = rospy.get_param("~failed_goal_cooldown", 30.0)
         self.failed_goal_radius = rospy.get_param("~failed_goal_radius", 0.75)
+        self.min_goal_dispatch_distance_m = float(
+            rospy.get_param("~min_goal_dispatch_distance_m", 0.45)
+        )
         self.dependency_check_timeout = rospy.get_param("~dependency_check_timeout", 0.1)
         self.input_timeout = rospy.get_param("~input_timeout", 3.0)
         self.no_frontier_cycles_required = rospy.get_param("~no_frontier_cycles_required", 5)
@@ -287,7 +473,13 @@ class ExplorationPlanner:
             rospy.get_param("~observation_max_distance", 0.60)
         )
         self.observation_target_distance = float(
-            rospy.get_param("~observation_target_distance", 0.50)
+            rospy.get_param("~observation_target_distance", 0.30)
+        )
+        self.entrance_boundary_guard_enabled = bool(
+            rospy.get_param("~entrance_boundary_guard_enabled", False)
+        )
+        self.entrance_boundary_allowance_m = float(
+            rospy.get_param("~entrance_boundary_allowance_m", 1.0)
         )
         self.goal_clearance_margin = float(
             rospy.get_param("~goal_clearance_margin", 0.04)
@@ -323,14 +515,17 @@ class ExplorationPlanner:
         self.mapping_pause_topic = rospy.get_param(
             "~mapping_pause_topic", "/localization/mapping_pause"
         )
-        self.clear_costmaps_service = rospy.get_param(
-            "~clear_costmaps_service", "/move_base/clear_costmaps"
-        )
         self.transit_floor_action_name = rospy.get_param(
             "~transit_floor_action_name", "/danger_search/transit_floor"
         )
         self.elevator_cmd_topic = rospy.get_param(
             "~elevator_cmd_topic", "/danger_search/elevator_cmd_vel"
+        )
+        self.safety_stop_topic = rospy.get_param(
+            "~safety_stop_topic", "/danger_search/safety_stop"
+        )
+        self.sent_cmd_topic = rospy.get_param(
+            "~sent_cmd_topic", "/danger_search/cmd_vel_sent"
         )
         self.scan_topic = rospy.get_param("~scan_topic", "/localization/scan")
         self.elevator_id = rospy.get_param("~elevator_id", "elevator_main")
@@ -375,6 +570,21 @@ class ExplorationPlanner:
         self.elevator_crossing_clearance_m = float(
             rospy.get_param("~elevator_crossing_clearance_m", 0.32)
         )
+        self.elevator_footprint_min_x = float(
+            rospy.get_param("~elevator_footprint_min_x", -0.35)
+        )
+        self.elevator_footprint_max_x = float(
+            rospy.get_param("~elevator_footprint_max_x", 0.30)
+        )
+        self.elevator_footprint_min_y = float(
+            rospy.get_param("~elevator_footprint_min_y", -0.15)
+        )
+        self.elevator_footprint_max_y = float(
+            rospy.get_param("~elevator_footprint_max_y", 0.15)
+        )
+        self.elevator_footprint_margin_m = float(
+            rospy.get_param("~elevator_footprint_margin_m", 0.08)
+        )
         self.elevator_hall_navigation_max_s = float(
             rospy.get_param("~elevator_hall_navigation_max_s", 180.0)
         )
@@ -411,6 +621,9 @@ class ExplorationPlanner:
                 and 0.0 < self.elevator_crossing_min_progress_m
                 <= self.elevator_crossing_distance_m
                 and self.elevator_crossing_clearance_m > 0.0
+                and self.elevator_footprint_min_x < self.elevator_footprint_max_x
+                and self.elevator_footprint_min_y < self.elevator_footprint_max_y
+                and self.elevator_footprint_margin_m >= 0.0
                 and self.elevator_hall_navigation_max_s > 0.0
                 and self.elevator_hall_nominal_speed_mps > 0.0
                 and self.elevator_scan_settle_s >= 0.0
@@ -449,6 +662,9 @@ class ExplorationPlanner:
                 0.0 < self.observation_min_distance
                 <= self.observation_target_distance
                 <= self.observation_max_distance
+                and math.isfinite(self.entrance_boundary_allowance_m)
+                and self.entrance_boundary_allowance_m >= 0.0
+                and self.min_goal_dispatch_distance_m > 0.0
                 and self.goal_clearance_margin >= 0.0
                 and self.trap_blacklist_radius > 0.0
                 and self.blacklist_clear_revisions >= 1):
@@ -457,9 +673,16 @@ class ExplorationPlanner:
         # ========== 状态 ==========
         self.exploring = False
         self.current_pose = None
+        # A session-start anchor used only on its originating floor.  Other
+        # floors must not be projected into this floor's world-XY half-plane.
+        self.entrance_boundary_anchor = None
         self.current_map = None
         self.map_info = None
         self.map_data = None
+        self.pending_active_map = None
+        self.accepted_map_context = None
+        self.accepted_map_load_identity = None
+        self.last_legacy_map_time = rospy.Time(0)
         self.mapping_ready = False
         self.mapping_stable = False
         self.mapping_lost = True
@@ -469,6 +692,10 @@ class ExplorationPlanner:
         self.nav_failure_code = "NONE"
         self.nav_failure_detail = ""
         self.nav_active_goal_id = ""
+        self.nav_floor = 0
+        self.nav_map_epoch = 0
+        self.nav_map_version = 0
+        self.nav_transitioning = True
         self.last_pose_time = rospy.Time(0)
         self.last_map_time = rospy.Time(0)
         self.last_mapping_status_time = rospy.Time(0)
@@ -497,6 +724,8 @@ class ExplorationPlanner:
         self.backoff_until = rospy.Time(0)
         self.last_goal_time = rospy.Time(0)
         self.current_goal = None
+        self.selected_goal_metrics = None
+        self.active_goal_timeout_s = float(self.goal_timeout)
         self.failed_goals = []
         self.trap_blacklist = {}
         self.last_recovery_event_id = 0
@@ -516,6 +745,7 @@ class ExplorationPlanner:
         self.completed_floors = set()
         self.floor_runtime = {}
         self.coverage_debt_by_floor = {}
+        self.elevator_hall_bindings = {}
         self.floor_no_frontier_since = rospy.Time(0)
         self.elevator_halls = []          # 候选电梯厅世界坐标 (x, y)
         self.elevator_hall_index = 0      # 当前尝试的候选
@@ -552,6 +782,8 @@ class ExplorationPlanner:
         self.floor_change_open_scan_stamp = rospy.Time(0)
         self.floor_change_phase_started = rospy.Time(0)
         self.floor_change_error_code = ""
+        self.floor_change_stop_deadline = rospy.Time(0)
+        self._pending_floor_failure = None
         self.floor_transit_fatal = False
         self.active_elevator_id = self.elevator_id
         self._service_future = None
@@ -561,6 +793,9 @@ class ExplorationPlanner:
         self._service_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self.latest_scan = None
         self.last_scan_time = rospy.Time(0)
+        self.safety_stop_active = False
+        self.last_sent_command = Twist()
+        self.last_sent_command_time = rospy.Time(0)
         self.elevator_client = None
         self.door_client = None
 
@@ -574,16 +809,18 @@ class ExplorationPlanner:
         self.switch_floor_client = rospy.ServiceProxy(
             self.switch_floor_service, SwitchFloor
         )
-        self.clear_costmaps_client = rospy.ServiceProxy(
-            self.clear_costmaps_service, Empty
-        )
-
         # ========== 订阅者 ==========
         self.pose_sub = rospy.Subscriber(
             self.pose_topic, PoseWithCovarianceStamped, self.pose_callback
         )
         self.map_sub = rospy.Subscriber(
             self.map_topic, OccupancyGrid, self.map_callback
+        )
+        self.active_map_sub = rospy.Subscriber(
+            self.active_map_topic,
+            FloorOccupancyGrid,
+            self.active_map_callback,
+            queue_size=1,
         )
         self.mapping_status_sub = rospy.Subscriber(
             self.mapping_status_topic, MappingStatus, self.mapping_status_callback
@@ -596,6 +833,12 @@ class ExplorationPlanner:
         )
         self.scan_sub = rospy.Subscriber(
             self.scan_topic, LaserScan, self._scan_callback, queue_size=2
+        )
+        self.safety_stop_sub = rospy.Subscriber(
+            self.safety_stop_topic, Bool, self._safety_stop_callback, queue_size=2
+        )
+        self.sent_cmd_sub = rospy.Subscriber(
+            self.sent_cmd_topic, Twist, self._sent_cmd_callback, queue_size=10
         )
         if self.multifloor_enabled:
             self.current_floor_sub = rospy.Subscriber(
@@ -656,20 +899,149 @@ class ExplorationPlanner:
         self.last_pose_time = rospy.Time.now()
 
     def map_callback(self, msg):
+        """Observe the legacy map; multi-floor planning uses active_map only."""
         expected_size = msg.info.width * msg.info.height
         if (msg.header.frame_id != self.map_frame or msg.info.resolution <= 0
                 or expected_size == 0 or len(msg.data) != expected_size):
             rospy.logwarn_throttle(5, "[exploration] Ignoring invalid occupancy grid")
             return
+        self.last_legacy_map_time = rospy.Time.now()
+        if getattr(self, "multifloor_enabled", False):
+            return
+        self._apply_occupancy_grid(
+            msg, (int(getattr(self, "current_floor", 0)),
+                  int(getattr(self, "map_epoch", 0)),
+                  int(getattr(self, "current_map_version", 0)))
+        )
+
+    @staticmethod
+    def _map_load_identity(message):
+        load = getattr(message.info, "map_load_time", None)
+        origin = message.info.origin
+        return (
+            int(getattr(load, "secs", 0)), int(getattr(load, "nsecs", 0)),
+            int(message.info.width),
+            int(message.info.height), round(float(message.info.resolution), 9),
+            round(float(origin.position.x), 6),
+            round(float(origin.position.y), 6),
+            round(float(getattr(origin.position, "z", 0.0)), 6),
+            round(float(origin.orientation.x), 7),
+            round(float(origin.orientation.y), 7),
+            round(float(origin.orientation.z), 7),
+            round(float(origin.orientation.w), 7),
+        )
+
+    def _invalidate_active_map(self, cancel_goal=False):
+        self.current_map = None
+        self.map_info = None
+        self.map_data = None
+        self.accepted_map_context = None
+        self.accepted_map_load_identity = None
+        self.last_map_time = rospy.Time(0)
+        self._reachable_cache_key = None
+        self._reachable_cache = None
+        self._component_cache_key = None
+        self._frontier_cache_key = None
+        self._frontier_cluster_cache_key = None
+        self._clearance_cache_key = None
+        self._clearance_cache = None
+        if cancel_goal and getattr(self, "waiting_for_result", False):
+            self.goal_id += 1
+            self.move_base_client.cancel_all_goals()
+            self.waiting_for_result = False
+            self.current_goal = None
+
+    def active_map_callback(self, envelope):
+        grid = envelope.occupancy_grid
+        expected_size = grid.info.width * grid.info.height
+        if (grid.header.frame_id != self.map_frame
+                or envelope.header.frame_id != grid.header.frame_id
+                or envelope.header.stamp != grid.header.stamp
+                or grid.info.resolution <= 0.0 or expected_size == 0
+                or len(grid.data) != expected_size):
+            rospy.logwarn_throttle(
+                2.0, "[exploration] ignoring malformed active map envelope"
+            )
+            return
+        context = (
+            int(envelope.floor_id), int(getattr(envelope, "map_epoch", 0)),
+            int(envelope.map_version),
+        )
+        current = (
+            int(self.current_floor), int(self.map_epoch),
+            int(self.current_map_version),
+        )
+        if (context[1] < current[1]
+                or (context[1] == current[1] and context[0] != current[0])
+                or (self.accepted_map_context is not None
+                    and context[:2] == self.accepted_map_context[:2]
+                    and context[2] < self.accepted_map_context[2])):
+            rospy.logwarn_throttle(
+                2.0, "[exploration] ignoring stale active map context %s", context
+            )
+            return
+        self.pending_active_map = envelope
+        self._try_accept_pending_active_map()
+
+    def _try_accept_pending_active_map(self):
+        envelope = self.pending_active_map
+        if envelope is None:
+            return False
+        context = (
+            int(envelope.floor_id), int(getattr(envelope, "map_epoch", 0)),
+            int(envelope.map_version),
+        )
+        expected = (
+            int(self.current_floor), int(self.map_epoch),
+            int(self.current_map_version),
+        )
+        if (not map_context_is_committed(expected, context)
+                or self.mapping_transitioning
+                or not self.mapping_ready or not self.mapping_stable):
+            return False
+        self._apply_occupancy_grid(envelope.occupancy_grid, context)
+        self.pending_active_map = None
+        return True
+
+    def _apply_occupancy_grid(self, msg, context):
         new_data = np.array(msg.data, dtype=np.int8).reshape(
             (msg.info.height, msg.info.width)
         )
+        load_identity = self._map_load_identity(msg)
+        floor = int(context[0])
+        if not hasattr(self, "floor_runtime"):
+            self.floor_runtime = {}
+        if not hasattr(self, "accepted_map_context"):
+            self.accepted_map_context = None
+        if not hasattr(self, "accepted_map_load_identity"):
+            self.accepted_map_load_identity = None
+        runtime = self.floor_runtime.get(floor, {})
+        previous_identity = runtime.get("map_load_identity")
+        previous_version = int(runtime.get("map_version", -1))
+        if (self.accepted_map_context is not None
+                and int(self.accepted_map_context[0]) == floor):
+            previous_identity = (
+                self.accepted_map_load_identity
+                if previous_identity is None else previous_identity
+            )
+            previous_version = max(
+                previous_version, int(self.accepted_map_context[2])
+            )
+        if ((previous_identity is not None and previous_identity != load_identity)
+                or (previous_version >= 0 and int(context[2]) < previous_version)):
+            self._clear_floor_runtime_for_map_reset(floor)
         significant = (self.map_data is None or self.map_data.shape != new_data.shape
                        or np.count_nonzero(self.map_data != new_data)
                        >= self.map_change_cell_threshold)
         self.current_map = msg
         self.map_info = msg.info
         self.map_data = new_data
+        self.accepted_map_context = tuple(int(value) for value in context)
+        self.accepted_map_load_identity = load_identity
+        runtime = self.floor_runtime.setdefault(floor, {})
+        runtime["map_load_identity"] = load_identity
+        runtime["map_version"] = int(context[2])
+        runtime["map_epoch"] = int(context[1])
         now = rospy.Time.now()
         self.last_map_time = now
         if significant:
@@ -685,41 +1057,90 @@ class ExplorationPlanner:
             self._update_blacklist_validity()
 
     def mapping_status_callback(self, msg):
-        self.mapping_ready = msg.ready
-        self.mapping_stable = msg.stable
-        self.mapping_lost = msg.lost
-        previous_epoch = self.map_epoch
-        self.map_epoch = int(getattr(msg, "map_epoch", self.map_epoch))
-        self.mapping_transitioning = bool(getattr(msg, "transitioning", False))
-        self.current_floor = int(msg.current_floor)
-        self.floor_map_versions = {
+        incoming_epoch = int(getattr(msg, "map_epoch", self.map_epoch))
+        incoming_floor = int(msg.current_floor)
+        incoming_versions = {
             int(item.floor_id): int(item.map_version)
             for item in getattr(msg, "floor_maps", [])
         }
-        self.current_map_version = int(
-            self.floor_map_versions.get(self.current_floor, 0)
-        )
+        incoming_version = int(incoming_versions.get(incoming_floor, 0))
+        if self.last_mapping_status_time != rospy.Time(0) and (
+                incoming_epoch < self.map_epoch
+                or (incoming_epoch == self.map_epoch
+                    and incoming_floor != self.current_floor)
+                or (incoming_epoch == self.map_epoch
+                    and incoming_floor == self.current_floor
+                    and incoming_version < self.current_map_version)):
+            rospy.logwarn_throttle(
+                2.0,
+                "[exploration] ignoring regressive mapping status floor=%d epoch=%d version=%d",
+                incoming_floor, incoming_epoch, incoming_version,
+            )
+            return
+        previous_floor = self.current_floor
+        previous_epoch = self.map_epoch
+        self.mapping_ready = msg.ready
+        self.mapping_stable = msg.stable
+        self.mapping_lost = msg.lost
+        self.map_epoch = incoming_epoch
+        self.mapping_transitioning = bool(getattr(msg, "transitioning", False))
+        self.current_floor = incoming_floor
+        self.floor_map_versions = incoming_versions
+        self.current_map_version = incoming_version
         self.visited_floors.add(self.current_floor)
-        if self.map_epoch != previous_epoch:
-            self._reachable_cache_key = None
-            self._reachable_cache = None
-            self._component_cache_key = None
-            self._frontier_cache_key = None
-            self._frontier_cluster_cache_key = None
-            self._clearance_cache_key = None
+        if (self.map_epoch != previous_epoch
+                or self.current_floor != previous_floor
+                or self.mapping_transitioning):
+            self._invalidate_active_map(cancel_goal=True)
         self.last_mapping_status_time = rospy.Time.now()
+        self._try_accept_pending_active_map()
 
     def _scan_callback(self, message):
         self.latest_scan = message
         self.last_scan_time = rospy.Time.now()
 
+    def _safety_stop_callback(self, message):
+        self.safety_stop_active = bool(message.data)
+        if self.safety_stop_active and self.floor_change_active:
+            self._stop_elevator_motion()
+
+    def _sent_cmd_callback(self, message):
+        self.last_sent_command = message
+        self.last_sent_command_time = rospy.Time.now()
+
     def nav_health_callback(self, msg):
+        incoming_context = (
+            int(getattr(msg, "current_floor", self.current_floor)),
+            int(getattr(msg, "map_epoch", self.map_epoch)),
+            int(getattr(msg, "map_version", self.current_map_version)),
+        )
+        current_context = (
+            int(getattr(self, "nav_floor", self.current_floor)),
+            int(getattr(self, "nav_map_epoch", self.map_epoch)),
+            int(getattr(self, "nav_map_version", 0)),
+        )
+        if self.last_nav_health_time != rospy.Time(0) and (
+                incoming_context[1] < current_context[1]
+                or (incoming_context[1] == current_context[1]
+                    and incoming_context[0] != current_context[0])
+                or (incoming_context[:2] == current_context[:2]
+                    and incoming_context[2] < current_context[2])):
+            rospy.logwarn_throttle(
+                2.0,
+                "[exploration] ignoring regressive navigation context %s",
+                incoming_context,
+            )
+            return
         self.nav_ready = msg.ready
         self.nav_has_active_goal = msg.has_active_goal
         self.nav_stuck = msg.stuck
         self.nav_failure_code = msg.failure_code
         self.nav_failure_detail = msg.failure_detail
         self.nav_active_goal_id = msg.active_goal_id
+        self.nav_floor, self.nav_map_epoch, self.nav_map_version = incoming_context
+        self.nav_transitioning = bool(
+            getattr(msg, "transitioning", self.mapping_transitioning)
+        )
         self.last_nav_health_time = rospy.Time.now()
 
     def recovery_event_callback(self, msg):
@@ -768,10 +1189,17 @@ class ExplorationPlanner:
             self.last_recovery_event_id = event_id
             self._remember_trap_region(*stuck_pose)
 
-    def _clearance_map(self):
-        key = (
+    def _map_cache_identity(self):
+        """Identify every map-dependent cache across floor switches and loads."""
+        return (
+            int(getattr(self, "current_floor", 0)),
             int(getattr(self, "map_epoch", 0)),
+            int(getattr(self, "current_map_version", 0)),
             int(getattr(self, "map_revision", 0)),
+        )
+
+    def _clearance_map(self):
+        key = self._map_cache_identity() + (
             self.map_data.shape,
             int(self.free_threshold),
         )
@@ -888,6 +1316,9 @@ class ExplorationPlanner:
             "has_active_goal": bool(self.waiting_for_result or self.nav_has_active_goal),
             "blacklisted_cell_count": len(getattr(self, "trap_blacklist", {})),
             "observation_goal_count": len(getattr(self, "observation_goal_cells", [])),
+            "coverage_debt_count": len(self.coverage_debt_by_floor.get(
+                int(self.current_floor), set()
+            )),
         }
         self.status_pub.publish(String(data=json.dumps(payload, sort_keys=True)))
 
@@ -907,7 +1338,18 @@ class ExplorationPlanner:
             return False, "mapping_transitioning"
         if not self.mapping_ready or not self.mapping_stable:
             return False, "mapping_not_ready"
-        if not self.nav_ready:
+        expected_context = (
+            int(self.current_floor), int(self.map_epoch),
+            int(self.current_map_version),
+        )
+        if (self.multifloor_enabled and not map_context_is_committed(
+                expected_context, self.accepted_map_context)):
+            return False, "active_map_context_mismatch"
+        if (not self.nav_ready or self.nav_transitioning
+                or (self.multifloor_enabled and not map_context_is_committed(
+                    expected_context,
+                    (self.nav_floor, self.nav_map_epoch, self.nav_map_version),
+                ))):
             return False, "navigation_not_ready"
         return True, "healthy"
 
@@ -1033,9 +1475,7 @@ class ExplorationPlanner:
 
     def _frontier_mask(self):
         """返回与未知四邻接的已知自由栅格。"""
-        key = (
-            int(getattr(self, "map_epoch", 0)),
-            int(getattr(self, "map_revision", 0)),
+        key = self._map_cache_identity() + (
             self.map_data.shape,
             int(self.free_threshold),
         )
@@ -1070,11 +1510,7 @@ class ExplorationPlanner:
         """Return valid 8-connected frontier clusters via OpenCV WFD."""
         if frontier is None:
             frontier = self._frontier_mask()
-            cache_key = (
-                int(getattr(self, "map_epoch", 0)),
-                int(getattr(self, "map_revision", 0)),
-                "all",
-            )
+            cache_key = self._map_cache_identity() + ("all",)
         if (cache_key is not None
                 and cache_key == getattr(self, "_frontier_cluster_cache_key", None)):
             return self._frontier_cluster_cache
@@ -1102,7 +1538,15 @@ class ExplorationPlanner:
         return clusters
 
     def _observation_goal_for_cluster(
-            self, cluster, reachable, clearance, frontier_distance=None):
+            self, cluster, reachable, clearance, frontier_safe=None):
+        """Choose a known-free viewpoint for one frontier cluster.
+
+        The observation band is relative to *this* cluster.  Distance to the
+        nearest frontier anywhere in the map is a separate footprint-safety
+        constraint: using it as the observation distance makes every cluster
+        impossible whenever two unknown boundaries are closer than twice the
+        configured standoff.
+        """
         margin = int(math.ceil(
             self.observation_max_distance / self.map_info.resolution
         )) + 2
@@ -1112,27 +1556,31 @@ class ExplorationPlanner:
         x1 = min(self.map_info.width, max(cluster_x) + margin + 1)
         y0 = max(0, min(cluster_y) - margin)
         y1 = min(self.map_info.height, max(cluster_y) + margin + 1)
-        if frontier_distance is None:
-            cluster_mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
-            for cell_x, cell_y in cluster:
-                cluster_mask[cell_y - y0, cell_x - x0] = 1
-            distance_to_frontier = cv2.distanceTransform(
-                (cluster_mask == 0).astype(np.uint8),
-                cv2.DIST_L2,
-                cv2.DIST_MASK_PRECISE,
-            ) * self.map_info.resolution
-        else:
-            distance_to_frontier = frontier_distance[y0:y1, x0:x1]
+        cluster_mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+        for cell_x, cell_y in cluster:
+            cluster_mask[cell_y - y0, cell_x - x0] = 1
+        distance_to_cluster = cv2.distanceTransform(
+            (cluster_mask == 0).astype(np.uint8),
+            cv2.DIST_L2,
+            cv2.DIST_MASK_PRECISE,
+        ) * self.map_info.resolution
         required_clearance = (
             self.connectivity_clearance_radius + self.goal_clearance_margin
         )
+        if frontier_safe is None:
+            nearest_frontier_safe = np.ones_like(
+                distance_to_cluster, dtype=bool
+            )
+        else:
+            nearest_frontier_safe = frontier_safe[y0:y1, x0:x1]
         candidate_mask = (
             reachable[y0:y1, x0:x1]
-            & (distance_to_frontier >= (
+            & (distance_to_cluster >= (
                 self.observation_min_distance
                 + 0.5 * self.map_info.resolution - 1e-6
             ))
-            & (distance_to_frontier <= self.observation_max_distance + 1e-6)
+            & (distance_to_cluster <= self.observation_max_distance + 1e-6)
+            & nearest_frontier_safe
             & (clearance[y0:y1, x0:x1] >= required_clearance - 1e-6)
         )
         for cell in getattr(self, "trap_blacklist", {}):
@@ -1144,7 +1592,7 @@ class ExplorationPlanner:
         centroid_x = sum(cell[0] for cell in cluster) / len(cluster)
         centroid_y = sum(cell[1] for cell in cluster) / len(cluster)
         target_error = np.abs(
-            distance_to_frontier[candidate_y, candidate_x]
+            distance_to_cluster[candidate_y, candidate_x]
             - self.observation_target_distance
         )
         candidate_clearance = clearance[
@@ -1177,27 +1625,76 @@ class ExplorationPlanner:
 
     def _observation_goals(self, frontier, reachable):
         clearance = self._clearance_map()
-        frontier_distance = cv2.distanceTransform(
-            (frontier == 0).astype(np.uint8),
-            cv2.DIST_L2,
-            cv2.DIST_MASK_PRECISE,
-        ) * self.map_info.resolution
+        required_clearance = (
+            self.connectivity_clearance_radius + self.goal_clearance_margin
+        )
+        radius_cells = int(math.ceil(
+            required_clearance / self.map_info.resolution
+        ))
+        yy, xx = np.ogrid[
+            -radius_cells:radius_cells + 1,
+            -radius_cells:radius_cells + 1,
+        ]
+        # This boolean dilation is equivalent to testing whether the nearest
+        # frontier centre is closer than required_clearance, while avoiding a
+        # second full-map Euclidean distance transform on every planning pass.
+        frontier_kernel = (
+            (xx * xx + yy * yy) * self.map_info.resolution ** 2
+            < required_clearance ** 2 - 1e-9
+        ).astype(np.uint8)
+        frontier_safe = cv2.dilate(
+            np.asarray(frontier, dtype=np.uint8), frontier_kernel, iterations=1
+        ) == 0
         goals = []
-        cluster_key = (
-            int(getattr(self, "map_epoch", 0)),
-            int(getattr(self, "map_revision", 0)),
+        cluster_key = self._map_cache_identity() + (
             int(getattr(self, "_reachable_component_id", 0)),
         )
         for cluster in self._frontier_clusters(
                 frontier & reachable, cache_key=cluster_key):
             goal = self._observation_goal_for_cluster(
-                cluster, reachable, clearance, frontier_distance
+                cluster, reachable, clearance, frontier_safe
             )
-            if goal is not None:
+            if (goal is not None
+                    and self._entrance_boundary_allows_goal(goal["x"], goal["y"])):
                 goals.append(goal)
         self.observation_goal_cells = [goal["cell"] for goal in goals]
         self._publish_observation_goals(goals)
         return goals
+
+    def _capture_entrance_boundary_anchor(self):
+        """Capture a fresh start-pose boundary for this exploration session."""
+        if not getattr(self, "entrance_boundary_guard_enabled", False):
+            self.entrance_boundary_anchor = None
+            return True
+        try:
+            self.entrance_boundary_anchor = entrance_boundary_anchor_from_pose(
+                self.current_pose, self.current_floor
+            )
+        except (AttributeError, TypeError, ValueError):
+            self.entrance_boundary_anchor = None
+            return False
+        return True
+
+    def _entrance_boundary_allows_goal(self, goal_x, goal_y):
+        """Apply the virtual entrance boundary only on its anchor floor."""
+        if not getattr(self, "entrance_boundary_guard_enabled", False):
+            return True
+        anchor = getattr(self, "entrance_boundary_anchor", None)
+        if anchor is None:
+            # Enabling the guard without a valid start pose is a startup
+            # contract error; do not silently dispatch an unguarded goal.
+            return False
+        if int(getattr(self, "current_floor", 0)) != int(anchor[3]):
+            return True
+        try:
+            return entrance_boundary_allows_goal(
+                anchor,
+                goal_x,
+                goal_y,
+                getattr(self, "entrance_boundary_allowance_m", 0.0),
+            )
+        except (TypeError, ValueError):
+            return False
 
     def _publish_observation_goals(self, goals):
         publisher = getattr(self, "observation_goals_pub", None)
@@ -1237,9 +1734,7 @@ class ExplorationPlanner:
 
     def _reachable_free_mask(self):
         """Return the 4-connected inflated-free component containing the robot."""
-        component_key = (
-            int(getattr(self, "map_epoch", 0)),
-            int(getattr(self, "map_revision", 0)),
+        component_key = self._map_cache_identity() + (
             self.map_data.shape,
             int(self.free_threshold),
             int(self.connectivity_occupied_threshold),
@@ -1299,6 +1794,7 @@ class ExplorationPlanner:
 
     def _select_goal(self):
         """Return (goal, reason); dependency failure is not no-frontier."""
+        self.selected_goal_metrics = None
         if self.current_pose is None or self.map_data is None:
             return None, "input_missing"
 
@@ -1306,12 +1802,24 @@ class ExplorationPlanner:
         cy = self.current_pose.position.y
         frontier = self._frontier_mask()
         all_representatives = self._frontier_representatives(frontier)
+        # The guarded entrance is a deliberate virtual boundary, not unpaid
+        # exploration work. Excluded exterior frontiers must be removed from
+        # convergence accounting or an indoor-only run can never finish.
+        all_representatives = [
+            cell for cell in all_representatives
+            if self._entrance_boundary_allows_goal(*self._map_to_world(*cell))
+        ]
         self.remaining_frontier_count = len(all_representatives)
         if not all_representatives:
+            self.coverage_debt_by_floor.pop(int(self.current_floor), None)
             return None, "no_frontier"
 
         reachable = self._reachable_free_mask()
         reachable_frontier = frontier & reachable
+        coverage_debt = set()
+        for cell_x, cell_y in all_representatives:
+            if not bool(reachable[cell_y, cell_x]):
+                coverage_debt.add((int(cell_x), int(cell_y), "disconnected"))
         use_observation_goals = hasattr(self, "observation_target_distance")
         if use_observation_goals:
             candidates = self._observation_goals(frontier, reachable)
@@ -1326,13 +1834,26 @@ class ExplorationPlanner:
             key=lambda goal: math.hypot(goal["x"] - cx, goal["y"] - cy)
         )
 
+        minimum_dispatch = float(
+            getattr(self, "min_goal_dispatch_distance_m", 0.0)
+        )
+        dispatch_candidates = [
+            candidate for candidate in candidates
+            if math.hypot(candidate["x"] - cx, candidate["y"] - cy)
+            >= minimum_dispatch
+        ]
+        skipped_near_candidates = len(dispatch_candidates) < len(candidates)
+
         reachable_candidates = []
         service_unavailable = False
-        for candidate in candidates[:self.max_frontier_candidates]:
+        for candidate in dispatch_candidates[:self.max_frontier_candidates]:
             gx, gy = candidate["x"], candidate["y"]
+            map_x, map_y = self._world_to_map(gx, gy)
             if self._goal_is_cooled_down(gx, gy):
+                coverage_debt.add((int(map_x), int(map_y), "cooldown"))
                 continue
-            if (self._world_to_map(gx, gy) in getattr(self, "trap_blacklist", {})):
+            if ((map_x, map_y) in getattr(self, "trap_blacklist", {})):
+                coverage_debt.add((int(map_x), int(map_y), "trap"))
                 continue
             path_state = self._check_path(cx, cy, gx, gy)
             if path_state == "reachable":
@@ -1351,12 +1872,50 @@ class ExplorationPlanner:
                     + getattr(self, "path_clearance_weight", 0.0)
                     / max(path_clearance, 0.01)
                 )
-                reachable_candidates.append((score, candidate))
+                reachable_candidates.append((score, candidate, metrics))
+            elif path_state == "unreachable":
+                coverage_debt.add((int(map_x), int(map_y), "unreachable"))
             if path_state == "unavailable":
                 service_unavailable = True
 
+        if coverage_debt:
+            self.coverage_debt_by_floor[int(self.current_floor)] = coverage_debt
+        else:
+            self.coverage_debt_by_floor.pop(int(self.current_floor), None)
+
         if reachable_candidates:
-            _, selected = min(reachable_candidates, key=lambda item: item[0])
+            _, selected, selected_metrics = min(
+                reachable_candidates, key=lambda item: item[0]
+            )
+            selected_metrics = dict(selected_metrics or {})
+            planned_path_length = float(selected_metrics.get(
+                "path_length",
+                math.hypot(selected["x"] - cx, selected["y"] - cy),
+            ))
+            points = selected_metrics.get("points") or ()
+            path_horizon = float(getattr(
+                self, "max_frontier_goal_path_m", float("inf")
+            ))
+            if planned_path_length > path_horizon and points:
+                waypoint_x, waypoint_y, waypoint_yaw, dispatch_length, truncated = (
+                    path_prefix_goal(points, path_horizon)
+                )
+                if truncated:
+                    self.selected_goal_metrics = {
+                        **selected_metrics,
+                        "frontier_goal": (selected["x"], selected["y"]),
+                        "dispatch_path_length": dispatch_length,
+                        "truncated": True,
+                    }
+                    return (
+                        (waypoint_x, waypoint_y, waypoint_yaw),
+                        "reachable_frontier_waypoint",
+                    )
+            self.selected_goal_metrics = {
+                **selected_metrics,
+                "dispatch_path_length": planned_path_length,
+                "truncated": False,
+            }
             goal = (
                 (selected["x"], selected["y"], selected["yaw"])
                 if use_observation_goals
@@ -1366,9 +1925,12 @@ class ExplorationPlanner:
         if service_unavailable:
             return None, "navigation_service_unavailable"
 
+        if skipped_near_candidates and not dispatch_candidates:
+            return None, "frontier_already_in_observation_range"
+
         return None, "all_frontiers_unreachable_or_blacklisted"
 
-    def _send_goal(self, gx, gy, yaw=0.0):
+    def _send_goal(self, gx, gy, yaw=0.0, planned_path_length=None):
         """发送导航目标"""
         if not self.move_base_client.wait_for_server(
                 rospy.Duration(self.dependency_check_timeout)):
@@ -1400,7 +1962,27 @@ class ExplorationPlanner:
         self.waiting_for_result = True
         self.current_goal = (gx, gy, yaw)
         self.last_goal_time = rospy.Time.now()
-        rospy.loginfo(f"[exploration] Sent goal: ({gx:.2f}, {gy:.2f})")
+        if planned_path_length is None:
+            self.active_goal_timeout_s = float(self.goal_timeout)
+        else:
+            self.active_goal_timeout_s = bounded_navigation_timeout(
+                planned_path_length,
+                self.goal_timeout,
+                self.goal_timeout_base_s,
+                self.goal_timeout_per_path_m,
+                self.goal_timeout_min_s,
+            )
+        rospy.loginfo(
+            "[exploration] Sent goal: (%.2f, %.2f) path=%.2fm timeout=%.1fs%s",
+            gx,
+            gy,
+            -1.0 if planned_path_length is None else planned_path_length,
+            self.active_goal_timeout_s,
+            " waypoint" if (planned_path_length is not None and (
+                self.selected_goal_metrics
+                and self.selected_goal_metrics.get("truncated")
+            )) else "",
+        )
         return True
 
     def goal_done_cb(self, session_id, goal_id, state, result):
@@ -1445,6 +2027,11 @@ class ExplorationPlanner:
         with self.state_lock:
             if self.exploring:
                 return TriggerResponse(success=True, message="Exploration already running")
+            if not self._capture_entrance_boundary_anchor():
+                return TriggerResponse(
+                    success=False,
+                    message="entrance boundary guard requires a valid start pose",
+                )
             rospy.loginfo("[exploration] Start exploration")
             self.session_id += 1
             self.exploring = True
@@ -1463,6 +2050,7 @@ class ExplorationPlanner:
             self.completed_floors = set()
             self.floor_runtime = {}
             self.coverage_debt_by_floor = {}
+            self.elevator_hall_bindings = {}
             self.floor_change_active = False
             self.floor_change_step = None
             self.floor_change_gave_up_count = 0
@@ -1488,6 +2076,7 @@ class ExplorationPlanner:
             self.goal_id += 1
             self.waiting_for_result = False
             self.current_goal = None
+            self.entrance_boundary_anchor = None
             self.last_recovery_goal_id = ""
             self.nav_active_goal_id = ""
             self.navigation_goal_sent_at = rospy.Time(0)
@@ -1519,8 +2108,11 @@ class ExplorationPlanner:
             self._set_state("NAVIGATING", "active_goal")
             # 检查目标是否超时
             elapsed = (rospy.Time.now() - self.last_goal_time).to_sec()
-            if elapsed > self.goal_timeout:
-                rospy.logwarn("[exploration] Goal timeout, canceling")
+            if elapsed > self.active_goal_timeout_s:
+                rospy.logwarn(
+                    "[exploration] Goal timeout after %.1fs, canceling",
+                    self.active_goal_timeout_s,
+                )
                 self.goal_id += 1
                 self.move_base_client.cancel_goal()
                 self._remember_failed_goal()
@@ -1554,7 +2146,12 @@ class ExplorationPlanner:
         if goal is not None:
             self.no_reachable_frontier_cycles = 0
             self.floor_no_frontier_since = rospy.Time(0)
-            if not self._send_goal(*goal):
+            selected_metrics = self.selected_goal_metrics or {}
+            if not self._send_goal(
+                    *goal,
+                    planned_path_length=selected_metrics.get(
+                        "dispatch_path_length"
+                    )):
                 self.retry_count += 1
                 self._set_state("WAITING", "move_base_unavailable")
             else:
@@ -1610,9 +2207,18 @@ class ExplorationPlanner:
     def _current_floor_callback(self, message):
         """Compatibility mirror of the localization-owned discrete floor."""
         floor = int(message.data)
+        if self.last_mapping_status_time != rospy.Time(0):
+            if floor != self.current_floor:
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[exploration] ignoring current_floor=%d while status owns floor=%d",
+                    floor,
+                    self.current_floor,
+                )
+            return
         if floor != self.current_floor:
-            rospy.loginfo("[exploration] current floor -> %d", floor)
-        self.current_floor = floor
+            rospy.loginfo("[exploration] bootstrap current floor -> %d", floor)
+            self.current_floor = floor
         self.visited_floors.add(floor)
 
     def _elevator_door_id(self, floor):
@@ -1631,17 +2237,34 @@ class ExplorationPlanner:
         return None if selection is None else selection["final_target"]
 
     def _save_current_floor_runtime(self):
+        prior = self.floor_runtime.get(int(self.current_floor), {})
         self.floor_runtime[int(self.current_floor)] = {
             "failed_goals": list(self.failed_goals),
             "trap_blacklist": dict(self.trap_blacklist),
+            "retry_count": int(self.retry_count),
             "map_epoch": int(self.map_epoch),
             "map_version": int(self.current_map_version),
+            "map_load_identity": (
+                self.accepted_map_load_identity
+                if self.accepted_map_load_identity is not None
+                else prior.get("map_load_identity")
+            ),
+            "coverage_debt": set(self.coverage_debt_by_floor.get(
+                int(self.current_floor), set()
+            )),
         }
 
     def _restore_current_floor_runtime(self):
         runtime = self.floor_runtime.get(int(self.current_floor), {})
         self.failed_goals = list(runtime.get("failed_goals", []))
         self.trap_blacklist = dict(runtime.get("trap_blacklist", {}))
+        self.retry_count = int(runtime.get("retry_count", 0))
+        restored_debt = set(runtime.get("coverage_debt", set()))
+        if restored_debt:
+            self.coverage_debt_by_floor[int(self.current_floor)] = restored_debt
+        else:
+            self.coverage_debt_by_floor.pop(int(self.current_floor), None)
+        self.backoff_until = rospy.Time(0)
         self.no_reachable_frontier_cycles = 0
         self.floor_no_frontier_since = rospy.Time(0)
         self._reachable_cache_key = None
@@ -1650,6 +2273,30 @@ class ExplorationPlanner:
         self._frontier_cache_key = None
         self._frontier_cluster_cache_key = None
         self._clearance_cache_key = None
+        self._publish_blacklist()
+
+    def _clear_floor_runtime_for_map_reset(self, floor):
+        """Discard coordinates tied to a map that was reset or reloaded."""
+        floor = int(floor)
+        self.floor_runtime.pop(floor, None)
+        self.coverage_debt_by_floor.pop(floor, None)
+        self.completed_floors.discard(floor)
+        for key in list(self.elevator_hall_bindings):
+            if int(key[0]) == floor:
+                self.elevator_hall_bindings.pop(key, None)
+        if floor != int(self.current_floor):
+            return
+        self.failed_goals = []
+        self.trap_blacklist = {}
+        self.retry_count = 0
+        self.backoff_until = rospy.Time(0)
+        self.no_reachable_frontier_cycles = 0
+        self.floor_no_frontier_since = rospy.Time(0)
+        self.current_goal = None
+        self.waiting_for_result = False
+        self.last_recovery_goal_id = ""
+        self.nav_active_goal_id = ""
+        self.navigation_goal_sent_at = rospy.Time(0)
         self._publish_blacklist()
 
     def _ensure_service_clients(self):
@@ -1700,12 +2347,6 @@ class ExplorationPlanner:
             target_floor=int(self.floor_change_target),
         )
 
-    def _clear_costmaps_request(self):
-        rospy.wait_for_service(
-            self.clear_costmaps_service, timeout=self.elevator_service_timeout_s
-        )
-        return self.clear_costmaps_client()
-
     def _submit_service(self, kind, callback):
         if self._service_future is not None:
             return False
@@ -1751,6 +2392,19 @@ class ExplorationPlanner:
 
     def _stop_elevator_motion(self):
         self.elevator_cmd_pub.publish(Twist())
+
+    def _control_output_is_zero(self, now, freshness_s=0.75):
+        stamp = getattr(self, "last_sent_command_time", rospy.Time(0))
+        command = getattr(self, "last_sent_command", None)
+        if command is None or stamp == rospy.Time(0):
+            return False
+        if (now - stamp).to_sec() > float(freshness_s):
+            return False
+        values = (
+            command.linear.x, command.linear.y, command.linear.z,
+            command.angular.x, command.angular.y, command.angular.z,
+        )
+        return all(abs(float(value)) <= 1e-3 for value in values)
 
     def _scan_window(self, message, backward=False):
         if message is None or not message.ranges or message.angle_increment == 0.0:
@@ -1961,6 +2615,58 @@ class ExplorationPlanner:
             deduplicated.append(candidate)
         return deduplicated
 
+    def _cached_hall_candidate(self):
+        """Return a still-valid hall binding for this floor/elevator pair."""
+        key = (int(self.current_floor), str(self.active_elevator_id))
+        binding = self.elevator_hall_bindings.get(key)
+        if binding is None:
+            return None
+        # A cached hall pose is coordinate data from one map revision.  A
+        # return to the same floor can keep the map-load identity while door
+        # motion or newly observed obstacles advance its version; in that
+        # case force fresh candidate detection instead of trusting the pose.
+        if int(binding.get("map_version", -1)) != int(self.current_map_version):
+            self.elevator_hall_bindings.pop(key, None)
+            return None
+        if binding.get("map_load_identity") != self.accepted_map_load_identity:
+            self.elevator_hall_bindings.pop(key, None)
+            return None
+        hall = tuple(binding.get("hall", ()))
+        if len(hall) != 3:
+            self.elevator_hall_bindings.pop(key, None)
+            return None
+        hx, hy, into_yaw = hall
+        approach_x = hx - self.elevator_hall_approach_m * math.cos(into_yaw)
+        approach_y = hy - self.elevator_hall_approach_m * math.sin(into_yaw)
+        map_x, map_y = self._world_to_map(approach_x, approach_y)
+        if not self._is_free(map_x, map_y):
+            self.elevator_hall_bindings.pop(key, None)
+            return None
+        path_state = self._check_path(
+            self.current_pose.position.x,
+            self.current_pose.position.y,
+            approach_x,
+            approach_y,
+        )
+        if path_state != "reachable":
+            self.elevator_hall_bindings.pop(key, None)
+            return None
+        return (float(hx), float(hy), float(into_yaw))
+
+    def _remember_validated_hall(self):
+        if self.floor_change_hall_point is None:
+            return
+        key = (int(self.floor_change_start_floor), str(self.active_elevator_id))
+        self.elevator_hall_bindings[key] = {
+            "hall": tuple(float(value) for value in self.floor_change_hall_point),
+            "map_version": int(self.current_map_version),
+            "map_load_identity": self.accepted_map_load_identity,
+        }
+
+    def _discard_active_hall_binding(self):
+        key = (int(self.floor_change_start_floor), str(self.active_elevator_id))
+        self.elevator_hall_bindings.pop(key, None)
+
     def _record_floor_change_result(self, success, failure_code, message):
         self.floor_change_result = {
             "success": bool(success),
@@ -1988,6 +2694,13 @@ class ExplorationPlanner:
         if self.current_pose is None or self.map_data is None:
             self._record_floor_change_result(
                 False, "NO_HALL", "pose or map is unavailable"
+            )
+            return False
+        healthy, reason = self._inputs_health(rospy.Time.now())
+        if not healthy:
+            self._record_floor_change_result(
+                False, "UNREACHABLE_HALL",
+                "floor transit input contract is not ready: " + reason,
             )
             return False
         if requested_target == self.current_floor:
@@ -2044,14 +2757,22 @@ class ExplorationPlanner:
         self.navigation_goal_sent_at = rospy.Time(0)
         self._floor_change_goal_succeeded = None
 
+        cached_hall = self._cached_hall_candidate()
         self.elevator_halls = self._detect_elevator_halls()
+        if cached_hall is not None and not any(
+                math.hypot(cached_hall[0] - hall[0], cached_hall[1] - hall[1])
+                < 0.35 for hall in self.elevator_halls):
+            self.elevator_halls.insert(0, cached_hall)
         if not self.elevator_halls:
             self._floor_change_fail("NO_HALL", "no elevator hall candidate")
             return False
         cx = self.current_pose.position.x
         cy = self.current_pose.position.y
         self.elevator_halls.sort(
-            key=lambda hall: math.hypot(hall[0] - cx, hall[1] - cy)
+            key=lambda hall: (
+                0 if cached_hall is not None and hall == cached_hall else 1,
+                math.hypot(hall[0] - cx, hall[1] - cy),
+            )
         )
         self.elevator_hall_index = 0
         self._set_floor_change_phase("TO_HALL", "select_elevator_hall")
@@ -2164,7 +2885,8 @@ class ExplorationPlanner:
             if entering:
                 self._set_floor_change_phase("CLOSE_CURRENT_START")
             else:
-                self._set_floor_change_phase("CLEAR_COSTMAP_START")
+                self.floor_change_stable_since = rospy.Time(0)
+                self._set_floor_change_phase("WAIT_STABLE", "wait_navigation_epoch")
             return
         scan_fresh = (
             self.last_scan_time != rospy.Time(0)
@@ -2177,16 +2899,36 @@ class ExplorationPlanner:
         window = self._scan_window(self.latest_scan, backward=not entering)
         finite = window[np.isfinite(window)]
         clearance = float(np.min(finite)) if finite.size else float("inf")
-        if clearance <= self.elevator_crossing_clearance_m:
+        remaining = max(0.0, self.floor_change_crossing_target_m - progress)
+        swept_obstacle = swept_footprint_obstacle(
+            self.latest_scan.ranges,
+            self.latest_scan.angle_min,
+            self.latest_scan.angle_increment,
+            self.latest_scan.range_min,
+            self.latest_scan.range_max,
+            self.floor_change_crossing_direction,
+            remaining,
+            (
+                self.elevator_footprint_min_x,
+                self.elevator_footprint_max_x,
+                self.elevator_footprint_min_y,
+                self.elevator_footprint_max_y,
+            ),
+            self.elevator_footprint_margin_m,
+        )
+        if (clearance <= self.elevator_crossing_clearance_m
+                or swept_obstacle is not None):
             self._stop_elevator_motion()
             if progress < self.elevator_crossing_min_progress_m:
                 self._floor_change_fail(
-                    failure_code, "obstacle blocked elevator crossing"
+                    failure_code,
+                    "obstacle intersects elevator swept footprint",
                 )
             elif entering:
                 self._set_floor_change_phase("CLOSE_CURRENT_START")
             else:
-                self._set_floor_change_phase("CLEAR_COSTMAP_START")
+                self.floor_change_stable_since = rospy.Time(0)
+                self._set_floor_change_phase("WAIT_STABLE", "wait_navigation_epoch")
             return
         command = Twist()
         command.linear.x = (
@@ -2203,7 +2945,83 @@ class ExplorationPlanner:
             rospy.loginfo("[exploration] Exploration complete: %s", reason)
         self._set_state("COMPLETE", reason)
 
+    @staticmethod
+    def _stamp_is_fresh(stamp, now, timeout):
+        return (stamp != rospy.Time(0)
+                and (now - stamp).to_sec() <= float(timeout))
+
+    def _transit_phase_health(self, now):
+        """Apply only the dependencies that are valid for the active phase."""
+        step = str(self.floor_change_step or "")
+        if step == "STOPPING":
+            return True, "", ""
+        if self.safety_stop_active:
+            return False, "CANCELED", "safety stop is active"
+
+        if self.current_pose is None or not self._stamp_is_fresh(
+                self.last_pose_time, now, self.input_timeout):
+            code = "MAP_NOT_STABLE" if step == "WAIT_STABLE" else (
+                "EXIT_FAILED" if step == "EXIT" else "UNREACHABLE_HALL"
+                if step == "TO_HALL" else "ENTER_FAILED"
+            )
+            return False, code, "localized pose is stale"
+        if not self._stamp_is_fresh(
+                self.last_mapping_status_time, now, self.input_timeout):
+            code = "MAP_NOT_STABLE" if step == "WAIT_STABLE" else (
+                "UNREACHABLE_HALL" if step == "TO_HALL"
+                else "SERVICE_UNAVAILABLE"
+            )
+            return False, code, "mapping status is stale"
+
+        if step == "TO_HALL":
+            expected = (
+                int(self.current_floor), int(self.map_epoch),
+                int(self.current_map_version),
+            )
+            if (self.mapping_lost or self.mapping_transitioning
+                    or not self.mapping_ready or not self.mapping_stable
+                    or self.accepted_map_context != expected
+                    or not self._stamp_is_fresh(
+                        self.last_map_time, now, self.input_timeout)):
+                return False, "UNREACHABLE_HALL", "hall navigation map is not ready"
+            return True, "", ""
+
+        if step == "WAIT_STABLE":
+            if self.waiting_for_result or self.nav_has_active_goal:
+                return False, "MAP_NOT_STABLE", "ordinary navigation goal survived transit"
+            if not self._stamp_is_fresh(
+                    self.last_map_time, now, self.input_timeout):
+                return False, "MAP_NOT_STABLE", "active map is stale"
+            if not self._stamp_is_fresh(
+                    self.last_nav_health_time, now, self.input_timeout):
+                return False, "MAP_NOT_STABLE", "navigation health is stale"
+            return True, "", ""
+
+        if self.waiting_for_result or self.nav_has_active_goal:
+            code = "EXIT_FAILED" if step == "EXIT" else "ENTER_FAILED"
+            return False, code, "ordinary move_base goal is active during transit"
+
+        scan_required_steps = {
+            "OPEN_CURRENT_START", "OPEN_CURRENT_WAIT", "CAPTURE_OPEN_SCAN",
+            "VALIDATE_CLOSE_START", "VALIDATE_CLOSE_WAIT",
+            "CAPTURE_CLOSED_SCAN", "REOPEN_CURRENT_START",
+            "REOPEN_CURRENT_WAIT", "ENTER", "EXIT",
+        }
+        if step in scan_required_steps and (
+                self.latest_scan is None or not self._stamp_is_fresh(
+                    self.last_scan_time, now, self.input_timeout)):
+            code = "EXIT_FAILED" if step == "EXIT" else "ENTER_FAILED"
+            return False, code, "laser scan is stale during elevator transit"
+
+        return True, "", ""
+
     def _advance_floor_change(self, now):
+        if self.floor_change_step == "STOPPING":
+            self._stop_elevator_motion()
+            zero_confirmed = self._control_output_is_zero(now)
+            if zero_confirmed or now >= self.floor_change_stop_deadline:
+                self._finalize_floor_change_failure(zero_confirmed)
+            return
         if now > self.floor_change_deadline:
             code = (
                 "UNREACHABLE_HALL"
@@ -2233,6 +3051,8 @@ class ExplorationPlanner:
                 self._retry_hall_or_fail(
                     "UNREACHABLE_HALL", "hall navigation failed"
                 )
+                return
+            if self.nav_has_active_goal:
                 return
             self.elevator_hall_found = self.floor_change_hall_point
             self._set_floor_change_phase("OPEN_CURRENT_START")
@@ -2343,10 +3163,12 @@ class ExplorationPlanner:
                 )
                 return
             if not self._hall_validation_passed:
+                self._discard_active_hall_binding()
                 self._retry_hall_or_fail(
                     "NO_HALL", "door motion did not change the local scan"
                 )
                 return
+            self._remember_validated_hall()
             self._start_crossing(+1.0)
             return
 
@@ -2435,39 +3257,40 @@ class ExplorationPlanner:
             if self.floor_change_exit_to_hall:
                 self._start_crossing(-1.0)
             else:
-                self._set_floor_change_phase("CLEAR_COSTMAP_START")
-            return
-
-        if step == "CLEAR_COSTMAP_START":
-            self._stop_elevator_motion()
-            if self._submit_service("clear_costmaps", self._clear_costmaps_request):
-                self._set_floor_change_phase("CLEAR_COSTMAP_WAIT")
-            return
-        if step == "CLEAR_COSTMAP_WAIT":
-            outcome, response = self._service_outcome(now, "clear_costmaps")
-            if outcome == "pending":
-                return
-            if outcome != "success":
-                code = "SERVICE_TIMEOUT" if outcome == "timeout" else "MAP_NOT_STABLE"
-                self._floor_change_fail(
-                    code, "costmap reset failed: " + str(response or outcome)
-                )
-                return
-            self.floor_change_stable_since = rospy.Time(0)
-            self._set_floor_change_phase("WAIT_STABLE", "wait_mapping_stable")
+                self.floor_change_stable_since = rospy.Time(0)
+                self._set_floor_change_phase("WAIT_STABLE", "wait_navigation_epoch")
             return
 
         if step == "WAIT_STABLE":
             floor_ok = self.current_floor == self.floor_change_target
-            epoch_ok = self.map_epoch >= self.floor_change_expected_epoch
-            version_ok = self.current_map_version >= (
+            epoch_ok = self.map_epoch == self.floor_change_expected_epoch
+            minimum_version = (
                 self.floor_change_start_target_version
                 + self.floor_min_new_map_versions
+            )
+            version_ok = self.current_map_version >= minimum_version
+            active_context_ok = (
+                self.accepted_map_context is not None
+                and self.accepted_map_context[:2] == (
+                    int(self.floor_change_target),
+                    int(self.floor_change_expected_epoch),
+                )
+                and int(self.accepted_map_context[2]) >= minimum_version
+            )
+            navigation_context_ok = (
+                (self.nav_floor, self.nav_map_epoch) == (
+                    int(self.floor_change_target),
+                    int(self.floor_change_expected_epoch),
+                )
+                and self.nav_map_version >= minimum_version
             )
             stable_now = (
                 floor_ok and epoch_ok and version_ok
                 and self.mapping_ready and self.mapping_stable
-                and not self.mapping_transitioning and self.nav_ready
+                and not self.mapping_transitioning
+                and active_context_ok
+                and self.nav_ready and not self.nav_transitioning
+                and navigation_context_ok
             )
             if not stable_now:
                 self.floor_change_stable_since = rospy.Time(0)
@@ -2483,6 +3306,9 @@ class ExplorationPlanner:
         self._floor_change_fail(failure_code, message)
 
     def _floor_change_fail(self, failure_code, message):
+        if self.floor_change_step == "STOPPING":
+            self._stop_elevator_motion()
+            return
         rospy.logwarn(
             "[exploration] floor transit failed [%s]: %s",
             failure_code, message,
@@ -2494,8 +3320,29 @@ class ExplorationPlanner:
         self._stop_elevator_motion()
         self._invalidate_service()
         failed_step = self.floor_change_step
+        fatal_steps = {
+            "ENTER", "CLOSE_CURRENT_START", "CLOSE_CURRENT_WAIT",
+            "CALL_TARGET_START", "CALL_TARGET_WAIT", "SWITCH_FLOOR_START",
+            "SWITCH_FLOOR_WAIT", "EXIT", "WAIT_STABLE",
+        }
+        self._pending_floor_failure = {
+            "failure_code": str(failure_code),
+            "message": str(message),
+            "fatal": failed_step in fatal_steps,
+        }
+        self.floor_change_step = "STOPPING"
+        self.floor_change_stop_deadline = rospy.Time.now() + rospy.Duration(1.0)
+        self._set_state("FLOOR_CHANGE", "confirm_control_stopped")
+
+    def _finalize_floor_change_failure(self, zero_confirmed):
+        pending = dict(self._pending_floor_failure or {})
+        failure_code = str(pending.get("failure_code", "SERVICE_UNAVAILABLE"))
+        message = str(pending.get("message", "floor transit failed"))
+        if not zero_confirmed:
+            message += "; control zero output was not confirmed within 1.0 s"
         self.floor_change_active = False
         self.floor_change_step = None
+        self._pending_floor_failure = None
         self.last_recovery_goal_id = ""
         self.nav_active_goal_id = ""
         self.navigation_goal_sent_at = rospy.Time(0)
@@ -2504,15 +3351,11 @@ class ExplorationPlanner:
         self.floor_change_retry_after = rospy.Time.now() + rospy.Duration(
             self.map_stable_time
         )
-        fatal_steps = {
-            "ENTER", "CLOSE_CURRENT_START", "CLOSE_CURRENT_WAIT",
-            "CALL_TARGET_START", "CALL_TARGET_WAIT", "SWITCH_FLOOR_START",
-            "SWITCH_FLOOR_WAIT", "EXIT", "CLEAR_COSTMAP_START",
-            "CLEAR_COSTMAP_WAIT", "WAIT_STABLE",
-        }
-        if not self.floor_change_external and failed_step in fatal_steps:
+        if not self.floor_change_external and bool(pending.get("fatal", False)):
             self.floor_transit_fatal = True
             self._set_state("FAILED", "floor_change_failed:" + failure_code)
+        elif not self.exploring and not self.floor_change_external:
+            self._set_state("STOPPED", "stop_requested")
         else:
             self._set_state("WAITING", "floor_change_failed:" + failure_code)
         self.last_goal_time = rospy.Time.now()
@@ -2531,7 +3374,6 @@ class ExplorationPlanner:
         self.no_reachable_frontier_cycles = 0
         self.floor_no_frontier_since = rospy.Time(0)
         self.last_significant_map_change = rospy.Time.now()
-        self.retry_count = 0
         self.floor_change_gave_up_count = 0
         if self.current_floor != final_target:
             # A transfer floor is stable now; recompute the next public ride.
@@ -2560,11 +3402,15 @@ class ExplorationPlanner:
             if self.floor_change_step in {
                     "ENTER", "CLOSE_CURRENT_START", "CLOSE_CURRENT_WAIT",
                     "CALL_TARGET_START", "CALL_TARGET_WAIT",
-                    "SWITCH_FLOOR_START", "SWITCH_FLOOR_WAIT", "EXIT",
-                    "CLEAR_COSTMAP_START", "CLEAR_COSTMAP_WAIT"}:
+                    "SWITCH_FLOOR_START", "SWITCH_FLOOR_WAIT", "EXIT"}:
                 self._publish_mapping_pause()
             try:
-                self._advance_floor_change(rospy.Time.now())
+                now = rospy.Time.now()
+                healthy, failure_code, detail = self._transit_phase_health(now)
+                if not healthy:
+                    self._floor_change_fail(failure_code, detail)
+                    return
+                self._advance_floor_change(now)
             except Exception as exc:
                 rospy.logerr("[exploration] transit state machine exception: %s", exc)
                 self._floor_change_fail(
@@ -2607,9 +3453,8 @@ class ExplorationPlanner:
             "SWITCH_FLOOR_START": 0.70,
             "SWITCH_FLOOR_WAIT": 0.75,
             "EXIT": 0.82,
-            "CLEAR_COSTMAP_START": 0.86,
-            "CLEAR_COSTMAP_WAIT": 0.88,
             "WAIT_STABLE": 0.92,
+            "STOPPING": 0.99,
         }
         while not rospy.is_shutdown():
             with self.state_lock:

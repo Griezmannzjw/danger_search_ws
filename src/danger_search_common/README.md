@@ -15,6 +15,18 @@
 - `map_epoch`：活动地图身份，切层或地图重置时单调递增
 - `floor_z_m`：当前楼层相对任务起点的配置标高
 
+### FloorOccupancyGrid.msg
+- `occupancy_grid`：与 `/map` 同一快照
+- `floor_id`、`map_epoch`、`map_version`：该快照的原子身份
+- `/mapping/active_map`：该消息的锁存权威输入；消费者必须严格匹配
+  `MappingStatus` 的楼层和 epoch，版本必须有效、单调且不领先 MappingStatus。
+  同 epoch 内容版本允许因独立 ROS 连接短暂滞后，不得以裸 `/map` 进行跨层规划
+
+### NavigationHealth.msg
+- `current_floor`、`map_epoch`、`map_version`：navigation 已核验并提交的活动地图快照；
+  同 epoch 下可短暂落后于 MappingStatus 的最新内容版本
+- `transitioning`：地图签名或 costmap reset 未就绪，必须拒绝新 goal
+
 ### TransitFloor.action
 - Goal：`target_floor`, `exit_to_hall`
 - Result：`success`, `reached_floor`, `map_epoch`, `failure_code`, `message`

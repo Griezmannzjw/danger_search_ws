@@ -46,6 +46,34 @@ class TestRedCandidateDetector(unittest.TestCase):
 
         self.assertEqual(candidates, [])
 
+    def test_empty_scene_has_no_candidate(self):
+        image = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        _, candidates = self.detector.detect(image)
+
+        self.assertEqual(candidates, [])
+
+    def test_lightly_occluded_circle_remains_candidate(self):
+        image = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.circle(image, (320, 240), 35, (0, 0, 255), thickness=-1)
+        # Simulate a small foreground edge at the far side of the target.
+        # This remains inside the acceptance envelope, while a heavily
+        # occluded shape is still rejected by the circularity checks.
+        cv2.rectangle(image, (340, 200), (370, 280), (0, 0, 0), -1)
+
+        _, candidates = self.detector.detect(image)
+
+        self.assertEqual(len(candidates), 1)
+
+    def test_moderately_motion_blurred_circle_remains_candidate(self):
+        image = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.circle(image, (320, 240), 35, (0, 0, 255), thickness=-1)
+        image = cv2.GaussianBlur(image, (15, 15), 0)
+
+        _, candidates = self.detector.detect(image)
+
+        self.assertEqual(len(candidates), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
