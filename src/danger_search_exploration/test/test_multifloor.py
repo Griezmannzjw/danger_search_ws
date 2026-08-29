@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""多楼层探索单元测试：电梯井自主检测（门缝发现）。
-
-只测 ROS 无关的 _detect_elevator_halls / _perimeter_door_gaps 逻辑。
-"""
+"""多楼层探索、电梯门主动定位与换层状态机回归测试。"""
 
 import importlib.util
 import math
@@ -38,9 +35,14 @@ def make_planner(grid, resolution=0.10):
     )
     planner.connectivity_occupied_threshold = 65
     planner.shaft_min_area_m2 = 4.0
-    planner.shaft_max_area_m2 = 50.0
-    planner.door_gap_min_width_m = 0.8
-    planner.door_gap_max_width_m = 2.5
+    planner.shaft_max_area_m2 = 12.0
+    planner.shaft_min_side_m = 1.8
+    planner.shaft_max_side_m = 3.6
+    planner.shaft_wall_support_min = 0.70
+    planner.door_gap_min_width_m = 0.9
+    planner.door_gap_max_width_m = 1.8
+    planner.door_center_tolerance_fraction = 0.25
+    planner.elevator_hall_min_score = 0.75
     planner.free_threshold = 40
     return planner
 
@@ -124,7 +126,7 @@ class ElevatorDetectionTest(unittest.TestCase):
     def test_two_shafts_produce_distinct_candidates(self):
         grid = build_shaft_map(500)
         second = build_shaft_map(
-            500, shaft=(-8.0, -5.5, -4.0, -1.0), door=(-3.2, -2.0)
+            500, shaft=(-8.0, -5.5, -4.0, -1.0), door=(-3.1, -2.1)
         )
         grid = np.maximum(grid, second)
         planner = make_planner(grid)
@@ -143,6 +145,43 @@ class ElevatorDetectionTest(unittest.TestCase):
         grid[80:160, 157:160] = 100
         planner = make_planner(grid)
         self.assertEqual(planner._detect_elevator_halls(), [])
+
+    def test_large_room_and_two_opening_shaft_are_rejected(self):
+        large = build_shaft_map(
+            400, shaft=(1.0, 6.0, 1.0, 6.0), door=(3.0, 4.2)
+        )
+        self.assertEqual(make_planner(large)._detect_elevator_halls(), [])
+
+        grid = build_shaft_map(400)
+        # Add a second, door-sized opening to the east wall.
+        half = 20.0
+        grid[int((2.0 + half) / 0.1):int((3.0 + half) / 0.1) + 1,
+             int((3.8 + half) / 0.1):int((4.1 + half) / 0.1) + 1] = 0
+        self.assertEqual(make_planner(grid)._detect_elevator_halls(), [])
+
+    def test_passive_candidate_requires_three_versions_and_two_seconds(self):
+        planner = make_planner(build_shaft_map(400))
+        planner.current_floor = 0
+        planner.map_epoch = 3
+        planner.accepted_map_load_identity = (1, 2, 3)
+        planner.elevator_hall_tracks = {}
+        planner.elevator_hall_last_observed_version = None
+        planner.elevator_hall_min_versions = 3
+        planner.elevator_hall_min_duration_s = 2.0
+        planner.elevator_hall_min_score = 0.75
+        for version, seconds in ((4, 0.0), (5, 1.0)):
+            planner.current_map_version = version
+            planner.accepted_map_context = (0, 3, version)
+            planner._observe_elevator_halls(MODULE.rospy.Time.from_sec(seconds))
+        self.assertEqual(
+            planner._confirmed_elevator_halls(MODULE.rospy.Time.from_sec(1.0)), []
+        )
+        planner.current_map_version = 6
+        planner.accepted_map_context = (0, 3, 6)
+        planner._observe_elevator_halls(MODULE.rospy.Time.from_sec(2.0))
+        self.assertTrue(
+            planner._confirmed_elevator_halls(MODULE.rospy.Time.from_sec(2.0))
+        )
 
 
 class PublicTopologyTest(unittest.TestCase):
@@ -183,6 +222,10 @@ class PublicTopologyTest(unittest.TestCase):
         self.assertGreaterEqual(config["elevator_service_timeout_s"], 40.0)
         self.assertEqual(config["elevator_crossing_timeout_s"], 20.0)
         self.assertEqual(config["floor_map_stable_time_s"], 15.0)
+        self.assertEqual(config["elevator_crossing_speed_mps"], 0.40)
+        self.assertEqual(config["shaft_max_area_m2"], 12.0)
+        self.assertEqual(config["door_gap_min_width_m"], 0.9)
+        self.assertEqual(config["door_gap_max_width_m"], 1.8)
         self.assertEqual(config["active_map_topic"], "/mapping/active_map")
         self.assertGreater(config["elevator_footprint_margin_m"], 0.0)
 
@@ -201,33 +244,138 @@ class DoorScanValidationTest(unittest.TestCase):
         self.assertFalse(MODULE.scan_door_changed(opened, closed))
 
 
+class ActiveDoorLocalizationTest(unittest.TestCase):
+    @staticmethod
+    def scans_for_door(x=2.0, half_width=0.65, count=721, noise=0.0):
+        angle_min = -math.pi
+        increment = 2.0 * math.pi / float(count - 1)
+        angles = angle_min + np.arange(count) * increment
+        closed = np.full(count, np.nan, dtype=np.float32)
+        if x > 0.0:
+            valid = ((np.cos(angles) > 0.0)
+                     & (np.abs(x * np.tan(angles)) <= half_width))
+        else:
+            valid = ((np.cos(angles) < 0.0)
+                     & (np.abs(x * np.tan(angles)) <= half_width))
+        closed[valid] = x / np.cos(angles[valid])
+        opened = np.full(count, np.nan, dtype=np.float32)
+        opened_stack = np.tile(opened, (5, 1))
+        closed_stack = np.tile(closed, (5, 1))
+        if noise:
+            random = np.random.RandomState(7)
+            closed_stack[:, valid] += random.normal(
+                0.0, noise, size=(5, int(np.count_nonzero(valid)))
+            )
+        return opened_stack, closed_stack, angle_min, increment
+
+    def localize(self, opened, closed, angle_min, increment):
+        return MODULE.localize_actuated_door(
+            opened, closed, angle_min, increment, 0.05, 10.0,
+            (0.0, 0.0, 0.0), (0.0, 0.0),
+        )
+
+    def test_infinite_open_ranges_recover_center_and_inward_yaw(self):
+        opened, closed, angle_min, increment = self.scans_for_door(noise=0.01)
+        candidate = self.localize(opened, closed, angle_min, increment)
+        self.assertIsNotNone(candidate)
+        self.assertAlmostEqual(candidate.x, 2.0, delta=0.04)
+        self.assertAlmostEqual(candidate.y, 0.0, delta=0.04)
+        self.assertLess(abs(candidate.into_yaw), math.radians(2.0))
+        self.assertTrue(candidate.validated)
+        self.assertEqual(candidate.source, "door_motion")
+
+    def test_sparse_projected_scan_bridges_five_no_return_bins(self):
+        opened, closed, angle_min, increment = self.scans_for_door()
+        finite = np.flatnonzero(np.isfinite(closed[0]))
+        for offset in (25, 50):
+            closed[:, finite[offset:offset + 5]] = np.nan
+        candidate = self.localize(opened, closed, angle_min, increment)
+        self.assertIsNotNone(candidate)
+        self.assertAlmostEqual(candidate.x, 2.0, delta=0.04)
+        self.assertAlmostEqual(candidate.y, 0.0, delta=0.06)
+
+    def test_scan_seam_cluster_is_merged(self):
+        opened, closed, angle_min, increment = self.scans_for_door(x=-2.0)
+        candidate = self.localize(opened, closed, angle_min, increment)
+        self.assertIsNotNone(candidate)
+        yaw_error = abs(math.atan2(
+            math.sin(candidate.into_yaw - math.pi),
+            math.cos(candidate.into_yaw - math.pi),
+        ))
+        self.assertLess(yaw_error, math.radians(2.0))
+
+    def test_scan_points_are_transformed_into_map_frame(self):
+        opened, closed, angle_min, increment = self.scans_for_door(x=2.0)
+        candidate = MODULE.localize_actuated_door(
+            opened, closed, angle_min, increment, 0.05, 10.0,
+            (1.0, 2.0, math.pi / 2.0), (1.0, 2.0),
+        )
+        self.assertIsNotNone(candidate)
+        self.assertAlmostEqual(candidate.x, 1.0, delta=0.04)
+        self.assertAlmostEqual(candidate.y, 4.0, delta=0.04)
+        self.assertAlmostEqual(candidate.into_yaw, math.pi / 2.0, delta=0.04)
+
+    def test_no_motion_and_ambiguous_two_doors_are_rejected(self):
+        opened, front, angle_min, increment = self.scans_for_door(x=2.0)
+        self.assertIsNone(self.localize(front, front, angle_min, increment))
+        _opened_back, back, _angle_min, _increment = self.scans_for_door(x=-2.0)
+        combined = np.where(np.isfinite(front), front, back)
+        self.assertIsNone(self.localize(opened, combined, angle_min, increment))
+
+    def test_robot_motion_contract(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.initial_hall_discovery_pose = (0.0, 0.0, 0.0)
+        planner.initial_hall_discovery_max_translation_m = 0.03
+        planner.initial_hall_discovery_max_yaw_deg = 1.0
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=0.031, y=0.0),
+            orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+        )
+        self.assertTrue(planner._initial_discovery_robot_moved())
+
+    def test_close_is_submitted_once_and_restore_requests_open(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.initial_hall_discovery_active = True
+        planner.initial_hall_discovery_step = "CLOSE_START"
+        planner.initial_hall_discovery_started = MODULE.rospy.Time.from_sec(1.0)
+        planner.initial_hall_discovery_timeout_s = 60.0
+        planner.current_floor = 0
+        planner._initial_discovery_robot_moved = Mock(return_value=False)
+        planner._submit_service = Mock(return_value=True)
+        planner._set_initial_discovery_step = Mock()
+        planner._door_request = Mock(return_value=object())
+
+        planner._advance_initial_hall_discovery(
+            MODULE.rospy.Time.from_sec(2.0)
+        )
+        self.assertEqual(planner._submit_service.call_count, 1)
+        kind, close_callback = planner._submit_service.call_args.args
+        self.assertEqual(kind, "discovery_close")
+        close_callback()
+        planner._door_request.assert_called_once_with(0, False)
+
+        planner.initial_hall_discovery_step = "RESTORE_OPEN_START"
+        planner._submit_service.reset_mock()
+        planner._door_request.reset_mock()
+        planner._advance_initial_hall_discovery(
+            MODULE.rospy.Time.from_sec(3.0)
+        )
+        kind, open_callback = planner._submit_service.call_args.args
+        self.assertEqual(kind, "discovery_restore_open")
+        open_callback()
+        planner._door_request.assert_called_once_with(0, True)
+
+
 class ElevatorHallCacheTest(unittest.TestCase):
-    def test_map_version_change_invalidates_cached_hall_before_replanning(self):
+    @staticmethod
+    def planner_with_binding(epoch=4, version=12, binding_epoch=4,
+                             binding_version=10, load=(1, 2, 3)):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
         planner.current_floor = 1
+        planner.map_epoch = epoch
         planner.active_elevator_id = "main"
-        planner.current_map_version = 12
-        planner.accepted_map_load_identity = (1, 2, 3)
-        key = (1, "main")
-        planner.elevator_hall_bindings = {
-            key: {
-                "hall": (2.0, 3.0, 0.0),
-                "map_version": 11,
-                "map_load_identity": (1, 2, 3),
-            }
-        }
-
-        result = planner._cached_hall_candidate()
-
-        self.assertIsNone(result)
-        self.assertNotIn(key, planner.elevator_hall_bindings)
-
-    def test_matching_map_version_still_requires_reachability_validation(self):
-        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
-        planner.current_floor = 1
-        planner.active_elevator_id = "main"
-        planner.current_map_version = 12
-        planner.accepted_map_load_identity = (1, 2, 3)
+        planner.current_map_version = version
+        planner.accepted_map_load_identity = load
         planner.elevator_hall_approach_m = 0.8
         planner.current_pose = SimpleNamespace(
             position=SimpleNamespace(x=0.0, y=0.0)
@@ -235,15 +383,49 @@ class ElevatorHallCacheTest(unittest.TestCase):
         planner._world_to_map = Mock(return_value=(20, 30))
         planner._is_free = Mock(return_value=True)
         planner._check_path = Mock(return_value="reachable")
+        planner.last_checked_path_metrics = {"path_length": 4.0}
+        key = (1, "main")
         planner.elevator_hall_bindings = {
-            (1, "main"): {
+            key: {
                 "hall": (2.0, 3.0, 0.0),
-                "map_version": 12,
-                "map_load_identity": (1, 2, 3),
+                "floor": 1,
+                "epoch": binding_epoch,
+                "map_version": binding_version,
+                "map_load_identity": load,
+                "source": "door_motion",
+                "confidence": 1.0,
+                "score": 1.0,
+                "validated": True,
             }
         }
+        return planner, key
 
-        self.assertEqual(planner._cached_hall_candidate(), (2.0, 3.0, 0.0))
+    def test_same_epoch_newer_map_version_keeps_cached_hall(self):
+        planner, key = self.planner_with_binding()
+
+        result = planner._cached_hall_candidate()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.hall(), (2.0, 3.0, 0.0))
+        self.assertTrue(result.validated)
+        self.assertIn(key, planner.elevator_hall_bindings)
+
+    def test_wrong_epoch_or_map_load_invalidates_binding(self):
+        planner, key = self.planner_with_binding(binding_epoch=3)
+        self.assertIsNone(planner._cached_hall_candidate())
+        self.assertNotIn(key, planner.elevator_hall_bindings)
+
+        planner, key = self.planner_with_binding()
+        planner.accepted_map_load_identity = (9, 9, 9)
+        self.assertIsNone(planner._cached_hall_candidate())
+        self.assertNotIn(key, planner.elevator_hall_bindings)
+
+    def test_cached_hall_still_requires_reachability_validation(self):
+        planner, _key = self.planner_with_binding()
+
+        self.assertEqual(
+            planner._cached_hall_candidate().hall(), (2.0, 3.0, 0.0)
+        )
         planner._check_path.assert_called_once()
 
 
@@ -292,6 +474,27 @@ class TransitStateMachineTest(unittest.TestCase):
             self.result_calls += 1
             return self.value
 
+    @staticmethod
+    def to_hall_planner():
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_step = "TO_HALL"
+        planner.safety_stop_active = False
+        planner.current_pose = object()
+        planner.input_timeout = 2.0
+        recent = MODULE.rospy.Time.from_sec(9.5)
+        planner.last_pose_time = recent
+        planner.last_mapping_status_time = recent
+        planner.last_map_time = recent
+        planner.current_floor = 0
+        planner.map_epoch = 1
+        planner.current_map_version = 12
+        planner.mapping_lost = False
+        planner.mapping_transitioning = False
+        planner.mapping_ready = True
+        planner.mapping_stable = True
+        planner.accepted_map_context = (0, 1, 12)
+        return planner
+
     def test_service_timeout_invalidates_late_response_epoch(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
         old = self.Future(value=SimpleNamespace(accepted=True), done=False)
@@ -334,8 +537,53 @@ class TransitStateMachineTest(unittest.TestCase):
                 MODULE.rospy.Time, "now",
                 return_value=MODULE.rospy.Time.from_sec(1.0)):
             self.assertTrue(planner._pick_elevator_hall_and_send())
-        self.assertEqual(planner.elevator_hall_index, 2)
+        self.assertEqual(planner.elevator_hall_index, 1)
         planner._send_goal.assert_called_once()
+
+    def test_higher_score_far_candidate_beats_lower_score_near_candidate(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=0.0, y=0.0)
+        )
+        planner.elevator_halls = [
+            MODULE.ElevatorHallCandidate(1.0, 0.0, 0.0, score=0.80),
+            MODULE.ElevatorHallCandidate(4.0, 0.0, 0.0, score=0.95),
+        ]
+        planner.elevator_hall_index = 0
+        planner.elevator_hall_min_score = 0.75
+        planner.elevator_hall_approach_m = 0.8
+        planner.elevator_hall_navigation_max_s = 180.0
+        planner.elevator_hall_nominal_speed_mps = 0.25
+        planner.elevator_car_target_m = 1.4
+        planner._world_to_map = Mock(return_value=(1, 1))
+        planner._is_free = Mock(return_value=True)
+        planner._check_path = Mock(return_value="reachable")
+        planner.last_checked_path_metrics = {"path_length": 2.0}
+        planner._send_goal = Mock(return_value=True)
+        planner._set_floor_change_phase = Mock()
+
+        with patch.object(
+                MODULE.rospy.Time, "now",
+                return_value=MODULE.rospy.Time.from_sec(1.0)):
+            self.assertTrue(planner._pick_elevator_hall_and_send())
+        sent_x = planner._send_goal.call_args.args[0]
+        self.assertGreater(sent_x, 3.0)
+
+    def test_motion_validated_binding_skips_runtime_close_reopen(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_deadline = MODULE.rospy.Time.from_sec(100.0)
+        planner.floor_change_step = "OPEN_CURRENT_WAIT"
+        planner.hall_validation_required = True
+        planner.floor_change_hall_candidate = MODULE.ElevatorHallCandidate(
+            2.0, 0.0, 0.0, score=1.0, source="door_motion",
+            confidence=1.0, validated=True,
+        )
+        planner._service_outcome = Mock(return_value=("success", object()))
+        planner._start_crossing = Mock()
+
+        planner._advance_floor_change(MODULE.rospy.Time.from_sec(1.0))
+
+        planner._start_crossing.assert_called_once_with(+1.0)
 
     def test_wait_stable_requires_epoch_two_versions_and_full_hold(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
@@ -483,6 +731,68 @@ class TransitStateMachineTest(unittest.TestCase):
         self.assertEqual(code, "CANCELED")
         self.assertIn("safety", detail)
 
+    def test_to_hall_accepts_fresh_committed_map_that_lags_status(self):
+        planner = self.to_hall_planner()
+        planner.accepted_map_context = (0, 1, 10)
+
+        healthy, code, detail = planner._transit_phase_health(
+            MODULE.rospy.Time.from_sec(10.0)
+        )
+
+        self.assertTrue(healthy)
+        self.assertEqual(code, "")
+        self.assertEqual(detail, "")
+
+    def test_to_hall_tolerates_degraded_readiness_after_committed_start(self):
+        planner = self.to_hall_planner()
+        planner.mapping_ready = False
+        planner.mapping_stable = False
+
+        with patch.object(MODULE.rospy, "logwarn_throttle") as warning:
+            healthy, code, detail = planner._transit_phase_health(
+                MODULE.rospy.Time.from_sec(10.0)
+            )
+
+        self.assertTrue(healthy)
+        self.assertEqual(code, "")
+        self.assertEqual(detail, "")
+        warning.assert_called_once()
+
+    def test_to_hall_rejects_uncommitted_map_contexts(self):
+        invalid_contexts = (
+            (1, 1, 10),
+            (0, 0, 10),
+            (0, 2, 10),
+            (0, 1, 0),
+            (0, 1, 13),
+        )
+        for context in invalid_contexts:
+            with self.subTest(context=context):
+                planner = self.to_hall_planner()
+                planner.accepted_map_context = context
+
+                healthy, code, detail = planner._transit_phase_health(
+                    MODULE.rospy.Time.from_sec(10.0)
+                )
+
+                self.assertFalse(healthy)
+                self.assertEqual(code, "UNREACHABLE_HALL")
+                self.assertIn("not committed", detail)
+                self.assertIn("mapping=(0, 1, 12)", detail)
+
+    def test_to_hall_rejects_stale_committed_map(self):
+        planner = self.to_hall_planner()
+        planner.accepted_map_context = (0, 1, 10)
+        planner.last_map_time = MODULE.rospy.Time.from_sec(7.0)
+
+        healthy, code, detail = planner._transit_phase_health(
+            MODULE.rospy.Time.from_sec(10.0)
+        )
+
+        self.assertFalse(healthy)
+        self.assertEqual(code, "UNREACHABLE_HALL")
+        self.assertIn("stale", detail)
+
     def test_floor_map_reset_clears_only_that_floor_coordinates(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
         planner.current_floor = 1
@@ -528,6 +838,114 @@ class TransitStateMachineTest(unittest.TestCase):
         self.assertFalse(planner._control_output_is_zero(
             MODULE.rospy.Time.from_sec(10.0)
         ))
+
+
+class CompletedFloorTransitionTest(unittest.TestCase):
+    @staticmethod
+    def planner():
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.current_floor = 0
+        planner.completed_floors = {0}
+        planner.served_floors = {0, 1, 2}
+        planner.multifloor_enabled = True
+        planner.floor_change_active = False
+        planner.floor_change_gave_up_count = 0
+        planner.elevator_max_retries = 3
+        planner.floor_change_retry_after = MODULE.rospy.Time.from_sec(20.0)
+        planner.floor_transit_fatal = False
+        planner.exploration_state = "EXPLORE_FLOOR"
+        planner.state_reason = "floor_complete"
+        planner._select_next_floor = Mock(return_value=1)
+        planner._begin_floor_change = Mock(return_value=True)
+        planner._complete_exploration = Mock()
+        planner.state_calls = []
+
+        def set_state(state, reason):
+            planner.exploration_state = state
+            planner.state_reason = reason
+            planner.state_calls.append((state, reason))
+
+        planner._set_state = set_state
+        return planner
+
+    def test_floor_completion_is_persisted_and_logged_once(self):
+        planner = self.planner()
+        planner.completed_floors = set()
+        planner.coverage_debt_by_floor = {0: {(1, 2, "unreachable")}}
+        planner.remaining_frontier_count = 4
+        planner._save_current_floor_runtime = Mock()
+
+        with patch.object(MODULE.rospy, "loginfo") as loginfo:
+            first = planner._mark_current_floor_complete(
+                "bounded_unreachable", "all_frontiers_unreachable_or_blacklisted"
+            )
+            second = planner._mark_current_floor_complete(
+                "bounded_unreachable", "all_frontiers_unreachable_or_blacklisted"
+            )
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(planner.completed_floors, {0})
+        planner._save_current_floor_runtime.assert_called_once()
+        loginfo.assert_called_once()
+
+    def test_completed_floor_bypasses_frontier_selection(self):
+        planner = self.planner()
+        planner.exploring = True
+        planner.complete_published = False
+        planner._inputs_health = Mock(return_value=(True, "healthy"))
+        planner._continue_completed_floor = Mock()
+        planner._select_goal = Mock()
+
+        with patch.object(
+                MODULE.rospy.Time, "now",
+                return_value=MODULE.rospy.Time.from_sec(10.0)):
+            planner.planner_loop(None)
+
+        planner._continue_completed_floor.assert_called_once_with(
+            MODULE.rospy.Time.from_sec(10.0)
+        )
+        planner._select_goal.assert_not_called()
+
+    def test_retry_backoff_state_is_set_once(self):
+        planner = self.planner()
+
+        planner._continue_completed_floor(MODULE.rospy.Time.from_sec(10.0))
+        planner._continue_completed_floor(MODULE.rospy.Time.from_sec(11.0))
+
+        self.assertEqual(
+            planner.state_calls,
+            [("WAITING", "floor_transit_retry_backoff")],
+        )
+        planner._begin_floor_change.assert_not_called()
+
+    def test_retry_starts_once_after_backoff(self):
+        planner = self.planner()
+        planner.floor_change_retry_after = MODULE.rospy.Time.from_sec(5.0)
+
+        def begin(_floor):
+            planner.floor_change_active = True
+            return True
+
+        planner._begin_floor_change.side_effect = begin
+
+        planner._continue_completed_floor(MODULE.rospy.Time.from_sec(10.0))
+        planner._continue_completed_floor(MODULE.rospy.Time.from_sec(10.1))
+
+        planner._begin_floor_change.assert_called_once_with(1)
+
+    def test_retry_exhaustion_is_terminal_and_idempotent(self):
+        planner = self.planner()
+        planner.floor_change_gave_up_count = 3
+
+        planner._continue_completed_floor(MODULE.rospy.Time.from_sec(30.0))
+        planner._continue_completed_floor(MODULE.rospy.Time.from_sec(31.0))
+
+        self.assertEqual(
+            planner.state_calls,
+            [("FAILED", "floor_transit_unavailable")],
+        )
+        planner._begin_floor_change.assert_not_called()
 
 
 class ActiveMapContractTest(unittest.TestCase):

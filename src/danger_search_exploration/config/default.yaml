@@ -100,11 +100,23 @@ elevator_id: elevator_main
 # 电梯门 ID 前缀（各楼层为 elevator_floor_0/1/2）
 elevator_door_prefix: elevator_floor
 
-# 电梯自主发现：在地图上找大的实心连通区域（电梯井/楼梯井），在其周界找门缝
-shaft_min_area_m2: 4.0          # 候选井道包围盒最小面积
-shaft_max_area_m2: 50.0         # 候选井道包围盒最大面积（跳过密封楼外等巨型伪影）
-door_gap_min_width_m: 0.8       # 门缝宽度范围（按地图分辨率换算格数）
-door_gap_max_width_m: 2.5
+# 启动时先用公开门服务和全向激光差分定位电梯门；失败才用严格几何回退
+initial_hall_discovery_enabled: true
+initial_hall_discovery_scan_count: 5
+initial_hall_discovery_max_translation_m: 0.03
+initial_hall_discovery_max_yaw_deg: 1.0
+initial_hall_discovery_timeout_s: 60.0
+shaft_min_area_m2: 4.0
+shaft_max_area_m2: 12.0
+shaft_min_side_m: 1.8
+shaft_max_side_m: 3.6
+shaft_wall_support_min: 0.70
+door_gap_min_width_m: 0.9
+door_gap_max_width_m: 1.8
+door_center_tolerance_fraction: 0.25
+elevator_hall_min_score: 0.75
+elevator_hall_min_versions: 3
+elevator_hall_min_duration_s: 2.0
 # 靠近电梯厅/轿厢的安全距离
 elevator_hall_approach_m: 0.8
 elevator_car_target_m: 1.6      # 进轿厢后停靠位置（门缝向井道内推进距离）
@@ -116,7 +128,7 @@ elevator_floor_change_timeout_s: 480.0  # 仅为总安全上限；各阶段有�
 elevator_hall_navigation_max_s: 180.0
 elevator_hall_nominal_speed_mps: 0.25
 elevator_crossing_timeout_s: 20.0
-elevator_crossing_speed_mps: 0.20
+elevator_crossing_speed_mps: 0.40
 elevator_crossing_distance_m: 1.40
 elevator_crossing_min_progress_m: 0.80
 elevator_crossing_clearance_m: 0.32

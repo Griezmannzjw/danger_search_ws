@@ -91,8 +91,8 @@ Switched from passive to fixed stand
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
-source /home/ruilinli/SimEnv/devel/setup.bash
 source devel/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash --extend
 
 roslaunch danger_search_bringup simulation_truth.launch \
   autostart:=false \
@@ -139,8 +139,8 @@ raw GICP covariance is unhealthy
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
-source /home/ruilinli/SimEnv/devel/setup.bash
 source devel/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash --extend
 
 rosparam get /move_base/base_global_planner
 rosparam get /move_base/base_local_planner
@@ -291,6 +291,21 @@ message: "Mission started"
 [exploration] Start exploration
 ```
 
+随后先进入一次 `INITIAL_HALL_DISCOVERY`：机器人必须保持静止，依次采集 5 帧开门扫描、
+关闭 `elevator_floor_0`、稳定 0.75 秒并采集 5 帧关门扫描。Seed 42 正常应在 35 秒内看到：
+
+```bash
+rostopic echo /exploration/status
+rostopic echo /danger_search/cmd_vel_sent
+```
+
+`/exploration/status` 中应出现非空 `elevator_binding`，其 `source` 为 `door_motion`、
+`confidence` 为 `1.0`、`validated` 为 `true`；首次普通导航目标只能在该状态结束后发出。
+成功后 0 层电梯门保持关闭，直到 floor 0 完成并执行实际换层。若差分不可见、有歧义、
+扫描几何改变或机器人位姿漂移超限，节点必须恢复开门并有限转入严格几何回退。
+Livox 投影造成的稀疏无返回允许在同一线段内桥接最多 5 个 bin，拟合点本身仍必须是真实
+变化点，门宽、直线 RMS 和多簇歧义阈值不因此放宽。
+
 必须调用 `/danger_search/start`。不要直接调用 `/danger_search/start_exploration`，否则会绕过 mission 的任务生命周期、危险源确认和结果保存。
 
 ## 6. 终端四：启动 RViz
@@ -298,8 +313,8 @@ message: "Mission started"
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
-source /home/ruilinli/SimEnv/devel/setup.bash
 source devel/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash --extend
 
 rviz
 ```
@@ -337,8 +352,8 @@ map
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
-source /home/ruilinli/SimEnv/devel/setup.bash
 source devel/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash --extend
 
 rostopic hz /danger_search/nav_cmd_vel
 ```
@@ -396,6 +411,10 @@ rosbag record \
   -O /home/ruilinli/danger_search_ws/test_bags/standard_navigation_full.bag \
   /tf /tf_static \
   /map \
+  /mapping/status \
+  /mapping/current_floor \
+  /mapping/active_map \
+  /mapping/floors/1/map \
   /localization/pose \
   /localization/odom \
   /localization/scan \
@@ -405,6 +424,7 @@ rosbag record \
   /move_base/NavfnROS/plan \
   /move_base/DWAPlannerROS/local_plan \
   /danger_search/nav_cmd_vel \
+  /danger_search/elevator_cmd_vel \
   /danger_search/cmd_vel_sent \
   /cmd_vel \
   /navigation/health \
@@ -416,6 +436,51 @@ rosbag record \
 ```
 
 测试结束后在录包终端按 `Ctrl-C`，不要强制关闭后直接拔掉终端。
+
+### 7.5 检查多楼层换层合同
+
+floor 0 完成、系统开始前往电梯厅时，分别采样 mapping、active-map 和探索状态：
+
+```bash
+rostopic echo -n 1 /mapping/status
+rostopic echo -n 1 --noarr /mapping/active_map
+rostopic echo -n 1 /exploration/status
+rostopic echo /danger_search/transit_floor/status
+rostopic echo /danger_search/elevator_cmd_vel
+```
+
+第一个 `TO_HALL` 目标应使用启动阶段保存的 `source=door_motion` 绑定，不应导航到电梯
+背面、普通房间或远端墙角。开门成功后应直接进入 `ENTER`，不再执行一次“开—关—开”
+扫描验证；进入时 `/danger_search/elevator_cmd_vel.linear.x` 应达到 `0.40`，跨越门槛的
+定位进度不少于 `0.80 m`。
+
+`/mapping/status` 与 `/mapping/active_map` 必须属于相同的 floor 和 map epoch。active-map 的
+正版本允许暂时小于最新 mapping 版本，因为两条 ROS 连接异步发布；只要地图新鲜，系统不应
+因此取消 `TO_HALL`。不得出现目标刚发出便连续报告：
+
+```text
+floor transit failed [UNREACHABLE_HALL]: hall navigation active map context is not committed
+floor_transit_unavailable
+```
+
+换层启动前仍必须看到 `ready=True`、`stable=True`。厅导航运行后，move_base recovery
+转向期间 mapping 的 ready/stable 可以短暂降级；只要 `lost=False`、
+`transitioning=False`、位姿和 active-map 新鲜且 floor/epoch 合同有效，目标不应因此被取消。
+`/navigation/recovery_event` 在换层阶段也不应增加 `/exploration/trap_blacklist`。
+
+成功进入下一层后必须同时满足：
+
+```bash
+rostopic echo -n 1 /mapping/current_floor
+rostopic echo -n 1 /mapping/status
+rostopic echo -n 1 /mapping/floors/1/map
+rostopic echo -n 1 /exploration/status
+```
+
+- `/mapping/current_floor` 为 `1`。
+- `/mapping/status` 的 `current_floor` 为 `1`、`map_epoch` 已增加、`stable=True` 且
+  `transitioning=False`。
+- `/mapping/floors/1/map` 已发布，探索状态已离开换层阶段并继续 floor 1 探索。
 
 ## 8. 场景与验收项目
 

@@ -26,8 +26,10 @@ import json
 import os
 import threading
 from collections import deque
+from dataclasses import dataclass
 import cv2
 import numpy as np
+import tf2_ros
 from geometry_msgs.msg import (
     Point,
     Pose,
@@ -110,11 +112,13 @@ def load_public_scene_topology(path):
         raise ValueError("team scene info is missing public_scene")
     door_by_floor = {}
     door_by_elevator_floor = {}
+    door_initial_open_by_floor = {}
     for door in public_scene.get("door_ids", []):
         if door.get("kind") == "elevator":
             floor = int(door["floor_index"])
             door_id = str(door["id"])
             door_by_floor[floor] = door_id
+            door_initial_open_by_floor[floor] = bool(door.get("initial_open", False))
             elevator_id = str(door.get("elevator_id", "")).strip()
             if elevator_id:
                 door_by_elevator_floor[(elevator_id, floor)] = door_id
@@ -130,6 +134,7 @@ def load_public_scene_topology(path):
         "coordinate_frame": str(document.get("coordinate_frame", "")),
         "door_by_floor": door_by_floor,
         "door_by_elevator_floor": door_by_elevator_floor,
+        "door_initial_open_by_floor": door_initial_open_by_floor,
         "elevators": elevators,
         "served_floors": sorted({
             floor for elevator in elevators for floor in elevator["served_floors"]
@@ -221,6 +226,185 @@ def scan_door_changed(open_ranges, closed_ranges, change_threshold_m=0.20,
     return float(np.count_nonzero(changed)) / float(changed.size) >= float(
         changed_fraction
     )
+
+
+@dataclass
+class ElevatorHallCandidate:
+    """One sensor-derived elevator entrance hypothesis in the map frame."""
+
+    x: float
+    y: float
+    into_yaw: float
+    score: float = 0.0
+    source: str = "geometry"
+    confidence: float = 0.0
+    validated: bool = False
+    path_length: float = float("inf")
+
+    def __iter__(self):
+        return iter((self.x, self.y, self.into_yaw))
+
+    def __getitem__(self, index):
+        return (self.x, self.y, self.into_yaw)[index]
+
+    def __len__(self):
+        return 3
+
+    def hall(self):
+        return (float(self.x), float(self.y), float(self.into_yaw))
+
+
+def _circular_true_clusters(mask):
+    """Return contiguous true-index clusters, merging a 360-degree seam."""
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.size or not np.any(mask):
+        return []
+    transitions = np.flatnonzero(mask & ~np.roll(mask, 1))
+    if not transitions.size:  # Every beam changed; not a localized door.
+        return [np.arange(mask.size, dtype=np.int32)]
+    clusters = []
+    for start in transitions:
+        values = []
+        index = int(start)
+        while mask[index]:
+            values.append(index)
+            index = (index + 1) % mask.size
+            if index == start:
+                break
+        clusters.append(np.asarray(values, dtype=np.int32))
+    return clusters
+
+
+def _bridge_circular_gaps(mask, maximum_gap_beams):
+    """Bridge short no-return gaps in a circular projected lidar scan."""
+    bridged = np.asarray(mask, dtype=bool).copy()
+    maximum_gap_beams = int(maximum_gap_beams)
+    if maximum_gap_beams <= 0 or not np.any(bridged):
+        return bridged
+    for gap in _circular_true_clusters(~bridged):
+        if gap.size <= maximum_gap_beams:
+            bridged[gap] = True
+    return bridged
+
+
+def localize_actuated_door(open_scans, closed_scans, angle_min,
+                           angle_increment, range_min, range_max,
+                           scan_to_map, robot_xy,
+                           change_threshold_m=0.20,
+                           minimum_median_change_m=0.25,
+                           minimum_beams=5,
+                           minimum_width_m=0.9,
+                           maximum_width_m=1.8,
+                           maximum_line_rms_m=0.08,
+                           ambiguity_ratio=1.5,
+                           maximum_cluster_gap_beams=5):
+    """Localize a door from median open/closed 360-degree lidar scans.
+
+    Invalid open-door returns are represented by ``range_max`` only for beams
+    where the closed scan has a valid hit.  This preserves the expected
+    closing-door distance reduction without treating missing closed data as
+    evidence.  ``scan_to_map`` is a planar ``(x, y, yaw)`` transform.
+    """
+    opened = np.asarray(open_scans, dtype=np.float32)
+    closed = np.asarray(closed_scans, dtype=np.float32)
+    if (opened.ndim != 2 or closed.ndim != 2
+            or opened.shape != closed.shape or opened.shape[0] < 1
+            or opened.shape[1] < int(minimum_beams)
+            or not math.isfinite(float(angle_increment))
+            or abs(float(angle_increment)) < 1e-9
+            or abs(float(angle_increment)) * opened.shape[1]
+            < 2.0 * math.pi - 2.0 * abs(float(angle_increment))):
+        return None
+
+    opened_median = np.ma.median(
+        np.ma.masked_invalid(opened), axis=0
+    ).filled(np.nan)
+    closed_median = np.ma.median(
+        np.ma.masked_invalid(closed), axis=0
+    ).filled(np.nan)
+    with np.errstate(invalid="ignore"):
+        closed_valid = (
+            np.isfinite(closed_median)
+            & (closed_median >= float(range_min))
+            & (closed_median <= float(range_max))
+        )
+        opened_valid = (
+            np.isfinite(opened_median)
+            & (opened_median >= float(range_min))
+            & (opened_median <= float(range_max))
+        )
+    effective_open = np.where(opened_valid, opened_median, float(range_max))
+    reductions = effective_open - closed_median
+    with np.errstate(invalid="ignore"):
+        changed = closed_valid & (reductions >= float(change_threshold_m))
+
+    transform_x, transform_y, transform_yaw = (
+        float(value) for value in scan_to_map
+    )
+    robot_x, robot_y = (float(value) for value in robot_xy)
+    detections = []
+    clustered = _bridge_circular_gaps(changed, maximum_cluster_gap_beams)
+    for cluster_indices in _circular_true_clusters(clustered):
+        indices = cluster_indices[changed[cluster_indices]]
+        if indices.size < int(minimum_beams):
+            continue
+        angles = float(angle_min) + indices * float(angle_increment)
+        ranges = closed_median[indices].astype(np.float64)
+        scan_points = np.column_stack((ranges * np.cos(angles),
+                                       ranges * np.sin(angles)))
+        cosine = math.cos(transform_yaw)
+        sine = math.sin(transform_yaw)
+        points = np.column_stack((
+            transform_x + cosine * scan_points[:, 0] - sine * scan_points[:, 1],
+            transform_y + sine * scan_points[:, 0] + cosine * scan_points[:, 1],
+        ))
+        center = np.mean(points, axis=0)
+        centered = points - center
+        _singular, _values, vectors = np.linalg.svd(centered, full_matrices=False)
+        tangent = vectors[0]
+        projections = centered.dot(tangent)
+        normal_offsets = centered.dot(np.array((-tangent[1], tangent[0])))
+        width = float(np.max(projections) - np.min(projections))
+        line_rms = float(np.sqrt(np.mean(normal_offsets ** 2)))
+        median_change = float(np.median(reductions[indices]))
+        if not (float(minimum_width_m) <= width <= float(maximum_width_m)):
+            continue
+        if line_rms > float(maximum_line_rms_m):
+            continue
+        if median_change < float(minimum_median_change_m):
+            continue
+
+        segment_midpoint = center + tangent * 0.5 * (
+            float(np.min(projections)) + float(np.max(projections))
+        )
+        # The inward normal points away from the robot's hall-side pose.
+        normal = np.array((-tangent[1], tangent[0]))
+        away = segment_midpoint - np.array((robot_x, robot_y))
+        if float(np.dot(normal, away)) < 0.0:
+            normal = -normal
+        into_yaw = math.atan2(float(normal[1]), float(normal[0]))
+        evidence = float(indices.size) * median_change / max(
+            1e-3, 1.0 + 10.0 * line_rms
+        )
+        detections.append((
+            evidence,
+            ElevatorHallCandidate(
+                x=float(segment_midpoint[0]),
+                y=float(segment_midpoint[1]),
+                into_yaw=into_yaw,
+                score=1.0,
+                source="door_motion",
+                confidence=1.0,
+                validated=True,
+            ),
+        ))
+    if not detections:
+        return None
+    detections.sort(key=lambda item: item[0], reverse=True)
+    if (len(detections) > 1
+            and detections[0][0] < float(ambiguity_ratio) * detections[1][0]):
+        return None
+    return detections[0][1]
 
 
 def entrance_boundary_anchor_from_pose(pose, floor_id):
@@ -542,9 +726,26 @@ class ExplorationPlanner:
             "~elevator_door_prefix", "elevator_floor"
         )
         self.shaft_min_area_m2 = float(rospy.get_param("~shaft_min_area_m2", 4.0))
-        self.shaft_max_area_m2 = float(rospy.get_param("~shaft_max_area_m2", 50.0))
-        self.door_gap_min_width_m = float(rospy.get_param("~door_gap_min_width_m", 0.8))
-        self.door_gap_max_width_m = float(rospy.get_param("~door_gap_max_width_m", 2.5))
+        self.shaft_max_area_m2 = float(rospy.get_param("~shaft_max_area_m2", 12.0))
+        self.shaft_min_side_m = float(rospy.get_param("~shaft_min_side_m", 1.8))
+        self.shaft_max_side_m = float(rospy.get_param("~shaft_max_side_m", 3.6))
+        self.shaft_wall_support_min = float(rospy.get_param(
+            "~shaft_wall_support_min", 0.70
+        ))
+        self.door_gap_min_width_m = float(rospy.get_param("~door_gap_min_width_m", 0.9))
+        self.door_gap_max_width_m = float(rospy.get_param("~door_gap_max_width_m", 1.8))
+        self.door_center_tolerance_fraction = float(rospy.get_param(
+            "~door_center_tolerance_fraction", 0.25
+        ))
+        self.elevator_hall_min_score = float(rospy.get_param(
+            "~elevator_hall_min_score", 0.75
+        ))
+        self.elevator_hall_min_versions = int(rospy.get_param(
+            "~elevator_hall_min_versions", 3
+        ))
+        self.elevator_hall_min_duration_s = float(rospy.get_param(
+            "~elevator_hall_min_duration_s", 2.0
+        ))
         self.elevator_hall_approach_m = float(
             rospy.get_param("~elevator_hall_approach_m", 0.8)
         )
@@ -568,7 +769,7 @@ class ExplorationPlanner:
             rospy.get_param("~elevator_crossing_timeout_s", 20.0)
         )
         self.elevator_crossing_speed_mps = float(
-            rospy.get_param("~elevator_crossing_speed_mps", 0.20)
+            rospy.get_param("~elevator_crossing_speed_mps", 0.40)
         )
         self.elevator_crossing_distance_m = float(
             rospy.get_param("~elevator_crossing_distance_m", 1.4)
@@ -616,10 +817,31 @@ class ExplorationPlanner:
         self.hall_validation_required = bool(
             rospy.get_param("~hall_validation_required", True)
         )
+        self.initial_hall_discovery_enabled = bool(rospy.get_param(
+            "~initial_hall_discovery_enabled", True
+        ))
+        self.initial_hall_discovery_scan_count = int(rospy.get_param(
+            "~initial_hall_discovery_scan_count", 5
+        ))
+        self.initial_hall_discovery_max_translation_m = float(rospy.get_param(
+            "~initial_hall_discovery_max_translation_m", 0.03
+        ))
+        self.initial_hall_discovery_max_yaw_deg = float(rospy.get_param(
+            "~initial_hall_discovery_max_yaw_deg", 1.0
+        ))
+        self.initial_hall_discovery_timeout_s = float(rospy.get_param(
+            "~initial_hall_discovery_timeout_s", 60.0
+        ))
         if not (
                 self.shaft_min_area_m2 > 0.0
                 and self.shaft_max_area_m2 >= self.shaft_min_area_m2
+                and 0.0 < self.shaft_min_side_m <= self.shaft_max_side_m
+                and 0.0 < self.shaft_wall_support_min <= 1.0
                 and 0.0 < self.door_gap_min_width_m <= self.door_gap_max_width_m
+                and 0.0 <= self.door_center_tolerance_fraction <= 0.5
+                and 0.0 < self.elevator_hall_min_score <= 1.0
+                and self.elevator_hall_min_versions >= 1
+                and self.elevator_hall_min_duration_s >= 0.0
                 and self.elevator_hall_approach_m > 0.0
                 and self.elevator_service_timeout_s > 0.0
                 and self.elevator_max_retries >= 1
@@ -642,6 +864,10 @@ class ExplorationPlanner:
                 and self.floor_no_frontier_hold_s >= 10.0
                 and self.floor_unreachable_hold_s >= 10.0
                 and self.floor_height_m > 0.0
+                and self.initial_hall_discovery_scan_count >= 1
+                and self.initial_hall_discovery_max_translation_m > 0.0
+                and self.initial_hall_discovery_max_yaw_deg > 0.0
+                and self.initial_hall_discovery_timeout_s > 0.0
                 and self.retry_backoff > 0.0):
             raise rospy.ROSInitException("多楼层电梯参数无效")
 
@@ -663,10 +889,14 @@ class ExplorationPlanner:
                 raise rospy.ROSInitException("invalid public scene topology: %s" % exc)
             self.served_floors = set(self.scene_topology["served_floors"])
             self.elevator_door_ids = dict(self.scene_topology["door_by_floor"])
+            self.elevator_door_initial_open = dict(
+                self.scene_topology["door_initial_open_by_floor"]
+            )
             self.elevator_id = self.scene_topology["elevators"][0]["id"]
         else:
             self.served_floors = {0}
             self.elevator_door_ids = {}
+            self.elevator_door_initial_open = {}
 
         if not (
                 0.0 < self.observation_min_distance
@@ -756,6 +986,8 @@ class ExplorationPlanner:
         self.floor_runtime = {}
         self.coverage_debt_by_floor = {}
         self.elevator_hall_bindings = {}
+        self.elevator_hall_tracks = {}
+        self.elevator_hall_last_observed_version = None
         self.floor_no_frontier_since = rospy.Time(0)
         self.floor_unreachable_since = rospy.Time(0)
         self.elevator_halls = []          # 候选电梯厅世界坐标 (x, y)
@@ -769,6 +1001,7 @@ class ExplorationPlanner:
         self.floor_change_retries = 0
         self.floor_change_start_map_revision = 0
         self.floor_change_hall_point = None
+        self.floor_change_hall_candidate = None
         self.floor_change_car_point = None
         self.floor_change_stable_since = rospy.Time(0)
         self._floor_change_goal_succeeded = False
@@ -804,11 +1037,27 @@ class ExplorationPlanner:
         self._service_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self.latest_scan = None
         self.last_scan_time = rospy.Time(0)
+        self.initial_hall_discovery_active = False
+        self.initial_hall_discovery_step = "IDLE"
+        self.initial_hall_discovery_started = rospy.Time(0)
+        self.initial_hall_discovery_pose = None
+        self.initial_hall_discovery_scan_geometry = None
+        self.initial_hall_discovery_open_scans = []
+        self.initial_hall_discovery_closed_scans = []
+        self.initial_hall_discovery_last_scan_stamp = rospy.Time(0)
+        self.initial_hall_discovery_settle_until = rospy.Time(0)
+        self.initial_hall_discovery_restore_required = False
+        self.initial_hall_discovery_failure = ""
+        self.initial_hall_discovery_zero_since = rospy.Time(0)
+        self.initial_hall_discovery_door_held_closed = False
+        self.initial_hall_discovery_abort_deadline = rospy.Time(0)
         self.safety_stop_active = False
         self.last_sent_command = Twist()
         self.last_sent_command_time = rospy.Time(0)
         self.elevator_client = None
         self.door_client = None
+        self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(60.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
         # ========== Action客户端 ==========
         self.move_base_client = actionlib.SimpleActionClient(
@@ -1099,6 +1348,11 @@ class ExplorationPlanner:
         self.floor_map_versions = incoming_versions
         self.current_map_version = incoming_version
         self.visited_floors.add(self.current_floor)
+        for key, binding in list(getattr(
+                self, "elevator_hall_bindings", {}).items()):
+            if (int(key[0]) == self.current_floor
+                    and int(binding.get("epoch", -1)) != self.map_epoch):
+                self.elevator_hall_bindings.pop(key, None)
         if (self.map_epoch != previous_epoch
                 or self.current_floor != previous_floor
                 or self.mapping_transitioning):
@@ -1158,6 +1412,15 @@ class ExplorationPlanner:
         with self.state_lock:
             if (msg.header.frame_id != self.map_frame or self.map_data is None
                     or (not self.exploring and not self.floor_change_active)):
+                return
+
+            # Elevator-hall navigation has its own bounded candidate retry
+            # policy.  A failed hall approach must not mutate the completed
+            # floor's exploration blacklist: doing so can make every remaining
+            # hall candidate appear unreachable on the next floor-change
+            # attempt.  This also isolates late recovery events from the
+            # ordinary goal canceled when floor transit starts.
+            if self.floor_change_active:
                 return
 
             # RecoveryEvent is latched and navigation is also used by Mission.
@@ -1311,6 +1574,21 @@ class ExplorationPlanner:
 
     def _publish_status(self):
         coverage = self._known_grid_ratio()
+        binding = getattr(self, "elevator_hall_bindings", {}).get((
+            int(self.current_floor), str(getattr(self, "active_elevator_id", ""))
+        ))
+        binding_status = None
+        if binding is not None:
+            hall = tuple(binding.get("hall", ()))
+            if len(hall) == 3:
+                binding_status = {
+                    "x": float(hall[0]),
+                    "y": float(hall[1]),
+                    "yaw": float(hall[2]),
+                    "source": str(binding.get("source", "geometry")),
+                    "confidence": float(binding.get("confidence", 0.0)),
+                    "validated": bool(binding.get("validated", False)),
+                }
         payload = {
             "state": self.exploration_state,
             "reason": self.state_reason,
@@ -1329,6 +1607,14 @@ class ExplorationPlanner:
             "observation_goal_count": len(getattr(self, "observation_goal_cells", [])),
             "coverage_debt_count": len(self.coverage_debt_by_floor.get(
                 int(self.current_floor), set()
+            )),
+            "elevator_candidate_count": max(
+                len(getattr(self, "elevator_halls", [])),
+                len(getattr(self, "elevator_hall_tracks", {})),
+            ),
+            "elevator_binding": binding_status,
+            "initial_hall_discovery": str(getattr(
+                self, "initial_hall_discovery_step", "IDLE"
             )),
         }
         self.status_pub.publish(String(data=json.dumps(payload, sort_keys=True)))
@@ -2038,6 +2324,11 @@ class ExplorationPlanner:
         with self.state_lock:
             if self.exploring:
                 return TriggerResponse(success=True, message="Exploration already running")
+            if getattr(self, "initial_hall_discovery_active", False):
+                return TriggerResponse(
+                    success=False,
+                    message="Initial elevator door restoration is still running",
+                )
             if not self._capture_entrance_boundary_anchor():
                 return TriggerResponse(
                     success=False,
@@ -2063,6 +2354,8 @@ class ExplorationPlanner:
             self.floor_runtime = {}
             self.coverage_debt_by_floor = {}
             self.elevator_hall_bindings = {}
+            self.elevator_hall_tracks = {}
+            self.elevator_hall_last_observed_version = None
             self.floor_change_active = False
             self.floor_change_step = None
             self.floor_change_gave_up_count = 0
@@ -2071,12 +2364,18 @@ class ExplorationPlanner:
             self.elevator_halls = []
             self.elevator_hall_index = 0
             self.elevator_hall_found = None
-            self._set_state("WAITING", "waiting_for_inputs")
+            self._begin_initial_hall_discovery()
+            if self.initial_hall_discovery_active:
+                self._set_state(
+                    "INITIAL_HALL_DISCOVERY", "waiting_for_discovery_inputs"
+                )
+            else:
+                self._set_state("WAITING", "waiting_for_inputs")
             return TriggerResponse(success=True, message="Exploration started; waiting for inputs")
 
     def stop_exploration_cb(self, req):
         with self.state_lock:
-            if not self.exploring:
+            if not self.exploring and not self.initial_hall_discovery_active:
                 return TriggerResponse(success=True, message="Exploration already stopped")
             rospy.loginfo("[exploration] Stop exploration")
             if self.floor_change_active and not self.floor_change_external:
@@ -2084,6 +2383,15 @@ class ExplorationPlanner:
                     "CANCELED", "exploration stopped during floor transit"
                 )
             self.exploring = False
+            if (self.initial_hall_discovery_active
+                    or getattr(
+                        self, "initial_hall_discovery_door_held_closed", False
+                    )):
+                if not self.initial_hall_discovery_active:
+                    self.initial_hall_discovery_active = True
+                self._begin_initial_discovery_restore(
+                    "exploration stopped during initial hall discovery"
+                )
             self.session_id += 1
             self.goal_id += 1
             self.waiting_for_result = False
@@ -2162,9 +2470,70 @@ class ExplorationPlanner:
             return None, "navigation_service_unavailable"
         return "bounded_unreachable", selection_reason
 
+    def _mark_current_floor_complete(self, completion_mode, selection_reason):
+        """Persist and announce one floor-completion decision exactly once."""
+        if self.current_floor in self.completed_floors:
+            return False
+        debt_count = len(self.coverage_debt_by_floor.get(
+            self.current_floor, set()
+        ))
+        rospy.loginfo(
+            "[exploration] floor %d complete: mode=%s reason=%s "
+            "remaining_frontiers=%d coverage_debt=%d",
+            self.current_floor,
+            completion_mode,
+            selection_reason,
+            self.remaining_frontier_count,
+            debt_count,
+        )
+        self._save_current_floor_runtime()
+        self.completed_floors.add(self.current_floor)
+        return True
+
+    def _continue_completed_floor(self, now):
+        """Advance or settle the transition for an already completed floor."""
+        if self.floor_change_active:
+            return
+        if not self.multifloor_enabled:
+            self._complete_exploration("all_served_floors_explored")
+            return
+        if self.completed_floors.issuperset(self.served_floors):
+            self._complete_exploration("all_served_floors_explored")
+            return
+
+        next_floor = self._select_next_floor()
+        if next_floor is None:
+            self.floor_transit_fatal = True
+            self._set_state("FAILED", "served_floor_topology_unreachable")
+            return
+        if self.floor_change_gave_up_count >= self.elevator_max_retries:
+            if not (
+                    self.exploration_state == "FAILED"
+                    and self.state_reason == "floor_transit_unavailable"):
+                self._set_state("FAILED", "floor_transit_unavailable")
+            return
+        if now <= self.floor_change_retry_after:
+            if not (
+                    self.exploration_state == "WAITING"
+                    and self.state_reason == "floor_transit_retry_backoff"):
+                self._set_state("WAITING", "floor_transit_retry_backoff")
+            return
+        self._begin_floor_change(next_floor)
+
     def planner_loop(self, event):
         """主规划循环"""
         now = rospy.Time.now()
+        if getattr(self, "initial_hall_discovery_active", False):
+            try:
+                self._advance_initial_hall_discovery(now)
+            except Exception as exc:
+                rospy.logerr(
+                    "[exploration] initial hall discovery exception: %s", exc
+                )
+                self._begin_initial_discovery_restore(
+                    "initial hall discovery exception: %s" % exc
+                )
+            return
         # A dedicated 10 Hz timer advances transit so its leased velocity
         # input remains fresh; ordinary frontier planning pauses meanwhile.
         if self.floor_change_active:
@@ -2184,6 +2553,17 @@ class ExplorationPlanner:
             self._reset_bounded_floor_completion_evidence()
             state = "FAILED" if reason == "localization_lost" else "WAITING"
             self._set_state(state, reason)
+            return
+
+        if (self.multifloor_enabled and hasattr(self, "map_epoch")
+                and getattr(self, "map_data", None) is not None):
+            self._observe_elevator_halls(now)
+
+        # A floor-completion decision is durable across bounded transit retries.
+        # Do not rediscover frontiers or emit the same completion log while the
+        # state machine waits for its retry deadline.
+        if self.current_floor in self.completed_floors:
+            self._continue_completed_floor(now)
             return
 
         if self.waiting_for_result:
@@ -2246,32 +2626,10 @@ class ExplorationPlanner:
                 selection_reason, now
             )
             if completion_mode is not None:
-                debt_count = len(self.coverage_debt_by_floor.get(
-                    self.current_floor, set()
-                ))
-                rospy.loginfo(
-                    "[exploration] floor %d complete: mode=%s reason=%s "
-                    "remaining_frontiers=%d coverage_debt=%d",
-                    self.current_floor,
-                    completion_mode,
-                    selection_reason,
-                    self.remaining_frontier_count,
-                    debt_count,
+                self._mark_current_floor_complete(
+                    completion_mode, selection_reason
                 )
-                self._save_current_floor_runtime()
-                self.completed_floors.add(self.current_floor)
-                next_floor = self._select_next_floor()
-                if not self.multifloor_enabled:
-                    self._complete_exploration("all_served_floors_explored")
-                elif self.completed_floors.issuperset(self.served_floors):
-                    self._complete_exploration("all_served_floors_explored")
-                elif next_floor is None:
-                    self.floor_transit_fatal = True
-                    self._set_state("FAILED", "served_floor_topology_unreachable")
-                elif self.floor_change_gave_up_count >= self.elevator_max_retries:
-                    self._set_state("FAILED", "floor_transit_unavailable")
-                elif now > self.floor_change_retry_after:
-                    self._begin_floor_change(next_floor)
+                self._continue_completed_floor(now)
             else:
                 self._set_state("WAITING", wait_reason)
 
@@ -2498,6 +2856,334 @@ class ExplorationPlanner:
                 values.append(float(value))
         return np.asarray(values, dtype=np.float32)
 
+    @staticmethod
+    def _scan_geometry(message):
+        return (
+            len(message.ranges),
+            float(message.angle_min),
+            float(message.angle_increment),
+            float(message.range_min),
+            float(message.range_max),
+            str(message.header.frame_id),
+        )
+
+    @staticmethod
+    def _full_scan_ranges(message):
+        values = np.asarray(message.ranges, dtype=np.float32).copy()
+        invalid = (
+            ~np.isfinite(values)
+            | (values < float(message.range_min))
+            | (values > float(message.range_max))
+        )
+        values[invalid] = np.nan
+        return values
+
+    def _discovery_robot_pose(self):
+        if self.current_pose is None:
+            return None
+        return (
+            float(self.current_pose.position.x),
+            float(self.current_pose.position.y),
+            float(self._yaw_from_quaternion(self.current_pose.orientation)),
+        )
+
+    def _initial_discovery_robot_moved(self):
+        start = self.initial_hall_discovery_pose
+        current = self._discovery_robot_pose()
+        if start is None or current is None:
+            return True
+        yaw_delta = abs(math.atan2(
+            math.sin(current[2] - start[2]), math.cos(current[2] - start[2])
+        ))
+        return (
+            math.hypot(current[0] - start[0], current[1] - start[1])
+            > self.initial_hall_discovery_max_translation_m
+            or yaw_delta > math.radians(self.initial_hall_discovery_max_yaw_deg)
+        )
+
+    def _set_initial_discovery_step(self, step, reason):
+        self.initial_hall_discovery_step = str(step)
+        self._set_state("INITIAL_HALL_DISCOVERY", str(reason))
+
+    def _begin_initial_hall_discovery(self):
+        enabled = (
+            bool(getattr(self, "multifloor_enabled", False))
+            and bool(getattr(self, "initial_hall_discovery_enabled", False))
+            and bool(getattr(self, "elevator_door_initial_open", {}).get(
+                int(self.current_floor), False
+            ))
+            and bool(self._elevator_door_id(self.current_floor))
+        )
+        self.initial_hall_discovery_active = bool(enabled)
+        self.initial_hall_discovery_step = "WAIT_READY" if enabled else "DISABLED"
+        self.initial_hall_discovery_started = (
+            rospy.Time.now() if enabled else rospy.Time(0)
+        )
+        self.initial_hall_discovery_pose = None
+        self.initial_hall_discovery_scan_geometry = None
+        self.initial_hall_discovery_open_scans = []
+        self.initial_hall_discovery_closed_scans = []
+        self.initial_hall_discovery_last_scan_stamp = rospy.Time(0)
+        self.initial_hall_discovery_settle_until = rospy.Time(0)
+        self.initial_hall_discovery_restore_required = False
+        self.initial_hall_discovery_failure = ""
+        self.initial_hall_discovery_zero_since = rospy.Time(0)
+        self.initial_hall_discovery_abort_deadline = rospy.Time(0)
+        self.initial_hall_discovery_closed_scan_message = None
+
+    def _collect_initial_discovery_scan(self, destination):
+        if self.latest_scan is None:
+            return False
+        if self.last_scan_time <= self.initial_hall_discovery_last_scan_stamp:
+            return False
+        geometry = self._scan_geometry(self.latest_scan)
+        if self.initial_hall_discovery_scan_geometry is None:
+            self.initial_hall_discovery_scan_geometry = geometry
+        elif geometry != self.initial_hall_discovery_scan_geometry:
+            self._begin_initial_discovery_restore("scan geometry changed")
+            return False
+        destination.append(self._full_scan_ranges(self.latest_scan))
+        self.initial_hall_discovery_last_scan_stamp = self.last_scan_time
+        if destination is self.initial_hall_discovery_closed_scans:
+            self.initial_hall_discovery_closed_scan_message = self.latest_scan
+        return len(destination) >= self.initial_hall_discovery_scan_count
+
+    def _begin_initial_discovery_restore(self, reason):
+        if not self.initial_hall_discovery_active:
+            return
+        self.initial_hall_discovery_restore_required = True
+        self.initial_hall_discovery_failure = str(reason)
+        if self._service_future is not None:
+            self.initial_hall_discovery_abort_deadline = (
+                rospy.Time.now() + rospy.Duration(self.elevator_service_timeout_s)
+            )
+            self._set_initial_discovery_step(
+                "ABORTING", "restore_initial_elevator_door"
+            )
+        else:
+            self._set_initial_discovery_step(
+                "RESTORE_OPEN_START", "restore_initial_elevator_door"
+            )
+
+    def _finish_initial_hall_discovery(self, success):
+        self.initial_hall_discovery_active = False
+        self.initial_hall_discovery_step = "DONE" if success else "FALLBACK"
+        if success:
+            self._set_state("WAITING", "initial_hall_discovery_complete")
+        elif self.exploring:
+            rospy.logwarn(
+                "[exploration] initial elevator discovery fell back: %s",
+                self.initial_hall_discovery_failure or "no unambiguous door motion",
+            )
+            self._set_state("WAITING", "initial_hall_discovery_fallback")
+        else:
+            self._set_state("STOPPED", "stop_requested")
+
+    def _scan_to_map_planar_transform(self, message):
+        frame = str(message.header.frame_id)
+        if frame == self.map_frame:
+            return (0.0, 0.0, 0.0)
+        transform = self.tf_buffer.lookup_transform(
+            self.map_frame, frame, message.header.stamp, rospy.Duration(0.25)
+        ).transform
+        return (
+            float(transform.translation.x),
+            float(transform.translation.y),
+            float(self._yaw_from_quaternion(transform.rotation)),
+        )
+
+    def _save_hall_binding(self, candidate, floor=None, epoch=None):
+        floor = int(self.current_floor if floor is None else floor)
+        epoch = int(self.map_epoch if epoch is None else epoch)
+        key = (floor, str(self.active_elevator_id))
+        self.elevator_hall_bindings[key] = {
+            "hall": candidate.hall(),
+            "floor": floor,
+            "epoch": epoch,
+            "map_version": int(self.current_map_version),
+            "map_load_identity": self.accepted_map_load_identity,
+            "source": str(candidate.source),
+            "confidence": float(candidate.confidence),
+            "score": float(candidate.score),
+            "validated": bool(candidate.validated),
+        }
+
+    def _advance_initial_hall_discovery(self, now):
+        step = self.initial_hall_discovery_step
+        if (step not in ("ABORTING", "RESTORE_OPEN_START", "RESTORE_OPEN_WAIT")
+                and (now - self.initial_hall_discovery_started).to_sec()
+                > self.initial_hall_discovery_timeout_s):
+            self._begin_initial_discovery_restore(
+                "initial hall discovery timed out"
+            )
+            return
+        if step == "WAIT_READY":
+            healthy, _reason = self._inputs_health(now)
+            output_zero = self._control_output_is_zero(now)
+            if output_zero:
+                if self.initial_hall_discovery_zero_since == rospy.Time(0):
+                    self.initial_hall_discovery_zero_since = now
+            else:
+                self.initial_hall_discovery_zero_since = rospy.Time(0)
+            stationary = (
+                not self.waiting_for_result
+                and not self.nav_has_active_goal
+                and self.initial_hall_discovery_zero_since != rospy.Time(0)
+                and (now - self.initial_hall_discovery_zero_since).to_sec() >= 0.75
+            )
+            if not healthy or not stationary or self.latest_scan is None:
+                return
+            self.initial_hall_discovery_pose = self._discovery_robot_pose()
+            self.initial_hall_discovery_last_scan_stamp = rospy.Time(0)
+            self._set_initial_discovery_step(
+                "CAPTURE_OPEN", "capture_open_elevator_scans"
+            )
+            return
+
+        if step not in ("ABORTING", "RESTORE_OPEN_START", "RESTORE_OPEN_WAIT"):
+            if self._initial_discovery_robot_moved():
+                self._begin_initial_discovery_restore("robot moved during scan pair")
+                return
+
+        if step == "CAPTURE_OPEN":
+            if self._collect_initial_discovery_scan(
+                    self.initial_hall_discovery_open_scans):
+                self._set_initial_discovery_step(
+                    "CLOSE_START", "close_initial_elevator_door"
+                )
+            return
+        if step == "CLOSE_START":
+            if self._submit_service(
+                    "discovery_close",
+                    lambda: self._door_request(self.current_floor, False)):
+                self._set_initial_discovery_step(
+                    "CLOSE_WAIT", "close_initial_elevator_door"
+                )
+            return
+        if step == "CLOSE_WAIT":
+            if (now > self.floor_change_stage_deadline
+                    and self._service_future is not None
+                    and not self._service_future.done()):
+                self._begin_initial_discovery_restore(
+                    "close service timed out"
+                )
+                return
+            outcome, response = self._service_outcome(now, "discovery_close")
+            if outcome == "pending":
+                return
+            if outcome != "success":
+                self._begin_initial_discovery_restore(
+                    "close service %s: %s" % (
+                        outcome, getattr(response, "message", str(response or ""))
+                    )
+                )
+                return
+            self.initial_hall_discovery_settle_until = now + rospy.Duration(
+                self.elevator_scan_settle_s
+            )
+            self._set_initial_discovery_step(
+                "SETTLE_CLOSED", "settle_closed_elevator_door"
+            )
+            return
+        if step == "SETTLE_CLOSED":
+            if now < self.initial_hall_discovery_settle_until:
+                return
+            self.initial_hall_discovery_last_scan_stamp = self.last_scan_time
+            self._set_initial_discovery_step(
+                "CAPTURE_CLOSED", "capture_closed_elevator_scans"
+            )
+            return
+        if step == "CAPTURE_CLOSED":
+            if not self._collect_initial_discovery_scan(
+                    self.initial_hall_discovery_closed_scans):
+                return
+            message = self.initial_hall_discovery_closed_scan_message
+            try:
+                scan_to_map = self._scan_to_map_planar_transform(message)
+            except Exception as exc:
+                self._begin_initial_discovery_restore(
+                    "scan transform unavailable: %s" % exc
+                )
+                return
+            geometry = self.initial_hall_discovery_scan_geometry
+            candidate = localize_actuated_door(
+                self.initial_hall_discovery_open_scans,
+                self.initial_hall_discovery_closed_scans,
+                geometry[1], geometry[2], geometry[3], geometry[4],
+                scan_to_map,
+                self.initial_hall_discovery_pose[:2],
+                change_threshold_m=self.elevator_door_change_threshold_m,
+            )
+            if candidate is None:
+                self._begin_initial_discovery_restore(
+                    "door motion was absent or ambiguous"
+                )
+                return
+            self._save_hall_binding(candidate)
+            self.elevator_halls = [candidate]
+            self.initial_hall_discovery_door_held_closed = True
+            rospy.loginfo(
+                "[exploration] initial elevator hall bound from door motion: "
+                "floor=%d epoch=%d version=%d x=%.3f y=%.3f yaw=%.3f",
+                self.current_floor, self.map_epoch, self.current_map_version,
+                candidate.x, candidate.y, candidate.into_yaw,
+            )
+            # Successful discovery intentionally leaves the initial door closed.
+            self._finish_initial_hall_discovery(True)
+            return
+        if step == "ABORTING":
+            kind = str(self._service_kind)
+            if not kind:
+                self._set_initial_discovery_step(
+                    "RESTORE_OPEN_START", "restore_initial_elevator_door"
+                )
+                return
+            if (kind == "discovery_close"
+                    and self._service_future is not None
+                    and not self._service_future.done()
+                    and now < self.initial_hall_discovery_abort_deadline):
+                return
+            if self._service_future is not None and self._service_future.done():
+                try:
+                    self._service_future.result()
+                except Exception:
+                    pass
+                self._invalidate_service()
+                self._set_initial_discovery_step(
+                    "RESTORE_OPEN_START", "restore_initial_elevator_door"
+                )
+                return
+            status, _response = self._poll_service(now, kind)
+            if status == "pending":
+                return
+            self._invalidate_service()
+            self._set_initial_discovery_step(
+                "RESTORE_OPEN_START", "restore_initial_elevator_door"
+            )
+            return
+        if step == "RESTORE_OPEN_START":
+            if self._submit_service(
+                    "discovery_restore_open",
+                    lambda: self._door_request(self.current_floor, True)):
+                self._set_initial_discovery_step(
+                    "RESTORE_OPEN_WAIT", "restore_initial_elevator_door"
+                )
+            return
+        if step == "RESTORE_OPEN_WAIT":
+            outcome, response = self._service_outcome(
+                now, "discovery_restore_open"
+            )
+            if outcome == "pending":
+                return
+            if outcome != "success":
+                rospy.logerr(
+                    "[exploration] failed to restore initial elevator door: %s",
+                    getattr(response, "message", str(response or outcome)),
+                )
+            else:
+                self.initial_hall_discovery_door_held_closed = False
+            self._finish_initial_hall_discovery(False)
+
     def _perimeter_door_gaps(self, component):
         """在实心连通区域周界找门缝，返回 (外侧自由格x, 外侧格y, 朝向井道内的yaw)。"""
         ys, xs = np.where(component)
@@ -2545,17 +3231,17 @@ class ExplorationPlanner:
         return gaps
 
     def _closed_space_hall_candidates(self, occupied, free):
-        """Find rectangular shafts even when their walls join building walls.
-
-        Closing only door-sized gaps turns a U-shaped shaft into an enclosed
-        free-space component.  Inspecting the *original* boundary then recovers
-        the door opening.  Runtime door-motion validation remains mandatory in
-        competition mode, which is what separates a shaft from a small room.
-        """
+        """Find high-quality, single-opening rectangular shaft candidates."""
         resolution = self.map_info.resolution
         height, width = occupied.shape
         min_gap = max(1, int(math.ceil(self.door_gap_min_width_m / resolution)))
         max_gap = int(math.ceil(self.door_gap_max_width_m / resolution))
+        min_side = float(getattr(self, "shaft_min_side_m", 1.8))
+        max_side = float(getattr(self, "shaft_max_side_m", 3.6))
+        minimum_support = float(getattr(self, "shaft_wall_support_min", 0.70))
+        center_tolerance = float(getattr(
+            self, "door_center_tolerance_fraction", 0.25
+        ))
         kernel_lengths = sorted({
             min_gap + 2,
             (min_gap + max_gap) // 2 + 1,
@@ -2577,6 +3263,7 @@ class ExplorationPlanner:
 
         def line_runs(values):
             runs = []
+            minimum_structural_gap = max(2, int(math.ceil(0.15 / resolution)))
             index = 0
             while index < len(values):
                 if values[index]:
@@ -2585,7 +3272,7 @@ class ExplorationPlanner:
                 end = index
                 while end < len(values) and not values[end]:
                     end += 1
-                if min_gap <= end - index <= max_gap:
+                if end - index >= minimum_structural_gap:
                     runs.append((index, end))
                 index = end
             return runs
@@ -2598,12 +3285,21 @@ class ExplorationPlanner:
                 x, y, w, h, area = (int(value) for value in stats[label])
                 if x <= 1 or y <= 1 or x + w >= width - 2 or y + h >= height - 2:
                     continue
-                physical_area = float(w * h) * resolution ** 2
+                physical_width = float(w) * resolution
+                physical_height = float(h) * resolution
+                physical_area = physical_width * physical_height
                 if not self.shaft_min_area_m2 <= physical_area <= self.shaft_max_area_m2:
                     continue
-                aspect = float(w) / float(max(h, 1))
+                if not (
+                        min_side <= physical_width <= max_side
+                        and min_side <= physical_height <= max_side):
+                    continue
                 fill = float(area) / float(max(w * h, 1))
-                if not 0.40 <= aspect <= 2.50 or fill < 0.55:
+                interior_free = float(np.mean(free[y:y + h, x:x + w]))
+                interior_known = float(np.mean(
+                    self.map_data[y:y + h, x:x + w] >= 0
+                ))
+                if fill < 0.55 or interior_free < 0.55 or interior_known < 0.70:
                     continue
 
                 west = occupied[y:y + h, x - 1] != 0
@@ -2611,16 +3307,39 @@ class ExplorationPlanner:
                 south = occupied[y - 1, x:x + w] != 0
                 north = occupied[y + h, x:x + w] != 0
                 boundary_lines = (west, east, north, south)
-                if sum(float(np.mean(line)) for line in boundary_lines) < 2.1:
-                    continue
                 edge_specs = (
-                    (west, "west", 0.0),
-                    (east, "east", math.pi),
-                    (north, "north", -math.pi / 2.0),
-                    (south, "south", math.pi / 2.0),
+                    (0, west, "west", 0.0),
+                    (1, east, "east", math.pi),
+                    (2, north, "north", -math.pi / 2.0),
+                    (3, south, "south", math.pi / 2.0),
                 )
-                for line, edge, into_yaw in edge_specs:
-                    for start, end in line_runs(line):
+                for edge_index, line, edge, into_yaw in edge_specs:
+                    gaps = line_runs(line)
+                    if len(gaps) != 1:
+                        continue
+                    if not min_gap <= gaps[0][1] - gaps[0][0] <= max_gap:
+                        continue
+                    other_support = [
+                        float(np.mean(other))
+                        for index, other in enumerate(boundary_lines)
+                        if index != edge_index
+                    ]
+                    if any(value < minimum_support for value in other_support):
+                        continue
+                    for start, end in gaps:
+                        gap_cells = end - start
+                        gap_width = gap_cells * resolution
+                        edge_center = 0.5 * float(len(line))
+                        gap_center = 0.5 * float(start + end)
+                        center_offset = abs(gap_center - edge_center) / max(
+                            1.0, float(len(line))
+                        )
+                        if center_offset > center_tolerance:
+                            continue
+                        non_gap = np.concatenate((line[:start], line[end:]))
+                        if (not non_gap.size
+                                or float(np.mean(non_gap)) < minimum_support):
+                            continue
                         middle = (start + end - 1) // 2
                         if edge == "west":
                             gx, gy = x - 2, y + middle
@@ -2633,7 +3352,53 @@ class ExplorationPlanner:
                         if (0 <= gx < width and 0 <= gy < height
                                 and bool(free[gy, gx])):
                             wx, wy = self._map_to_world(gx, gy)
-                            candidate = (wx, wy, into_yaw)
+                            enclosure_score = float(np.mean(other_support))
+                            target_side = 0.5 * (min_side + max_side)
+                            half_side_range = max(1e-6, 0.5 * (max_side - min_side))
+                            size_score = 0.5 * sum(
+                                0.5 + 0.5 * max(
+                                    0.0,
+                                    1.0 - abs(side - target_side)
+                                    / half_side_range,
+                                ) for side in (physical_width, physical_height)
+                            )
+                            target_gap = 0.5 * (
+                                self.door_gap_min_width_m
+                                + self.door_gap_max_width_m
+                            )
+                            half_gap_range = max(
+                                1e-6,
+                                0.5 * (
+                                    self.door_gap_max_width_m
+                                    - self.door_gap_min_width_m
+                                ),
+                            )
+                            width_score = 0.5 + 0.5 * max(
+                                0.0,
+                                1.0 - abs(gap_width - target_gap)
+                                / half_gap_range,
+                            )
+                            center_score = max(
+                                0.0, 1.0 - center_offset / max(
+                                    1e-6, center_tolerance
+                                )
+                            )
+                            base_score = (
+                                0.30 * enclosure_score
+                                + 0.20 * size_score
+                                + 0.20 * width_score
+                                + 0.10 * center_score
+                                + 0.10 * interior_free
+                            )
+                            candidate = ElevatorHallCandidate(
+                                x=wx,
+                                y=wy,
+                                into_yaw=into_yaw,
+                                score=base_score,
+                                source="geometry",
+                                confidence=base_score,
+                                validated=False,
+                            )
                             if not any(
                                     math.hypot(wx - other[0], wy - other[1]) < 0.5
                                     and abs(math.atan2(
@@ -2645,37 +3410,12 @@ class ExplorationPlanner:
         return candidates
 
     def _detect_elevator_halls(self):
-        """从当前层地图检测电梯井门缝候选，返回 (world_x, world_y, 朝井道内yaw) 列表。
-
-        电梯井/楼梯井是薄墙围成的"井道"：墙面积小但包围盒大（电梯井 ~2.4x2.7m）。
-        用包围盒面积识别井道形状，再在周界找门缝。
-        """
+        """Detect strict passive shaft candidates from the active map only."""
         if self.map_data is None:
             return []
         occupied = (self.map_data >= self.connectivity_occupied_threshold).astype(np.uint8)
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(occupied, connectivity=8)
-        min_bbox_cells = self.shaft_min_area_m2 / (self.map_info.resolution ** 2)
-        max_bbox_cells = self.shaft_max_area_m2 / (self.map_info.resolution ** 2)
         free = (self.map_data >= 0) & (self.map_data < self.free_threshold)
-        width, height = self.map_info.width, self.map_info.height
-        candidates = []
-        for index in range(1, num):
-            x, y, w, h, _area = stats[index]
-            bbox_area = w * h
-            if bbox_area < min_bbox_cells or bbox_area > max_bbox_cells:
-                continue
-            # 跳过贴地图边界的区域（密封楼外/世界墙等大面积伪影）
-            if x <= 0 or y <= 0 or x + w >= width - 1 or y + h >= height - 1:
-                continue
-            component = (labels == index)
-            for gx, gy, into_yaw in self._perimeter_door_gaps(component):
-                if not (0 <= gy < height and 0 <= gx < width):
-                    continue
-                if not free[gy, gx]:
-                    continue
-                wx, wy = self._map_to_world(gx, gy)
-                candidates.append((wx, wy, into_yaw))
-        candidates.extend(self._closed_space_hall_candidates(occupied, free))
+        candidates = self._closed_space_hall_candidates(occupied, free)
         deduplicated = []
         for candidate in candidates:
             if any(
@@ -2690,17 +3430,84 @@ class ExplorationPlanner:
             deduplicated.append(candidate)
         return deduplicated
 
+    def _observe_elevator_halls(self, now):
+        """Accumulate passive evidence over distinct map versions."""
+        active_context = getattr(self, "accepted_map_context", None)
+        if (active_context is None
+                or tuple(int(value) for value in active_context[:2]) != (
+                    int(self.current_floor), int(self.map_epoch)
+                )):
+            return
+        active_version = int(active_context[2])
+        context = (
+            int(self.current_floor), int(self.map_epoch),
+            self.accepted_map_load_identity,
+        )
+        observation_key = context + (active_version,)
+        if self.elevator_hall_last_observed_version == observation_key:
+            return
+        if getattr(self, "elevator_hall_track_context", None) != context:
+            self.elevator_hall_tracks = {}
+            self.elevator_hall_track_context = context
+        self.elevator_hall_last_observed_version = observation_key
+        for candidate in self._detect_elevator_halls():
+            matching_key = None
+            for key, track in self.elevator_hall_tracks.items():
+                previous = track["candidate"]
+                if (math.hypot(candidate.x - previous.x,
+                               candidate.y - previous.y) < 0.50
+                        and abs(math.atan2(
+                            math.sin(candidate.into_yaw - previous.into_yaw),
+                            math.cos(candidate.into_yaw - previous.into_yaw),
+                        )) < 0.35):
+                    matching_key = key
+                    break
+            if matching_key is None:
+                matching_key = (
+                    round(candidate.x / 0.25), round(candidate.y / 0.25),
+                    round(candidate.into_yaw / 0.20),
+                )
+                self.elevator_hall_tracks[matching_key] = {
+                    "candidate": candidate,
+                    "first_seen": now,
+                    "last_seen": now,
+                    "versions": set(),
+                }
+            track = self.elevator_hall_tracks[matching_key]
+            track["candidate"] = candidate
+            track["last_seen"] = now
+            track["versions"].add(active_version)
+
+    def _confirmed_elevator_halls(self, now):
+        candidates = []
+        minimum_versions = int(getattr(self, "elevator_hall_min_versions", 3))
+        minimum_duration = float(getattr(
+            self, "elevator_hall_min_duration_s", 2.0
+        ))
+        minimum_score = float(getattr(self, "elevator_hall_min_score", 0.75))
+        for track in getattr(self, "elevator_hall_tracks", {}).values():
+            duration = (track["last_seen"] - track["first_seen"]).to_sec()
+            if (len(track["versions"]) < minimum_versions
+                    or duration < minimum_duration):
+                continue
+            candidate = track["candidate"]
+            candidate.score = min(1.0, float(candidate.score) + 0.10)
+            candidate.confidence = candidate.score
+            if candidate.score >= minimum_score:
+                candidates.append(candidate)
+        return candidates
+
     def _cached_hall_candidate(self):
         """Return a still-valid hall binding for this floor/elevator pair."""
         key = (int(self.current_floor), str(self.active_elevator_id))
         binding = self.elevator_hall_bindings.get(key)
         if binding is None:
             return None
-        # A cached hall pose is coordinate data from one map revision.  A
-        # return to the same floor can keep the map-load identity while door
-        # motion or newly observed obstacles advance its version; in that
-        # case force fresh candidate detection instead of trusting the pose.
-        if int(binding.get("map_version", -1)) != int(self.current_map_version):
+        if int(binding.get("floor", self.current_floor)) != int(self.current_floor):
+            self.elevator_hall_bindings.pop(key, None)
+            return None
+        current_epoch = int(getattr(self, "map_epoch", 0))
+        if int(binding.get("epoch", current_epoch)) != current_epoch:
             self.elevator_hall_bindings.pop(key, None)
             return None
         if binding.get("map_load_identity") != self.accepted_map_load_identity:
@@ -2711,8 +3518,9 @@ class ExplorationPlanner:
             self.elevator_hall_bindings.pop(key, None)
             return None
         hx, hy, into_yaw = hall
-        approach_x = hx - self.elevator_hall_approach_m * math.cos(into_yaw)
-        approach_y = hy - self.elevator_hall_approach_m * math.sin(into_yaw)
+        approach_distance = float(getattr(self, "elevator_hall_approach_m", 0.8))
+        approach_x = hx - approach_distance * math.cos(into_yaw)
+        approach_y = hy - approach_distance * math.sin(into_yaw)
         map_x, map_y = self._world_to_map(approach_x, approach_y)
         if not self._is_free(map_x, map_y):
             self.elevator_hall_bindings.pop(key, None)
@@ -2726,17 +3534,44 @@ class ExplorationPlanner:
         if path_state != "reachable":
             self.elevator_hall_bindings.pop(key, None)
             return None
-        return (float(hx), float(hy), float(into_yaw))
+        return ElevatorHallCandidate(
+            x=float(hx),
+            y=float(hy),
+            into_yaw=float(into_yaw),
+            score=float(binding.get("score", binding.get("confidence", 0.0))),
+            source=str(binding.get("source", "geometry")),
+            confidence=float(binding.get("confidence", 0.0)),
+            validated=bool(binding.get("validated", False)),
+            path_length=float((getattr(
+                self, "last_checked_path_metrics", None
+            ) or {}).get(
+                "path_length", float("inf")
+            )),
+        )
 
     def _remember_validated_hall(self):
         if self.floor_change_hall_point is None:
             return
-        key = (int(self.floor_change_start_floor), str(self.active_elevator_id))
-        self.elevator_hall_bindings[key] = {
-            "hall": tuple(float(value) for value in self.floor_change_hall_point),
-            "map_version": int(self.current_map_version),
-            "map_load_identity": self.accepted_map_load_identity,
-        }
+        candidate = self.floor_change_hall_candidate
+        if candidate is None:
+            candidate = ElevatorHallCandidate(
+                *self.floor_change_hall_point,
+                score=1.0,
+                source="runtime_door_motion",
+                confidence=1.0,
+                validated=True,
+            )
+        else:
+            candidate.validated = True
+            candidate.confidence = 1.0
+            candidate.score = 1.0
+            if candidate.source != "door_motion":
+                candidate.source = "runtime_door_motion"
+        self._save_hall_binding(
+            candidate,
+            floor=self.floor_change_start_floor,
+            epoch=self.floor_change_start_epoch,
+        )
 
     def _discard_active_hall_binding(self):
         key = (int(self.floor_change_start_floor), str(self.active_elevator_id))
@@ -2819,6 +3654,7 @@ class ExplorationPlanner:
         self.floor_change_expected_epoch = 0
         self.floor_change_stable_since = rospy.Time(0)
         self.floor_change_open_scan = None
+        self.floor_change_hall_candidate = None
         self._invalidate_service()
         self._stop_elevator_motion()
 
@@ -2833,7 +3669,8 @@ class ExplorationPlanner:
         self._floor_change_goal_succeeded = None
 
         cached_hall = self._cached_hall_candidate()
-        self.elevator_halls = self._detect_elevator_halls()
+        self._observe_elevator_halls(now)
+        self.elevator_halls = self._confirmed_elevator_halls(now)
         if cached_hall is not None and not any(
                 math.hypot(cached_hall[0] - hall[0], cached_hall[1] - hall[1])
                 < 0.35 for hall in self.elevator_halls):
@@ -2843,12 +3680,11 @@ class ExplorationPlanner:
             return False
         cx = self.current_pose.position.x
         cy = self.current_pose.position.y
-        self.elevator_halls.sort(
-            key=lambda hall: (
-                0 if cached_hall is not None and hall == cached_hall else 1,
-                math.hypot(hall[0] - cx, hall[1] - cy),
-            )
-        )
+        self.elevator_halls.sort(key=lambda hall: (
+            0 if bool(getattr(hall, "validated", False)) else 1,
+            -float(getattr(hall, "score", 0.0)),
+            math.hypot(hall[0] - cx, hall[1] - cy),
+        ))
         self.elevator_hall_index = 0
         self._set_floor_change_phase("TO_HALL", "select_elevator_hall")
         return self._pick_elevator_hall_and_send()
@@ -2858,27 +3694,59 @@ class ExplorationPlanner:
         cx = self.current_pose.position.x
         cy = self.current_pose.position.y
         had_candidate = self.elevator_hall_index < len(self.elevator_halls)
+        if self.elevator_hall_index == 0:
+            ranked = []
+            for raw_candidate in self.elevator_halls:
+                candidate = raw_candidate if isinstance(
+                    raw_candidate, ElevatorHallCandidate
+                ) else ElevatorHallCandidate(
+                    *raw_candidate, score=1.0, confidence=1.0
+                )
+                if (not candidate.validated
+                        and candidate.score < float(getattr(
+                            self, "elevator_hall_min_score", 0.75
+                        ))):
+                    continue
+                approach_x = candidate.x - self.elevator_hall_approach_m * math.cos(
+                    candidate.into_yaw
+                )
+                approach_y = candidate.y - self.elevator_hall_approach_m * math.sin(
+                    candidate.into_yaw
+                )
+                map_x, map_y = self._world_to_map(approach_x, approach_y)
+                if not self._is_free(map_x, map_y):
+                    continue
+                if self._check_path(cx, cy, approach_x, approach_y) != "reachable":
+                    continue
+                metrics = self.last_checked_path_metrics or {}
+                candidate.path_length = float(metrics.get(
+                    "path_length", math.hypot(approach_x - cx, approach_y - cy)
+                ))
+                ranked.append(candidate)
+            ranked.sort(key=lambda candidate: (
+                0 if candidate.validated else 1,
+                -candidate.score,
+                candidate.path_length,
+                math.hypot(candidate.x - cx, candidate.y - cy),
+            ))
+            self.elevator_halls = ranked
+            had_candidate = bool(ranked)
         while self.elevator_hall_index < len(self.elevator_halls):
-            hx, hy, into_yaw = self.elevator_halls[self.elevator_hall_index]
+            candidate = self.elevator_halls[self.elevator_hall_index]
+            hx, hy, into_yaw = candidate
             self.elevator_hall_index += 1
             approach_x = hx - self.elevator_hall_approach_m * math.cos(into_yaw)
             approach_y = hy - self.elevator_hall_approach_m * math.sin(into_yaw)
-            map_x, map_y = self._world_to_map(approach_x, approach_y)
-            if not self._is_free(map_x, map_y):
-                continue
-            path_state = self._check_path(cx, cy, approach_x, approach_y)
-            if path_state != "reachable":
-                continue
-            metrics = self.last_checked_path_metrics or {}
-            path_length = float(metrics.get(
-                "path_length", math.hypot(approach_x - cx, approach_y - cy)
-            ))
+            path_length = float(getattr(candidate, "path_length", float("inf")))
+            if not math.isfinite(path_length):
+                path_length = math.hypot(approach_x - cx, approach_y - cy)
             navigation_timeout = min(
                 self.elevator_hall_navigation_max_s,
                 max(30.0, 20.0 + 2.5 * path_length
                     / self.elevator_hall_nominal_speed_mps),
             )
             self.floor_change_hall_point = (hx, hy, into_yaw)
+            self.floor_change_hall_candidate = candidate
             self.floor_change_car_point = (
                 hx + self.elevator_car_target_m * math.cos(into_yaw),
                 hy + self.elevator_car_target_m * math.sin(into_yaw),
@@ -3053,12 +3921,42 @@ class ExplorationPlanner:
                 int(self.current_floor), int(self.map_epoch),
                 int(self.current_map_version),
             )
-            if (self.mapping_lost or self.mapping_transitioning
-                    or not self.mapping_ready or not self.mapping_stable
-                    or self.accepted_map_context != expected
-                    or not self._stamp_is_fresh(
-                        self.last_map_time, now, self.input_timeout)):
-                return False, "UNREACHABLE_HALL", "hall navigation map is not ready"
+            if self.mapping_lost:
+                return False, "UNREACHABLE_HALL", "hall navigation mapping is lost"
+            if self.mapping_transitioning:
+                return (
+                    False, "UNREACHABLE_HALL",
+                    "hall navigation mapping is transitioning",
+                )
+            if not map_context_is_committed(
+                    expected, self.accepted_map_context):
+                return (
+                    False,
+                    "UNREACHABLE_HALL",
+                    "hall navigation active map context is not committed: "
+                    "mapping=%r active=%r"
+                    % (expected, self.accepted_map_context),
+                )
+            if not self._stamp_is_fresh(
+                    self.last_map_time, now, self.input_timeout):
+                return False, "UNREACHABLE_HALL", "hall navigation map is stale"
+            if not self.mapping_ready or not self.mapping_stable:
+                # The floor-change entry gate already requires ready/stable.
+                # Once move_base starts, recovery turns can temporarily make
+                # localization report degraded/stable=false even though the
+                # pose, active map and floor/epoch contract remain healthy.
+                # Keep observing the flags, but do not cancel a valid goal on
+                # that transient diagnostic state.
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[exploration] hall navigation continuing with committed "
+                    "map while mapping readiness is degraded: ready=%s "
+                    "stable=%s mapping=%r active=%r",
+                    self.mapping_ready,
+                    self.mapping_stable,
+                    expected,
+                    self.accepted_map_context,
+                )
             return True, "", ""
 
         if step == "WAIT_STABLE":
@@ -3151,7 +4049,11 @@ class ExplorationPlanner:
                 detail = getattr(response, "message", str(response or outcome))
                 self._floor_change_fail(code, "open current door: " + detail)
                 return
-            if self.hall_validation_required:
+            self.initial_hall_discovery_door_held_closed = False
+            if (self.hall_validation_required
+                    and not bool(getattr(
+                        self.floor_change_hall_candidate, "validated", False
+                    ))):
                 self._set_floor_change_phase("CAPTURE_OPEN_SCAN")
             else:
                 self._start_crossing(+1.0)

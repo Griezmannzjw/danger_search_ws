@@ -210,6 +210,32 @@ class SimpleFrontierTest(unittest.TestCase):
         self.assertEqual(remembered, [])
         self.assertEqual(planner.last_recovery_event_id, 0)
 
+    def test_floor_transit_recovery_does_not_pollute_exploration_blacklist(self):
+        planner = make_planner(np.zeros((5, 5), dtype=np.int8))
+        planner.map_frame = "map"
+        planner.state_lock = MODULE.threading.RLock()
+        planner.exploring = True
+        planner.floor_change_active = True
+        planner.nav_active_goal_id = "hall-goal"
+        planner.navigation_goal_sent_at = MODULE.rospy.Time.from_sec(10.0)
+        planner.last_recovery_event_id = 0
+        planner.last_recovery_goal_id = ""
+        remembered = []
+        planner._remember_trap_region = lambda x, y: remembered.append((x, y))
+        event = MODULE.RecoveryEvent()
+        event.header.frame_id = "map"
+        event.header.stamp = MODULE.rospy.Time.from_sec(11.0)
+        event.event_id = 10
+        event.active_goal_id = "hall-goal"
+        event.phase = MODULE.RecoveryEvent.PHASE_FAILED
+        event.stuck_pose.position.x = 1.0
+        event.stuck_pose.position.y = 2.0
+
+        planner.recovery_event_callback(event)
+
+        self.assertEqual(remembered, [])
+        self.assertEqual(planner.last_recovery_event_id, 0)
+
     def test_make_plan_path_may_leave_but_not_reenter_exploration_blacklist(self):
         planner = make_planner(np.zeros((3, 7), dtype=np.int8))
         planner.map_frame = "map"
