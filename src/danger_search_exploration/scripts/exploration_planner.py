@@ -3409,6 +3409,90 @@ class ExplorationPlanner:
                                 candidates.append(candidate)
         return candidates
 
+    def _component_shaft_candidates(self, occupied, free):
+        """Robust passive detection: find shaft wall components and their door gaps.
+
+        The morphology-based _closed_space_hall_candidates can fail to fully enclose
+        a shaft on real maps (closing leaves a non-wall boundary, so the strict
+        three-wall support check rejects the real elevator).  This component-based
+        fallback detects the shaft WALLS directly and looks for a single perimeter
+        door gap, which is far more robust to lidar sparsity and small noise.
+        """
+        resolution = self.map_info.resolution
+        height, width = occupied.shape
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(
+            occupied, connectivity=8
+        )
+        min_bbox = self.shaft_min_area_m2 / (resolution ** 2)
+        max_bbox = self.shaft_max_area_m2 / (resolution ** 2)
+        minimum_support = float(getattr(self, "shaft_wall_support_min", 0.70))
+        target_side = 0.5 * (self.shaft_min_side_m + self.shaft_max_side_m)
+        half_side_range = max(1e-6, 0.5 * (self.shaft_max_side_m - self.shaft_min_side_m))
+        candidates = []
+        for index in range(1, num):
+            x, y, w, h, _area = stats[index]
+            if not (min_bbox <= w * h <= max_bbox):
+                continue
+            if x <= 0 or y <= 0 or x + w >= width - 2 or y + h >= height - 2:
+                continue
+            physical_width = float(w) * resolution
+            physical_height = float(h) * resolution
+            if not (self.shaft_min_side_m <= physical_width <= self.shaft_max_side_m
+                    and self.shaft_min_side_m <= physical_height <= self.shaft_max_side_m):
+                continue
+            # 井道应该是"薄墙围成的空腔"：内部应主要是自由
+            interior_free = float(np.mean(free[y:y + h, x:x + w]))
+            if interior_free < 0.45:
+                continue
+            component = (labels == index)
+            # 四条边界线的墙支撑（用于确认门缝所在的井道有其余三面墙）。
+            # 井道墙就在组件包围盒的最外一行/列上（x / x+w-1），不是在包围盒外一格。
+            boundaries = {
+                "west": occupied[y:y + h, x] != 0,
+                "east": occupied[y:y + h, x + w - 1] != 0,
+                "south": occupied[y, x:x + w] != 0,
+                "north": occupied[y + h - 1, x:x + w] != 0,
+            }
+            edge_yaws = {
+                "west": 0.0, "east": math.pi,
+                "north": -math.pi / 2.0, "south": math.pi / 2.0,
+            }
+            for gx, gy, into_yaw in self._perimeter_door_gaps(component):
+                if not (0 <= gy < height and 0 <= gx < width):
+                    continue
+                if not free[gy, gx]:
+                    continue
+                # 门缝所在边的其余三面墙支撑必须足够，避免把房间/走廊门洞当井道
+                other_support = [
+                    float(np.mean(support))
+                    for edge_name, support in boundaries.items()
+                    if abs(math.atan2(
+                        math.sin(into_yaw - edge_yaws[edge_name]),
+                        math.cos(into_yaw - edge_yaws[edge_name]),
+                    )) >= 0.10
+                ]
+                if any(value < minimum_support for value in other_support):
+                    continue
+                size_score = 0.5 * sum(
+                    0.5 + 0.5 * max(
+                        0.0,
+                        1.0 - abs(side - target_side) / half_side_range,
+                    ) for side in (physical_width, physical_height)
+                )
+                # 组件法已通过"墙+门缝+三墙支撑"验证，结构可靠，给较高置信
+                base_score = 0.5 + 0.4 * size_score
+                wx, wy = self._map_to_world(gx, gy)
+                candidates.append(ElevatorHallCandidate(
+                    x=wx,
+                    y=wy,
+                    into_yaw=into_yaw,
+                    score=min(1.0, base_score),
+                    source="geometry_component",
+                    confidence=min(1.0, base_score),
+                    validated=False,
+                ))
+        return candidates
+
     def _detect_elevator_halls(self):
         """Detect strict passive shaft candidates from the active map only."""
         if self.map_data is None:
@@ -3416,6 +3500,8 @@ class ExplorationPlanner:
         occupied = (self.map_data >= self.connectivity_occupied_threshold).astype(np.uint8)
         free = (self.map_data >= 0) & (self.map_data < self.free_threshold)
         candidates = self._closed_space_hall_candidates(occupied, free)
+        # 闭运算法在真实地图上可能无法完全封闭井道，导致漏检；组件法兜底。
+        candidates.extend(self._component_shaft_candidates(occupied, free))
         deduplicated = []
         for candidate in candidates:
             if any(
