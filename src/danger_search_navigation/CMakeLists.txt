@@ -98,4 +98,10 @@ if(CATKIN_ENABLE_TESTING)
   if(TARGET test_escape_recovery)
     target_link_libraries(test_escape_recovery ${catkin_LIBRARIES})
   endif()
+  catkin_add_gtest(test_dwa_velocity_samples
+    test/test_dwa_velocity_samples.cpp
+  )
+  if(TARGET test_dwa_velocity_samples)
+    target_link_libraries(test_dwa_velocity_samples ${catkin_LIBRARIES})
+  endif()
 endif()

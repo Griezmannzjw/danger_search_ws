@@ -31,6 +31,8 @@
     <param name="planner_config_key" value="DWAPlannerROS" />
     <param name="safe_max_angular_speed_rps" value="0.40" />
     <param name="effective_min_in_place_angular_speed_rps" value="0.40" />
+    <param name="effective_forward_speed_mps" value="0.30" />
+    <param name="controller_frequency_hz" value="10.0" />
     <rosparam command="load" file="$(arg config_dir)/dwa_planner.yaml" />
     <param name="run_profile" value="$(arg run_profile)" />
     <param name="competition_mode" value="$(arg competition_mode)" />

@@ -31,6 +31,8 @@ catkin_make --pkg unitree_guide -j2
 
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash --extend
+source /home/ruilinli/danger_search_ws/devel/setup.bash --extend
 catkin_make -j2
 ```
 
@@ -91,8 +93,8 @@ Switched from passive to fixed stand
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
-source devel/setup.bash
 source /home/ruilinli/SimEnv/devel/setup.bash --extend
+source /home/ruilinli/danger_search_ws/devel/setup.bash --extend
 
 roslaunch danger_search_bringup simulation_truth.launch \
   autostart:=false \
@@ -139,13 +141,17 @@ raw GICP covariance is unhealthy
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
-source devel/setup.bash
 source /home/ruilinli/SimEnv/devel/setup.bash --extend
+source /home/ruilinli/danger_search_ws/devel/setup.bash --extend
 
 rosparam get /move_base/base_global_planner
 rosparam get /move_base/base_local_planner
 rosparam get /move_base/DWAPlannerROS/odom_topic
 rosparam get /move_base/DWAPlannerROS/min_vel_x
+rosparam get /move_base/DWAPlannerROS/max_vel_x
+rosparam get /move_base/DWAPlannerROS/min_vel_trans
+rosparam get /move_base/DWAPlannerROS/max_vel_trans
+rosparam get /move_base/DWAPlannerROS/vx_samples
 rosparam get /move_base/DWAPlannerROS/min_vel_theta
 rosparam get /move_base/DWAPlannerROS/max_vel_theta
 rosparam get /move_base/local_costmap/obstacles/observation_sources
@@ -160,7 +166,11 @@ timeout 5 rostopic hz /localization/depth_obstacle_scan
 navfn/NavfnROS
 dwa_local_planner/DWAPlannerROS
 /localization/odom
+0.0
 0.3
+0.3
+0.3
+2
 0.4
 0.4
 scan depth_scan
@@ -244,13 +254,36 @@ rostopic echo /cmd_vel
 
 如果 `/cmd_vel.linear.x` 已达到 `0.30`，但机器人 `5 s` 内仍完全不动，取消目标并停止预检；此时问题属于 Unitree RL policy 或关节执行层，不要继续提高导航速度。
 
-### 4.2 原地旋转预检
+### 4.2 后方目标预检
 
-直线预检目标结束后，向相同位置发送约 `90°` 的最终朝向。由于 `xy_goal_tolerance=0.15`，局部规划器会进入标准终点旋转控制：
+直线预检完成后，向出生点附近发送一个位于机器人后方的目标。该目标专门验证
+DWA 是否保留零线速度转向样本；若再次把 `min_vel_x` 收紧到 `0.30`，这里会在
+首个控制周期开始持续报告 `DWA planner failed to produce path`。
 
 ```bash
 rostopic pub -1 /move_base_simple/goal geometry_msgs/PoseStamped \
-  "{header: {frame_id: map}, pose: {position: {x: 1.0, y: 0.0, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: 0.7071068, w: 0.7071068}}}"
+  "{header: {frame_id: map}, pose: {position: {x: 0.0, y: 0.0, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: 1.0, w: 0.0}}}"
+```
+
+终点朝向设为 `yaw=pi`，与返回出生点的行进方向一致，避免把“后方目标转向”
+预检混入到点后再次回转 `180°` 的独立终点姿态测试。
+
+验收要求：
+
+- `/danger_search/nav_cmd_vel` 先出现 `linear.x=0`、`|angular.z|` 接近
+  `0.40 rad/s` 的原地对准命令。
+- 对准后只出现 `linear.x=0.30 m/s` 的持续前进模式；不得持续发布
+  `0<linear.x<0.30 m/s` 的 DWA 目标速度。
+- `/move_base/status` 最终为 `SUCCEEDED`，不得耗尽 recovery 后终止。
+
+### 4.3 终点原地旋转预检
+
+后方目标预检结束后，向当前位置发送约 `90°` 的最终朝向。由于
+`xy_goal_tolerance=0.15`，局部规划器会进入标准终点旋转控制：
+
+```bash
+rostopic pub -1 /move_base_simple/goal geometry_msgs/PoseStamped \
+  "{header: {frame_id: map}, pose: {position: {x: 0.0, y: 0.0, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: 0.7071068, w: 0.7071068}}}"
 ```
 
 验收要求：
@@ -267,7 +300,7 @@ rostopic pub -1 /move_base/cancel actionlib_msgs/GoalID "{}"
 rostopic echo -n 1 /cmd_vel
 ```
 
-只有直线和转向预检都通过后，才开始完整任务。
+只有直线、后方目标和终点转向预检都通过后，才开始完整任务。
 
 ## 5. 终端三：通过 mission 启动完整任务
 
@@ -313,8 +346,8 @@ Livox 投影造成的稀疏无返回允许在同一线段内桥接最多 5 个 b
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
-source devel/setup.bash
 source /home/ruilinli/SimEnv/devel/setup.bash --extend
+source /home/ruilinli/danger_search_ws/devel/setup.bash --extend
 
 rviz
 ```
@@ -352,8 +385,8 @@ map
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
-source devel/setup.bash
 source /home/ruilinli/SimEnv/devel/setup.bash --extend
+source /home/ruilinli/danger_search_ws/devel/setup.bash --extend
 
 rostopic hz /danger_search/nav_cmd_vel
 ```
@@ -509,7 +542,7 @@ rostopic echo -n 1 /exploration/status
 任务运行或结束后执行：
 
 ```bash
-python3 -m json.tool /home/ruilinli/SimEnv/results/detected_danger.json
+python3 -m json.tool /home/ruilinli/SimEnv/results/detected_danger.simulation_truth.json
 ```
 
 同时对照真值文件：

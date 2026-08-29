@@ -7,15 +7,18 @@
 `navigation_core.py` 暂时保留用于历史对照和原有测试，但不再由 launch 启动。
 
 普通导航保持非完整约束（`vy=0`）。真机策略对应的 Gazebo 响应标定显示：
-纯转向 `|wz|<=0.30 rad/s` 基本停留在站立死区，`|wz|=0.40 rad/s` 以及
-`vx=0.40 m/s, |wz|=0.40 rad/s` 的组合弧线均能稳定执行。因此 DWA 的 yaw
+纯转向 `|wz|<=0.30 rad/s` 基本停留在站立死区，`|wz|=0.40 rad/s`、
+普通导航的 `vx=0.30 m/s` 步态以及恢复使用的
+`vx=0.40 m/s, |wz|=0.40 rad/s` 组合弧线均能稳定执行。因此 DWA 的 yaw
 域固定为 `[-0.40, 0.40] rad/s`，9 个对称样本仍覆盖零、`±0.10`、
 `±0.20`、`±0.30` 与 `±0.40`。上游轨迹生成器只在平移速度低于
 `min_vel_trans` 时应用 `min_vel_theta`，所以 `min_vel_theta=0.40` 会过滤
 无物理响应的纯转向，却不会删除移动弧线的较小角速度样本。
-平移同样固定 `min_vel_x=min_vel_trans=0.30 m/s`，避免角速度已达门槛时
-DWA 误放行 `vx=0.01–0.29 m/s` 的站立/碎步候选；到达 XY 容差后的纯转向
-由 DWA 的独立 stop/rotate 路径产生，不依赖 `min_vel_x=0` 样本。
+平移域固定为两个离散模式：`min_vel_x=0`、`max_vel_x=0.30 m/s`、
+`vx_samples=2`，且 `min_vel_trans=max_vel_trans=0.30 m/s`。ROS Noetic
+原生轨迹生成器因此只保留 `vx=0, |wz|=0.40` 的有效原地转向，以及
+`vx=0.30 m/s` 的前进/弧线轨迹，不生成 `0.01–0.29 m/s` 的站立或碎步候选。
+这也允许普通路径在目标位于机器人后方时先进行 footprint-checked 原地对准。
 `cmd_mux` 的 `0.80 rad/s` 仍只是所有生产者的最终硬上限。
 
 不再装载标准 `rotate_recovery/RotateRecovery`：其上游实现会尝试完整一圈，
