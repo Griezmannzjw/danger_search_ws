@@ -975,6 +975,7 @@ class LocalizationAdapterNode:
             hector_age = self._age(now, self.last_hector_pose_accepted)
             gicp_fusion_reason = self.last_gicp_fusion_reason
             hector_fusion_reason = self.last_hector_fusion_reason
+            gicp_consecutive_failures = self.gicp_consecutive_failures
             pose_guard_rejections = self.pose_stabilizer.consecutive_rejections
             pose_guard_reason = self.pose_stabilizer.last_reason
 
@@ -1019,11 +1020,16 @@ class LocalizationAdapterNode:
         pose_guard_lost = (
             pose_guard_rejections >= self.config.pose_rejections_before_lost
         )
-        gicp_degraded = pose_guard_degraded or (
-            gicp_healthy_age > self.config.gicp_healthy_fresh_timeout_s
+        gicp_degraded = (
+            pose_guard_degraded
+            or gicp_consecutive_failures > 0
+            or gicp_healthy_age > self.config.gicp_healthy_fresh_timeout_s
         )
-        gicp_lost = pose_guard_lost or (
-            gicp_healthy_age > self.config.gicp_healthy_lost_timeout_s
+        gicp_lost = (
+            pose_guard_lost
+            or gicp_consecutive_failures
+            >= self.config.pose_rejections_before_lost
+            or gicp_healthy_age > self.config.gicp_healthy_lost_timeout_s
         )
         hector_degraded = not hector_fresh
         ready = (

@@ -56,9 +56,11 @@ lidar_odom_max_angular_speed_rps: 0.80
 lidar_odom_max_gate_dt_s: 0.75
 lidar_odom_translation_margin_m: 0.04
 lidar_odom_rotation_margin_rad: 0.06
-lidar_odom_translation_deadband_m: 0.015
-lidar_odom_rotation_deadband_rad: 0.008
+lidar_odom_translation_deadband_m: 0.005  # 运动关键帧阈值；阈值内不推进参考帧
+lidar_odom_rotation_deadband_rad: 0.008   # 同上，让慢速运动相对固定参考累积
 lidar_odom_candidate_fitness_slack: 0.005
+lidar_odom_max_candidate_translation_disagreement_m: 0.05
+lidar_odom_max_candidate_rotation_disagreement_rad: 0.08
 lidar_odom_imu_yaw_tolerance_rad: 0.20
 lidar_odom_imu_stationary_accel_tolerance_mps2: 0.05
 lidar_odom_imu_stationary_gyro_threshold_rps: 0.02
@@ -73,9 +75,8 @@ lidar_odom_observation_max_points: 1000
 lidar_odom_submap_scans: 5
 lidar_odom_submap_max_points: 1200
 # The live GICP worker must keep up with the 10 Hz official scan stream.
-# A deterministic 100-point subset preserves the configured minimum geometry
-# while preventing stale scans from becoming a single over-limit motion step.
-lidar_odom_registration_max_points: 100
+# 入口弱几何需要保留更多横向表面；180 点仍显著低于局部子地图上限。
+lidar_odom_registration_max_points: 180
 lidar_odom_rebaseline_after_failures: 3
 gicp_recovery_consecutive_accepts: 2
 lidar_odom_max_absolute_translation_m: 100.0

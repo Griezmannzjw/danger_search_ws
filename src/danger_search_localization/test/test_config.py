@@ -35,10 +35,34 @@ class TestLocalizationConfig(unittest.TestCase):
         self.assertGreater(config["lidar_odom_max_reference_age_s"], 0.5)
         self.assertEqual(config["lidar_odom_submap_scans"], 5)
         self.assertEqual(config["lidar_odom_submap_max_points"], 1200)
-        self.assertEqual(config["lidar_odom_registration_max_points"], 100)
+        self.assertEqual(config["lidar_odom_registration_max_points"], 180)
         self.assertEqual(config["lidar_odom_observation_scans"], 1)
         self.assertEqual(config["gicp_recovery_consecutive_accepts"], 2)
         self.assertAlmostEqual(config["lidar_odom_min_correspondence_ratio"], 0.35)
+        self.assertAlmostEqual(config["lidar_odom_translation_deadband_m"], 0.005)
+        self.assertAlmostEqual(
+            config["lidar_odom_max_candidate_translation_disagreement_m"],
+            0.05,
+        )
+        self.assertAlmostEqual(
+            config["lidar_odom_max_candidate_rotation_disagreement_rad"],
+            0.08,
+        )
+
+    def test_gicp_accumulates_sub_deadband_motion_against_keyframe(self):
+        core_path = (
+            self.package_dir
+            / "include"
+            / "danger_search_localization"
+            / "lidar_odometry_core.hpp"
+        )
+        source = core_path.read_text()
+
+        self.assertIn(
+            "ACCEPTED_ACCUMULATING_KEYFRAME_MOTION",
+            source,
+        )
+        self.assertIn("AMBIGUOUS_REGISTRATION_CANDIDATES", source)
 
     def test_gicp_health_timeouts_are_ordered(self):
         with self.assertRaises(ValueError):
@@ -196,6 +220,12 @@ class TestLocalizationConfig(unittest.TestCase):
         self.assertIn("self.pose_stabilizer.update", adapter_source)
         self.assertIn("self.validated_pose_pub.publish", adapter_source)
         self.assertIn("~validated_gicp_pose_topic", mapper_source)
+        self.assertIn("gicp_consecutive_failures > 0", adapter_source)
+        self.assertIn(
+            "gicp_consecutive_failures\n"
+            "            >= self.config.pose_rejections_before_lost",
+            adapter_source,
+        )
         projector_source = (
             self.package_dir / "src" / "danger_search_localization" / "scan_projector_node.py"
         ).read_text()

@@ -51,6 +51,17 @@ ground-truth TF；同时开启 referee odom 会造成重复 TF 发布。默认
 不会发布到 `/localization/validated_pose`，因此地图同步冻结；连续异常使状态先降级再
 进入 LOST。系统不订阅 `/cmd_vel` 或 `/danger_search/cmd_vel_sent` 来计算位置。
 
+GICP 的死区改为运动关键帧阈值：不足 `0.005 m` 时不再清零后推进参考帧，而是继续
+相对同一可信关键帧配准。这样 10 Hz 下单帧不足阈值的缓慢横向侧滑会在点云相对位移
+中自然累积，并在越过阈值后一次提交。运动状态下的可信 GICP 平移不会因为单帧过小而丢失；IMU 静止保持仍用于
+抑制 Livox 垂直采样变化造成的假平移。预测初值和 identity 初值拟合质量接近时按运动
+连续性选择；官方 Ubuntu 20.04 的 PCL 1.10 环境还会用限幅后的点云质心平移初始化
+GICP，并按关键帧经过时间外推慢速运动，避免配准停留在上一帧的毫米级局部最优。若两个有效结果仍相差超过
+`0.05 m` 或 `0.08 rad`，该帧以 `AMBIGUOUS_REGISTRATION_CANDIDATES` 拒绝，避免弱
+几何下继续报告虚假健康。adapter 收到第一帧不健康协方差就立即进入 DEGRADED 并设置
+`drift_warning=true`，连续 3 帧进入 LOST，不再等健康位姿超时后才反映故障。正式里程计仍保持单帧观测，避免未做运动补偿的多帧点云
+在行走时重影；每次配准保留 180 个确定性采样点以增强入口横向表面约束。
+
 只有启动 `use_hector_correction:=true` 时，`/localization/mapping_scan` 才进入 Hector；Hector
 只提供经过同步和幅度限制的 `map -> odom` 修正，不能替换 GICP 物理平移。
 ```
@@ -108,8 +119,8 @@ GICP 位姿和地图更新建立后，`/mapping/status` 应变为 `ready: True`�
 | `/mapping/status` | `danger_search_common/MappingStatus` | 地图就绪、稳定、丢失、楼层和版本 |
 | `/localization/status` | `danger_search_common/LocalizationStatus` | 定位跟踪和协方差状态 |
 
-`/localization/pose` 第一帧定义为比赛出发点附近 `(0,0,0)`。GICP 对静止微动使用
-死区，并按时间间隔限制物理可达位移；GICP 使用最近 5 个可信扫描构造有限局部子地图，
+`/localization/pose` 第一帧定义为比赛出发点附近 `(0,0,0)`。GICP 使用关键帧死区，
+小位移期间保持参考帧而不是丢弃运动，并按时间间隔限制物理可达位移；GICP 使用最近 5 个可信扫描构造有限局部子地图，
 以匹配质量、有效对应比例和物理速度门共同拒绝错误局部最优。连续拒绝前两帧会保持
 可信参考；达到阈值后才用当前帧重建参考，且必须连续 2 帧成功才恢复健康。异常配准
 会保持上一位姿并停止污染地图。可选 Hector 模式只允许小幅、同步的全局修正；GICP
@@ -125,7 +136,7 @@ GICP 位姿和地图更新建立后，`/mapping/status` 应变为 `ready: True`�
 
 默认正常状态原因为 `TRACKING_GICP_ODOMETRY_WITH_LOCAL_OCCUPANCY_MAP`。只有可选
 Hector 模式正常时才显示 `TRACKING_FUSED_GICP_ODOMETRY_WITH_BOUNDED_HECTOR_CORRECTION`。
-反复 GICP 失败、位姿门控拒绝或 Hector 修正被拒绝时状态先变为 `DEGRADED`，navigation 会安全停车；
+反复 GICP 失败、多初值结果歧义、位姿门控拒绝或 Hector 修正被拒绝时状态先变为 `DEGRADED`，navigation 会安全停车；
 持续局部里程计失败才会进入 `LOST`，有效数据恢复后自动回到 `TRACKING`。
 
 换层期间 `/mapping/status` 明确发布 `stable=false`，原因为

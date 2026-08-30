@@ -91,7 +91,12 @@ TEST(LidarOdometryCore, DifferentVerticalSamplesDoNotInventPlanarMotion) {
   EXPECT_LT(healthy.registration.z_translation, TestConfig().max_step_z_m);
   EXPECT_LT(healthy.registration.roll_pitch,
             TestConfig().max_step_roll_pitch_rad);
-  EXPECT_LT(healthy.pose.translation().norm(), 0.02);
+  EXPECT_LT(healthy.pose.translation().norm(), 0.02)
+      << "registration translation=" << healthy.registration.translation
+      << " z=" << healthy.registration.z_translation
+      << " roll_pitch=" << healthy.registration.roll_pitch
+      << " fitness=" << healthy.registration.fitness
+      << " correspondence=" << healthy.registration.correspondence_ratio;
 }
 TEST(LidarOdometryCore, MetreScaleMismatchIsRejectedAndPoseIsHeld) {
   Core core(TestConfig()); const auto scene = MakeScene(); core.Process(scene, 1.0); const auto before = core.pose();
@@ -178,7 +183,7 @@ TEST(LidarOdometryCore, ImuStationaryConflictBypassesOnlyDynamicGate) {
   EXPECT_NEAR(result.pose.translation().norm(), 0.0, 1e-6);
 }
 
-TEST(LidarOdometryCore, TranslationDeadbandDoesNotAccumulateInternally) {
+TEST(LidarOdometryCore, OneOffSubDeadbandMotionIsNotPublished) {
   auto config = TestConfig();
   config.translation_deadband_m = 0.05;
   Core core(config);
@@ -192,6 +197,42 @@ TEST(LidarOdometryCore, TranslationDeadbandDoesNotAccumulateInternally) {
   EXPECT_EQ(first.outcome, Core::Outcome::kAccepted);
   EXPECT_EQ(second.outcome, Core::Outcome::kAccepted);
   EXPECT_NEAR(second.pose.translation().norm(), 0.0, 1e-6);
+}
+
+TEST(LidarOdometryCore, SlowLateralMotionAccumulatesAcrossFrames) {
+  auto config = TestConfig();
+  config.translation_deadband_m = 0.005;
+  config.max_fitness = 0.08;
+  Core core(config);
+  const auto scene = MakeScene();
+  core.Process(scene, 1.0, false, true, 0.0);
+
+  Core::ProcessResult result;
+  for (int index = 1; index <= 10; ++index) {
+    result = core.Process(
+        TransformCloud2d(scene, 0.0, -0.004 * index, 0.0),
+        1.0 + 0.1 * index, false, true, 0.0);
+    ASSERT_EQ(result.outcome, Core::Outcome::kAccepted)
+        << "index=" << index << " reason=" << result.reason
+        << " translation=" << result.registration.translation
+        << " fitness=" << result.registration.fitness
+        << " candidate_disagreement=("
+        << result.candidate_translation_disagreement << ","
+        << result.candidate_rotation_disagreement << ")";
+  }
+
+  EXPECT_GT(result.pose.translation().y(), 0.025);
+  EXPECT_NEAR(result.pose.translation().y(), 0.040, 0.020);
+}
+
+TEST(LidarOdometryCore, RejectsInvalidCandidateDisagreementLimits) {
+  auto config = TestConfig();
+  config.max_candidate_translation_disagreement_m = 0.0;
+  EXPECT_THROW({ Core core(config); }, std::invalid_argument);
+
+  config = TestConfig();
+  config.max_candidate_rotation_disagreement_rad = 0.0;
+  EXPECT_THROW({ Core core(config); }, std::invalid_argument);
 }
 
 TEST(LidarOdometryCore, RecoversLegalMotionAgainstRetainedReference) {

@@ -76,11 +76,17 @@ class LidarOdometryNode {
     private_nh_.param("lidar_odom_rotation_margin_rad",
                       config_.rotation_margin_rad, 0.06);
     private_nh_.param("lidar_odom_translation_deadband_m",
-                      config_.translation_deadband_m, 0.015);
+                      config_.translation_deadband_m, 0.005);
     private_nh_.param("lidar_odom_rotation_deadband_rad",
                       config_.rotation_deadband_rad, 0.008);
     private_nh_.param("lidar_odom_candidate_fitness_slack",
                       config_.candidate_fitness_slack, 0.005);
+    private_nh_.param(
+        "lidar_odom_max_candidate_translation_disagreement_m",
+        config_.max_candidate_translation_disagreement_m, 0.05);
+    private_nh_.param(
+        "lidar_odom_max_candidate_rotation_disagreement_rad",
+        config_.max_candidate_rotation_disagreement_rad, 0.08);
     private_nh_.param("lidar_odom_imu_yaw_tolerance_rad",
                       config_.imu_yaw_tolerance_rad, 0.20);
     private_nh_.param("lidar_odom_min_points", config_.min_points, 100);
@@ -385,7 +391,9 @@ class LidarOdometryNode {
           1.0,
           "[localization] GICP rejected (%s): converged=%d fitness=%.3f "
           "correspondence=%.3f translation=%.3f/%.3f rotation=%.3f/%.3f "
-          "z=%.3f roll_pitch=%.3f imu_yaw_error=%.3f failures=%d%s",
+          "z=%.3f roll_pitch=%.3f imu_yaw_error=%.3f "
+          "candidate_disagreement=(%.3fm,%.3frad) ambiguous=%d "
+          "failures=%d%s",
           result.reason.c_str(), result.registration.converged,
           result.registration.fitness,
           result.registration.correspondence_ratio,
@@ -393,6 +401,9 @@ class LidarOdometryNode {
           result.registration.rotation, result.rotation_limit,
           result.registration.z_translation, result.registration.roll_pitch,
           result.registration.imu_yaw_error,
+          result.candidate_translation_disagreement,
+          result.candidate_rotation_disagreement,
+          result.candidates_ambiguous,
           result.consecutive_failures,
           result.rebuilt_reference ? "; rebuilding reference frame"
                                    : "; retaining trusted reference");

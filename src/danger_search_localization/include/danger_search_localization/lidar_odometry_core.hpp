@@ -44,9 +44,11 @@ class LidarOdometryCore {
     double max_angular_speed_rps = 0.80;
     double translation_margin_m = 0.04;
     double rotation_margin_rad = 0.06;
-    double translation_deadband_m = 0.015;
+    double translation_deadband_m = 0.005;
     double rotation_deadband_rad = 0.008;
     double candidate_fitness_slack = 0.005;
+    double max_candidate_translation_disagreement_m = 0.05;
+    double max_candidate_rotation_disagreement_rad = 0.08;
     double imu_yaw_tolerance_rad = 0.20;
     int min_points = 100;
     int rebaseline_after_failures = 3;
@@ -87,6 +89,9 @@ class LidarOdometryCore {
     std::size_t target_points = 0;
     double translation_limit = 0.0;
     double rotation_limit = 0.0;
+    double candidate_translation_disagreement = 0.0;
+    double candidate_rotation_disagreement = 0.0;
+    bool candidates_ambiguous = false;
     RegistrationResult registration;
     std::string reason;
     Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
@@ -119,6 +124,7 @@ class LidarOdometryCore {
       return output;
     }
 
+    const double previous_input_stamp_s = last_input_stamp_s_;
     last_input_stamp_s_ = stamp_s;
     if (!reference_) {
       Rebaseline(current, stamp_s, imu_heading_valid, imu_heading_rad);
@@ -169,6 +175,24 @@ class LidarOdometryCore {
             ? NormalizeAngle(imu_heading_rad - trusted_imu_heading_rad_)
             : 0.0;
     Eigen::Isometry3d predicted_guess = last_increment_;
+    // While a sub-deadband scan is held against the same keyframe, extrapolate
+    // its accumulated SE(2) displacement to the current timestamp. Older PCL
+    // GICP versions otherwise tend to remain in the previous tiny local
+    // minimum, so a sequence of real 4 mm steps never grows past the 5 mm
+    // keyframe threshold.
+    const double previous_reference_dt =
+        previous_input_stamp_s > reference_stamp_s_
+            ? previous_input_stamp_s - reference_stamp_s_
+            : 0.0;
+    const double current_reference_dt = stamp_s - reference_stamp_s_;
+    if (!IsNearlyIdentity(last_increment_) && previous_reference_dt > 1e-6 &&
+        current_reference_dt > previous_reference_dt) {
+      const double prediction_scale = std::min(
+          2.0, current_reference_dt / previous_reference_dt);
+      predicted_guess = ScalePlanarTransform(last_increment_, prediction_scale);
+    }
+    predicted_guess = ApplyCentroidTranslationGuess(
+        current, target, predicted_guess, output.translation_limit);
     Eigen::Isometry3d identity_guess = Eigen::Isometry3d::Identity();
     if (imu_delta_valid) {
       const Eigen::Matrix3d expected_rotation =
@@ -183,17 +207,29 @@ class LidarOdometryCore {
                                           : Register(current, target, identity_guess);
     PopulateImuYawError(&predicted, imu_delta_valid, expected_yaw);
     PopulateImuYawError(&identity, imu_delta_valid, expected_yaw);
+    const Eigen::Isometry3d candidate_difference =
+        predicted.delta.inverse() * identity.delta;
+    output.candidate_translation_disagreement =
+        candidate_difference.translation().head<2>().norm();
+    output.candidate_rotation_disagreement =
+        std::abs(Yaw(candidate_difference));
+    output.candidates_ambiguous = CandidatesAmbiguous(
+        predicted, identity, output.translation_limit, output.rotation_limit,
+        imu_delta_valid, output.candidate_translation_disagreement,
+        output.candidate_rotation_disagreement);
     const RegistrationResult best = SelectCandidate(
         predicted, identity, output.translation_limit, output.rotation_limit,
-        imu_delta_valid);
+        imu_delta_valid, predicted_guess);
     output.registration = best;
 
-    if (!PassesAllGates(best, output.translation_limit, output.rotation_limit) ||
+    if (output.candidates_ambiguous ||
+        !PassesAllGates(best, output.translation_limit, output.rotation_limit) ||
         !PassesImuYawGate(best, imu_delta_valid)) {
       // The standing Livox pattern changes between frames and can yield a
       // plausible planar shift.  IMU stationarity may suppress that shift only
       // when registration geometry and the absolute hard limits remain valid.
-      if (imu_stationary && PassesStationaryHoldGates(best) &&
+      if (!output.candidates_ambiguous && imu_stationary &&
+          PassesStationaryHoldGates(best) &&
           PassesImuYawGate(best, imu_delta_valid)) {
         last_increment_.setIdentity();
         reference_stamp_s_ = stamp_s;
@@ -215,9 +251,11 @@ class LidarOdometryCore {
       recovery_accepts_ = 0;
       output.publish = true;
       output.outcome = Outcome::kRejected;
-      output.reason =
-          RejectionReason(best, output.translation_limit, output.rotation_limit,
-                          imu_delta_valid);
+      output.reason = output.candidates_ambiguous
+                          ? "AMBIGUOUS_REGISTRATION_CANDIDATES"
+                          : RejectionReason(
+                                best, output.translation_limit,
+                                output.rotation_limit, imu_delta_valid);
       if (consecutive_failures_ >= config_.rebaseline_after_failures) {
         Rebaseline(current, stamp_s, imu_heading_valid, imu_heading_rad);
         output.outcome = Outcome::kRebaseline;
@@ -230,20 +268,15 @@ class LidarOdometryCore {
     }
 
     Eigen::Isometry3d accepted_delta = best.delta;
+    // Keep the existing conservative stationary hold for changing Livox
+    // vertical samples. During locomotion, sub-deadband motion is accumulated
+    // against a fixed keyframe instead of advancing and losing the reference.
     if (imu_stationary) {
       accepted_delta.setIdentity();
     } else if (imu_delta_valid) {
       accepted_delta.linear() =
           Eigen::AngleAxisd(expected_yaw, Eigen::Vector3d::UnitZ())
               .toRotationMatrix();
-    }
-    if (accepted_delta.translation().head<2>().norm() <=
-        config_.translation_deadband_m) {
-      accepted_delta.translation().x() = 0.0;
-      accepted_delta.translation().y() = 0.0;
-    }
-    if (std::abs(Yaw(accepted_delta)) <= config_.rotation_deadband_rad) {
-      accepted_delta.linear().setIdentity();
     }
 
     const Eigen::Isometry3d increment = accepted_delta;
@@ -258,14 +291,35 @@ class LidarOdometryCore {
       return output;
     }
 
-    matching_pose_ = candidate_pose;
-    published_pose_ = matching_pose_;
-    last_increment_ = increment;
-    reference_ = current;
-    reference_stamp_s_ = stamp_s;
     consecutive_failures_ = 0;
     recovery_accepts_ =
         std::min(config_.recovery_consecutive_accepts, recovery_accepts_ + 1);
+    const bool commit_keyframe =
+        imu_stationary ||
+        increment.translation().head<2>().norm() >
+            config_.translation_deadband_m ||
+        std::abs(Yaw(increment)) > config_.rotation_deadband_rad;
+    if (!commit_keyframe) {
+      // Keep matching the next scan to the same trusted keyframe. Physical
+      // displacement therefore grows across scans until it is resolvable,
+      // instead of being erased whenever one 10 Hz increment is < 0.015 m.
+      last_increment_ = increment;
+      output.outcome = Outcome::kAccepted;
+      output.publish = true;
+      output.healthy =
+          recovery_accepts_ >= config_.recovery_consecutive_accepts;
+      output.reason = output.healthy
+                          ? "ACCEPTED_ACCUMULATING_KEYFRAME_MOTION"
+                          : "RECOVERING_ACCUMULATING_KEYFRAME_MOTION";
+      PopulateState(&output);
+      return output;
+    }
+
+    matching_pose_ = candidate_pose;
+    published_pose_ = matching_pose_;
+    last_increment_.setIdentity();
+    reference_ = current;
+    reference_stamp_s_ = stamp_s;
     UpdateTrustedImuHeading(imu_heading_valid, imu_heading_rad);
     history_.push_back(HistoryEntry{current, matching_pose_});
     while (static_cast<int>(history_.size()) > config_.submap_scans) {
@@ -335,6 +389,8 @@ class LidarOdometryCore {
         config_.translation_deadband_m < 0.0 ||
         config_.rotation_deadband_rad < 0.0 ||
         config_.candidate_fitness_slack < 0.0 ||
+        config_.max_candidate_translation_disagreement_m <= 0.0 ||
+        config_.max_candidate_rotation_disagreement_rad <= 0.0 ||
         config_.imu_yaw_tolerance_rad <= 0.0 ||
         config_.imu_yaw_tolerance_rad > std::acos(-1.0) ||
         config_.min_points < 3 ||
@@ -554,6 +610,29 @@ class LidarOdometryCore {
            result.imu_yaw_error <= config_.imu_yaw_tolerance_rad;
   }
 
+  bool CandidatesAmbiguous(const RegistrationResult& predicted,
+                           const RegistrationResult& identity,
+                           double translation_limit, double rotation_limit,
+                           bool imu_delta_valid,
+                           double translation_disagreement,
+                           double rotation_disagreement) const {
+    const bool predicted_valid =
+        PassesAllGates(predicted, translation_limit, rotation_limit) &&
+        PassesImuYawGate(predicted, imu_delta_valid);
+    const bool identity_valid =
+        PassesAllGates(identity, translation_limit, rotation_limit) &&
+        PassesImuYawGate(identity, imu_delta_valid);
+    if (!predicted_valid || !identity_valid) return false;
+    if (std::abs(predicted.fitness - identity.fitness) >
+        config_.candidate_fitness_slack) {
+      return false;
+    }
+    return translation_disagreement >
+               config_.max_candidate_translation_disagreement_m ||
+           rotation_disagreement >
+               config_.max_candidate_rotation_disagreement_rad;
+  }
+
   void PopulateImuYawError(RegistrationResult* result, bool imu_delta_valid,
                            double expected_yaw) const {
     if (!imu_delta_valid) {
@@ -568,7 +647,8 @@ class LidarOdometryCore {
                                      const RegistrationResult& identity,
                                      double translation_limit,
                                      double rotation_limit,
-                                     bool imu_delta_valid) const {
+                                     bool imu_delta_valid,
+                                     const Eigen::Isometry3d& continuity_guess) const {
     const bool predicted_valid =
         PassesAllGates(predicted, translation_limit, rotation_limit) &&
         PassesImuYawGate(predicted, imu_delta_valid);
@@ -584,20 +664,73 @@ class LidarOdometryCore {
     }
 
     const double predicted_consistency =
-        TransformDifference(predicted.delta, last_increment_);
+        TransformDifference(predicted.delta, continuity_guess);
     const double identity_consistency =
-        TransformDifference(identity.delta, last_increment_);
+        TransformDifference(identity.delta, continuity_guess);
     const double predicted_score = predicted.fitness + 0.20 * predicted_consistency;
     const double identity_score = identity.fitness + 0.20 * identity_consistency;
-    if (identity_score <= predicted_score + config_.candidate_fitness_slack) {
+    if (identity_score + config_.candidate_fitness_slack < predicted_score) {
       return identity;
     }
-    return predicted;
+    if (predicted_score + config_.candidate_fitness_slack < identity_score) {
+      return predicted;
+    }
+    // Near-tied fits are resolved by temporal consistency, not by a fixed
+    // identity preference that systematically suppresses slow translation.
+    return predicted_consistency <= identity_consistency ? predicted : identity;
   }
 
   static double Yaw(const Eigen::Isometry3d& transform) {
     return std::atan2(transform.rotation()(1, 0),
                       transform.rotation()(0, 0));
+  }
+
+  static Eigen::Isometry3d ScalePlanarTransform(
+      const Eigen::Isometry3d& transform, double scale) {
+    Eigen::Isometry3d scaled = Eigen::Isometry3d::Identity();
+    scaled.translation().x() = transform.translation().x() * scale;
+    scaled.translation().y() = transform.translation().y() * scale;
+    scaled.linear() =
+        Eigen::AngleAxisd(NormalizeAngle(Yaw(transform) * scale),
+                          Eigen::Vector3d::UnitZ())
+            .toRotationMatrix();
+    return scaled;
+  }
+
+  Eigen::Isometry3d ApplyCentroidTranslationGuess(
+      const Cloud::Ptr& source, const Cloud::Ptr& target,
+      const Eigen::Isometry3d& rotation_guess,
+      double translation_limit) const {
+    const Cloud::Ptr limited_source = LimitRegistrationCloud(source);
+    const Cloud::Ptr limited_target = LimitRegistrationCloud(target);
+    if (!limited_source || !limited_target || limited_source->empty() ||
+        limited_target->empty()) {
+      return rotation_guess;
+    }
+
+    Eigen::Vector3d source_centroid = Eigen::Vector3d::Zero();
+    Eigen::Vector3d target_centroid = Eigen::Vector3d::Zero();
+    for (const auto& point : limited_source->points) {
+      source_centroid += Eigen::Vector3d(point.x, point.y, point.z);
+    }
+    for (const auto& point : limited_target->points) {
+      target_centroid += Eigen::Vector3d(point.x, point.y, point.z);
+    }
+    source_centroid /= static_cast<double>(limited_source->size());
+    target_centroid /= static_cast<double>(limited_target->size());
+
+    const Eigen::Vector3d translation =
+        target_centroid - rotation_guess.linear() * source_centroid;
+    if (!translation.allFinite() ||
+        translation.head<2>().norm() > translation_limit) {
+      return rotation_guess;
+    }
+
+    Eigen::Isometry3d guess = rotation_guess;
+    guess.translation().x() = translation.x();
+    guess.translation().y() = translation.y();
+    guess.translation().z() = 0.0;
+    return guess;
   }
 
   static double NormalizeAngle(double angle) {
