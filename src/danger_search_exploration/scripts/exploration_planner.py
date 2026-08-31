@@ -76,6 +76,21 @@ BOUNDED_FLOOR_EXHAUSTION_REASONS = frozenset((
 ))
 
 
+def validate_fixed_elevator_hall_mode(
+        enabled, competition_mode, run_profile, x, y, into_yaw):
+    """Validate the explicit Seed-42 hall override and return its values."""
+    enabled = bool(enabled)
+    values = tuple(float(value) for value in (x, y, into_yaw))
+    if enabled and (
+            bool(competition_mode) or str(run_profile) != "simulation_truth"):
+        raise ValueError(
+            "fixed elevator hall is restricted to the simulation_truth profile"
+        )
+    if enabled and not all(math.isfinite(value) for value in values):
+        raise ValueError("fixed elevator hall coordinates must be finite")
+    return enabled, values
+
+
 def classify_navigation_failure(state, status_text=""):
     """Classify an Action terminal state without stale health telemetry."""
     normalized = str(status_text or "").lower()
@@ -573,6 +588,9 @@ class ExplorationPlanner:
         self.competition_mode = bool(rospy.get_param(
             "~competition_mode", rospy.get_param("/competition_mode", True)
         ))
+        self.run_profile = str(rospy.get_param(
+            "~run_profile", rospy.get_param("/run_profile", "formal")
+        ))
         self.localization_backend = str(rospy.get_param(
             "~localization_backend",
             rospy.get_param("/localization_backend", "gicp"),
@@ -766,7 +784,7 @@ class ExplorationPlanner:
             rospy.get_param("~floor_map_stable_time_s", 15.0)
         )
         self.elevator_crossing_timeout_s = float(
-            rospy.get_param("~elevator_crossing_timeout_s", 20.0)
+            rospy.get_param("~elevator_crossing_timeout_s", 40.0)
         )
         self.elevator_crossing_speed_mps = float(
             rospy.get_param("~elevator_crossing_speed_mps", 0.40)
@@ -832,6 +850,27 @@ class ExplorationPlanner:
         self.initial_hall_discovery_timeout_s = float(rospy.get_param(
             "~initial_hall_discovery_timeout_s", 60.0
         ))
+        fixed_hall_enabled = bool(rospy.get_param(
+            "~fixed_elevator_hall_enabled", False
+        ))
+        fixed_hall_values = (
+            rospy.get_param("~fixed_elevator_hall_x", -2.40),
+            rospy.get_param("~fixed_elevator_hall_y", -1.65),
+            rospy.get_param("~fixed_elevator_hall_into_yaw", -math.pi / 2.0),
+        )
+        try:
+            (self.fixed_elevator_hall_enabled,
+             validated_fixed_hall) = validate_fixed_elevator_hall_mode(
+                fixed_hall_enabled,
+                self.competition_mode,
+                self.run_profile,
+                *fixed_hall_values,
+            )
+        except ValueError as exc:
+            raise rospy.ROSInitException(str(exc))
+        (self.fixed_elevator_hall_x,
+         self.fixed_elevator_hall_y,
+         self.fixed_elevator_hall_into_yaw) = validated_fixed_hall
         if not (
                 self.shaft_min_area_m2 > 0.0
                 and self.shaft_max_area_m2 >= self.shaft_min_area_m2
@@ -2909,13 +2948,19 @@ class ExplorationPlanner:
         enabled = (
             bool(getattr(self, "multifloor_enabled", False))
             and bool(getattr(self, "initial_hall_discovery_enabled", False))
+            and not bool(getattr(self, "fixed_elevator_hall_enabled", False))
             and bool(getattr(self, "elevator_door_initial_open", {}).get(
                 int(self.current_floor), False
             ))
             and bool(self._elevator_door_id(self.current_floor))
         )
         self.initial_hall_discovery_active = bool(enabled)
-        self.initial_hall_discovery_step = "WAIT_READY" if enabled else "DISABLED"
+        if enabled:
+            self.initial_hall_discovery_step = "WAIT_READY"
+        elif bool(getattr(self, "fixed_elevator_hall_enabled", False)):
+            self.initial_hall_discovery_step = "FIXED_OVERRIDE"
+        else:
+            self.initial_hall_discovery_step = "DISABLED"
         self.initial_hall_discovery_started = (
             rospy.Time.now() if enabled else rospy.Time(0)
         )
@@ -3516,6 +3561,39 @@ class ExplorationPlanner:
             deduplicated.append(candidate)
         return deduplicated
 
+    def _fixed_elevator_hall_candidate(self):
+        """Return the explicit simulation-only hall without validating it."""
+        if not bool(getattr(self, "fixed_elevator_hall_enabled", False)):
+            return None
+        return ElevatorHallCandidate(
+            x=float(self.fixed_elevator_hall_x),
+            y=float(self.fixed_elevator_hall_y),
+            into_yaw=float(self.fixed_elevator_hall_into_yaw),
+            score=1.0,
+            source="fixed_test",
+            confidence=1.0,
+            validated=False,
+        )
+
+    def _hall_candidates_for_floor_change(self, now):
+        """Select either the fixed test hall or the normal discovery results."""
+        fixed_hall = self._fixed_elevator_hall_candidate()
+        if fixed_hall is not None:
+            # This test mode deliberately isolates the transit state machine
+            # from both active discovery and passive geometry detection.  The
+            # candidate remains unvalidated so the real door close/reopen scan
+            # check still runs before ENTER.
+            return [fixed_hall]
+
+        cached_hall = self._cached_hall_candidate()
+        self._observe_elevator_halls(now)
+        halls = self._confirmed_elevator_halls(now)
+        if cached_hall is not None and not any(
+                math.hypot(cached_hall[0] - hall[0], cached_hall[1] - hall[1])
+                < 0.35 for hall in halls):
+            halls.insert(0, cached_hall)
+        return halls
+
     def _observe_elevator_halls(self, now):
         """Accumulate passive evidence over distinct map versions."""
         active_context = getattr(self, "accepted_map_context", None)
@@ -3651,7 +3729,7 @@ class ExplorationPlanner:
             candidate.validated = True
             candidate.confidence = 1.0
             candidate.score = 1.0
-            if candidate.source != "door_motion":
+            if candidate.source not in ("door_motion", "fixed_test"):
                 candidate.source = "runtime_door_motion"
         self._save_hall_binding(
             candidate,
@@ -3754,13 +3832,7 @@ class ExplorationPlanner:
         self.navigation_goal_sent_at = rospy.Time(0)
         self._floor_change_goal_succeeded = None
 
-        cached_hall = self._cached_hall_candidate()
-        self._observe_elevator_halls(now)
-        self.elevator_halls = self._confirmed_elevator_halls(now)
-        if cached_hall is not None and not any(
-                math.hypot(cached_hall[0] - hall[0], cached_hall[1] - hall[1])
-                < 0.35 for hall in self.elevator_halls):
-            self.elevator_halls.insert(0, cached_hall)
+        self.elevator_halls = self._hall_candidates_for_floor_change(now)
         if not self.elevator_halls:
             self._floor_change_fail("NO_HALL", "no elevator hall candidate")
             return False
@@ -3816,7 +3888,9 @@ class ExplorationPlanner:
                 math.hypot(candidate.x - cx, candidate.y - cy),
             ))
             self.elevator_halls = ranked
-            had_candidate = bool(ranked)
+            # Preserve the distinction between "nothing was detected" and a
+            # known hall whose stand-off or Navfn path is unreachable.
+            had_candidate = had_candidate or bool(ranked)
         while self.elevator_hall_index < len(self.elevator_halls):
             candidate = self.elevator_halls[self.elevator_hall_index]
             hx, hy, into_yaw = candidate

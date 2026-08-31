@@ -18,14 +18,18 @@ def validate_dwa_velocity_domain(
     config,
     safe_max_angular_speed_rps=0.40,
     effective_min_in_place_angular_speed_rps=0.40,
+    effective_forward_speed_mps=0.30,
+    controller_frequency_hz=10.0,
 ):
     """Reject a DWA config that would recreate unsafe Unitree yaw samples.
 
     ``cmd_mux`` retains a broader final hard limit for all producers, while
     ordinary move_base operation has a smaller, validated policy domain.  An
-    odd symmetric sample count is required so moving arcs still evaluate zero
-    and the small/mid yaw candidates.  Pure rotations must clear the measured
-    Unitree policy deadband.
+    odd symmetric angular sample count is required so moving arcs still
+    evaluate zero and the small/mid yaw candidates.  The x domain is a
+    deliberate two-point set: zero for footprint-checked in-place rotation and
+    the measured effective forward gait.  Pure rotations must clear the
+    measured Unitree policy deadband.
     Upstream DWA treats ``min_vel_theta`` as a non-negative minimum magnitude;
     it derives the signed sample interval from ``max_vel_theta``.
     """
@@ -33,11 +37,15 @@ def validate_dwa_velocity_domain(
         raise ValueError("DWA configuration must be a mapping")
     required = (
         "min_vel_trans",
+        "max_vel_trans",
         "min_vel_x",
+        "max_vel_x",
         "min_vel_y",
         "max_vel_y",
         "min_vel_theta",
         "max_vel_theta",
+        "acc_lim_x",
+        "vx_samples",
         "vth_samples",
     )
     missing = [name for name in required if name not in config]
@@ -45,26 +53,51 @@ def validate_dwa_velocity_domain(
         raise ValueError("DWA configuration missing " + ", ".join(missing))
     try:
         min_trans = float(config["min_vel_trans"])
+        max_trans = float(config["max_vel_trans"])
         min_x = float(config["min_vel_x"])
+        max_x = float(config["max_vel_x"])
         min_y = float(config["min_vel_y"])
         max_y = float(config["max_vel_y"])
         min_theta = float(config["min_vel_theta"])
         max_theta = float(config["max_vel_theta"])
+        acc_x = float(config["acc_lim_x"])
         safe_limit = float(safe_max_angular_speed_rps)
         effective_minimum = float(effective_min_in_place_angular_speed_rps)
-        samples = int(config["vth_samples"])
+        effective_forward = float(effective_forward_speed_mps)
+        controller_frequency = float(controller_frequency_hz)
+        vx_samples = int(config["vx_samples"])
+        vth_samples = int(config["vth_samples"])
     except (TypeError, ValueError) as error:
         raise ValueError("DWA velocity domain is not numeric") from error
     values = (
-        min_trans, min_x, min_y, max_y, min_theta, max_theta, safe_limit,
-        effective_minimum,
+        min_trans, max_trans, min_x, max_x, min_y, max_y, min_theta,
+        max_theta, acc_x, safe_limit, effective_minimum, effective_forward,
+        controller_frequency,
     )
     if not all(math.isfinite(value) for value in values):
         raise ValueError("DWA velocity domain must be finite")
     if abs(min_y) > 1e-9 or abs(max_y) > 1e-9:
         raise ValueError("DWA must remain nonholonomic (min/max_vel_y == 0)")
-    if min_trans <= 0.0 or min_x + 1e-9 < min_trans:
-        raise ValueError("DWA min_vel_x must exclude the translational policy deadband")
+    if effective_forward <= 0.0:
+        raise ValueError("effective forward speed must be positive")
+    if controller_frequency <= 0.0:
+        raise ValueError("controller frequency must be positive")
+    if abs(min_x) > 1e-9:
+        raise ValueError("DWA x domain must include the zero-velocity rotation sample")
+    if (
+        abs(min_trans - effective_forward) > 1e-9
+        or abs(max_trans - effective_forward) > 1e-9
+        or abs(max_x - effective_forward) > 1e-9
+    ):
+        raise ValueError(
+            "DWA ordinary navigation speed must equal the effective forward gait"
+        )
+    if vx_samples != 2:
+        raise ValueError("DWA requires exactly two x velocity samples")
+    if acc_x / controller_frequency + 1e-9 < effective_forward:
+        raise ValueError(
+            "DWA x acceleration cannot span the two-mode domain in one control cycle"
+        )
     if safe_limit <= 0.0 or effective_minimum <= 0.0:
         raise ValueError("safe DWA angular speeds must be positive")
     if effective_minimum > safe_limit + 1e-9:
@@ -75,9 +108,9 @@ def validate_dwa_velocity_domain(
         raise ValueError("DWA angular domain exceeds the safe policy limit")
     if min_theta + 1e-9 < effective_minimum:
         raise ValueError("DWA in-place yaw magnitude remains inside the policy deadband")
-    if samples < 9 or samples % 2 == 0:
+    if vth_samples < 9 or vth_samples % 2 == 0:
         raise ValueError("DWA requires an odd >=9 angular sample count")
-    step = 2.0 * max_theta / float(samples - 1)
+    step = 2.0 * max_theta / float(vth_samples - 1)
     if step > 0.10 + 1e-9:
         raise ValueError("DWA moving-arc yaw sample spacing exceeds 0.10 rad/s")
 
@@ -107,12 +140,20 @@ class NavigationConfigGuard:
         self.effective_min_in_place_angular_speed_rps = float(rospy.get_param(
             "~effective_min_in_place_angular_speed_rps", 0.40
         ))
+        self.effective_forward_speed_mps = float(rospy.get_param(
+            "~effective_forward_speed_mps", 0.30
+        ))
+        self.controller_frequency_hz = float(rospy.get_param(
+            "~controller_frequency_hz", 10.0
+        ))
         try:
             if self.planner_config_key == "DWAPlannerROS":
                 validate_dwa_velocity_domain(
                     self.expected,
                     self.safe_max_angular_speed_rps,
                     self.effective_min_in_place_angular_speed_rps,
+                    self.effective_forward_speed_mps,
+                    self.controller_frequency_hz,
                 )
         except ValueError as error:
             raise rospy.ROSInitException("unsafe DWA velocity domain: %s" % error)

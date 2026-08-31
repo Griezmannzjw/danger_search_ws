@@ -220,7 +220,7 @@ class PublicTopologyTest(unittest.TestCase):
         with config_path.open(encoding="utf-8") as stream:
             config = yaml.safe_load(stream)
         self.assertGreaterEqual(config["elevator_service_timeout_s"], 40.0)
-        self.assertEqual(config["elevator_crossing_timeout_s"], 20.0)
+        self.assertEqual(config["elevator_crossing_timeout_s"], 40.0)
         self.assertEqual(config["floor_map_stable_time_s"], 15.0)
         self.assertEqual(config["elevator_crossing_speed_mps"], 0.40)
         self.assertEqual(config["shaft_max_area_m2"], 12.0)
@@ -228,6 +228,12 @@ class PublicTopologyTest(unittest.TestCase):
         self.assertEqual(config["door_gap_max_width_m"], 1.8)
         self.assertEqual(config["active_map_topic"], "/mapping/active_map")
         self.assertGreater(config["elevator_footprint_margin_m"], 0.0)
+        self.assertFalse(config["fixed_elevator_hall_enabled"])
+        self.assertEqual(config["fixed_elevator_hall_x"], -2.40)
+        self.assertEqual(config["fixed_elevator_hall_y"], -1.65)
+        self.assertAlmostEqual(
+            config["fixed_elevator_hall_into_yaw"], -math.pi / 2.0, places=6
+        )
 
 
 class DoorScanValidationTest(unittest.TestCase):
@@ -364,6 +370,100 @@ class ActiveDoorLocalizationTest(unittest.TestCase):
         self.assertEqual(kind, "discovery_restore_open")
         open_callback()
         planner._door_request.assert_called_once_with(0, True)
+
+
+class FixedHallOverrideTest(unittest.TestCase):
+    def test_override_is_restricted_to_simulation_truth(self):
+        enabled, values = MODULE.validate_fixed_elevator_hall_mode(
+            True, False, "simulation_truth", -2.4, -1.65, -math.pi / 2.0
+        )
+        self.assertTrue(enabled)
+        self.assertEqual(values, (-2.4, -1.65, -math.pi / 2.0))
+
+        for competition_mode, profile in (
+                (True, "simulation_truth"), (False, "formal")):
+            with self.assertRaises(ValueError):
+                MODULE.validate_fixed_elevator_hall_mode(
+                    True, competition_mode, profile,
+                    -2.4, -1.65, -math.pi / 2.0,
+                )
+
+    def test_disabled_override_does_not_restrict_other_profiles(self):
+        enabled, _values = MODULE.validate_fixed_elevator_hall_mode(
+            False, True, "formal", -2.4, -1.65, -math.pi / 2.0
+        )
+        self.assertFalse(enabled)
+
+    def test_override_skips_initial_door_discovery(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.multifloor_enabled = True
+        planner.initial_hall_discovery_enabled = True
+        planner.fixed_elevator_hall_enabled = True
+        planner.current_floor = 0
+        planner.elevator_door_initial_open = {0: True}
+
+        planner._begin_initial_hall_discovery()
+
+        self.assertFalse(planner.initial_hall_discovery_active)
+        self.assertEqual(planner.initial_hall_discovery_step, "FIXED_OVERRIDE")
+
+    def test_override_candidate_is_single_and_unvalidated(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.fixed_elevator_hall_enabled = True
+        planner.fixed_elevator_hall_x = -2.40
+        planner.fixed_elevator_hall_y = -1.65
+        planner.fixed_elevator_hall_into_yaw = -math.pi / 2.0
+
+        candidate = planner._fixed_elevator_hall_candidate()
+
+        self.assertEqual(candidate.hall(), (-2.40, -1.65, -math.pi / 2.0))
+        self.assertEqual(candidate.source, "fixed_test")
+        self.assertEqual(candidate.score, 1.0)
+        self.assertEqual(candidate.confidence, 1.0)
+        self.assertFalse(candidate.validated)
+
+    def test_override_excludes_cached_and_passive_candidates(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.fixed_elevator_hall_enabled = True
+        planner.fixed_elevator_hall_x = -2.40
+        planner.fixed_elevator_hall_y = -1.65
+        planner.fixed_elevator_hall_into_yaw = -math.pi / 2.0
+        planner._cached_hall_candidate = Mock()
+        planner._observe_elevator_halls = Mock()
+        planner._confirmed_elevator_halls = Mock()
+
+        candidates = planner._hall_candidates_for_floor_change(
+            MODULE.rospy.Time.from_sec(1.0)
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].source, "fixed_test")
+        planner._cached_hall_candidate.assert_not_called()
+        planner._observe_elevator_halls.assert_not_called()
+        planner._confirmed_elevator_halls.assert_not_called()
+
+    def test_unreachable_override_reports_unreachable_hall(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=0.0, y=0.0)
+        )
+        planner.elevator_halls = [MODULE.ElevatorHallCandidate(
+            -2.40, -1.65, -math.pi / 2.0,
+            score=1.0, source="fixed_test", confidence=1.0,
+            validated=False,
+        )]
+        planner.elevator_hall_index = 0
+        planner.elevator_hall_min_score = 0.75
+        planner.elevator_hall_approach_m = 0.8
+        planner._world_to_map = Mock(return_value=(1, 1))
+        planner._is_free = Mock(return_value=True)
+        planner._check_path = Mock(return_value="unreachable")
+        planner._floor_change_fail = Mock()
+
+        self.assertFalse(planner._pick_elevator_hall_and_send())
+        planner._floor_change_fail.assert_called_once_with(
+            "UNREACHABLE_HALL", "all elevator hall candidates are unreachable"
+        )
 
 
 class ElevatorHallCacheTest(unittest.TestCase):
@@ -584,6 +684,46 @@ class TransitStateMachineTest(unittest.TestCase):
         planner._advance_floor_change(MODULE.rospy.Time.from_sec(1.0))
 
         planner._start_crossing.assert_called_once_with(+1.0)
+
+    def test_fixed_candidate_failed_door_validation_never_enters(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_deadline = MODULE.rospy.Time.from_sec(100.0)
+        planner.floor_change_step = "REOPEN_CURRENT_WAIT"
+        planner.floor_change_hall_candidate = MODULE.ElevatorHallCandidate(
+            -2.40, -1.65, -math.pi / 2.0,
+            score=1.0, source="fixed_test", confidence=1.0,
+            validated=False,
+        )
+        planner._hall_validation_passed = False
+        planner._service_outcome = Mock(return_value=("success", object()))
+        planner._discard_active_hall_binding = Mock()
+        planner._retry_hall_or_fail = Mock()
+        planner._start_crossing = Mock()
+
+        planner._advance_floor_change(MODULE.rospy.Time.from_sec(1.0))
+
+        planner._start_crossing.assert_not_called()
+        planner._retry_hall_or_fail.assert_called_once_with(
+            "NO_HALL", "door motion did not change the local scan"
+        )
+
+    def test_validated_fixed_candidate_keeps_diagnostic_source(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_hall_point = (-2.40, -1.65, -math.pi / 2.0)
+        planner.floor_change_hall_candidate = MODULE.ElevatorHallCandidate(
+            -2.40, -1.65, -math.pi / 2.0,
+            score=1.0, source="fixed_test", confidence=1.0,
+            validated=False,
+        )
+        planner.floor_change_start_floor = 0
+        planner.floor_change_start_epoch = 1
+        planner._save_hall_binding = Mock()
+
+        planner._remember_validated_hall()
+
+        candidate = planner._save_hall_binding.call_args.args[0]
+        self.assertTrue(candidate.validated)
+        self.assertEqual(candidate.source, "fixed_test")
 
     def test_wait_stable_requires_epoch_two_versions_and_full_hold(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)

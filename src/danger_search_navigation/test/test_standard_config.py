@@ -83,15 +83,15 @@ class StandardNavigationConfigTest(unittest.TestCase):
         config = self._yaml("dwa_planner.yaml")["DWAPlannerROS"]
         self.assertEqual(config["odom_topic"], "/localization/odom")
         self.assertEqual(config["min_vel_trans"], 0.30)
-        self.assertEqual(config["max_vel_trans"], 0.40)
-        self.assertEqual(config["min_vel_x"], 0.30)
-        self.assertEqual(config["max_vel_x"], 0.40)
+        self.assertEqual(config["max_vel_trans"], 0.30)
+        self.assertEqual(config["min_vel_x"], 0.0)
+        self.assertEqual(config["max_vel_x"], 0.30)
         self.assertEqual(config["min_vel_y"], 0.0)
         self.assertEqual(config["max_vel_y"], 0.0)
         self.assertEqual(config["max_vel_theta"], 0.40)
         self.assertEqual(config["min_vel_theta"], 0.40)
         self.assertEqual((config["vx_samples"], config["vy_samples"],
-                          config["vth_samples"]), (5, 1, 9))
+                          config["vth_samples"]), (2, 1, 9))
         self.assertTrue(config["use_dwa"])
         self.assertEqual(config["path_distance_bias"], 32.0)
         self.assertEqual(config["goal_distance_bias"], 24.0)
@@ -116,7 +116,10 @@ class StandardNavigationConfigTest(unittest.TestCase):
         planner = self._yaml("dwa_planner.yaml")["DWAPlannerROS"]
         mux = self._control_config()
         self.assertLessEqual(planner["max_vel_x"], mux["max_linear_speed"])
-        self.assertGreaterEqual(planner["min_vel_x"], planner["min_vel_trans"])
+        self.assertEqual(planner["min_vel_x"], 0.0)
+        self.assertEqual(planner["max_vel_x"], planner["min_vel_trans"])
+        self.assertEqual(planner["max_vel_x"], planner["max_vel_trans"])
+        self.assertEqual(planner["vx_samples"], 2)
         self.assertLessEqual(planner["max_vel_y"], mux["max_lateral_speed"])
         safety_limit = 0.40
         self.assertLessEqual(planner["max_vel_theta"], safety_limit)
@@ -158,6 +161,8 @@ class StandardNavigationConfigTest(unittest.TestCase):
         self.assertEqual(
             params["effective_min_in_place_angular_speed_rps"], "0.40"
         )
+        self.assertEqual(params["effective_forward_speed_mps"], "0.30")
+        self.assertEqual(params["controller_frequency_hz"], "10.0")
 
     def test_escape_recovery_is_a_nav_core_plugin(self):
         root = ET.parse(PACKAGE / "recovery_plugin.xml").getroot()

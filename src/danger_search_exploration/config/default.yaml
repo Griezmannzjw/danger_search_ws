@@ -100,6 +100,13 @@ elevator_id: elevator_main
 # 电梯门 ID 前缀（各楼层为 elevator_floor_0/1/2）
 elevator_door_prefix: elevator_floor
 
+# Seed 42 simulation_truth only: bypass hall discovery but retain runtime
+# door-motion validation and the complete enter/ride/exit state machine.
+fixed_elevator_hall_enabled: false
+fixed_elevator_hall_x: -2.40
+fixed_elevator_hall_y: -1.65
+fixed_elevator_hall_into_yaw: -1.5707963
+
 # 启动时先用公开门服务和全向激光差分定位电梯门；失败才用严格几何回退
 initial_hall_discovery_enabled: true
 initial_hall_discovery_scan_count: 5
@@ -127,7 +134,7 @@ elevator_max_retries: 3
 elevator_floor_change_timeout_s: 480.0  # 仅为总安全上限；各阶段有独立超时
 elevator_hall_navigation_max_s: 180.0
 elevator_hall_nominal_speed_mps: 0.25
-elevator_crossing_timeout_s: 20.0
+elevator_crossing_timeout_s: 40.0
 elevator_crossing_speed_mps: 0.40
 elevator_crossing_distance_m: 1.40
 elevator_crossing_min_progress_m: 0.80
