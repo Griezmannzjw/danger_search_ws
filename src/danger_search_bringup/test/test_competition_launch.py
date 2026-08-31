@@ -66,6 +66,23 @@ class CompetitionLaunchTest(unittest.TestCase):
         )
         self.assertEqual(arguments["gazebo_base_link"], "a1_gazebo::base")
 
+    def test_truth_only_relaxes_stale_imu_timeout(self):
+        truth_launch_arguments = launch_arguments(self.truth)
+        formal_launch_arguments = launch_arguments(self.formal)
+        self.assertEqual(
+            truth_launch_arguments["posture_imu_timeout_s"].attrib["default"],
+            "1.5",
+        )
+        self.assertNotIn("posture_imu_timeout_s", formal_launch_arguments)
+        self.assertEqual(
+            include_arguments(self.truth)["posture_imu_timeout_s"],
+            "$(arg posture_imu_timeout_s)",
+        )
+        self.assertEqual(
+            launch_arguments(self.system)["posture_imu_timeout_s"].attrib["default"],
+            "0.25",
+        )
+
     def test_system_owns_all_nodes_and_forwards_runtime_contract(self):
         nodes = [node.attrib.get("name") for node in self.system.findall("node")]
         self.assertEqual(

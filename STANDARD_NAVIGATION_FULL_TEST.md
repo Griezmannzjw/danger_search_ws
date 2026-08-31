@@ -100,6 +100,17 @@ roslaunch danger_search_bringup simulation_truth.launch \
   simenv_root:=/home/ruilinli/SimEnv
 ```
 
+只验证 Seed 42 已知电梯坐标下的进梯和换层链路时，在上述命令末尾增加：
+
+```bash
+  fixed_elevator_hall_enabled:=true
+```
+
+该开关仅允许用于 `simulation_truth`，固定门中心为 map 坐标
+`(-2.40, -1.65)`、朝轿厢方向 `yaw=-1.5707963`。它只绕过电梯入口发现；门口
+`make_plan`、开—关—开激光验证、局部避障、进出轿厢、呼梯和换层地图合同仍会执行。
+正式 competition 模式若误开该参数，探索节点必须拒绝启动。
+
 该命令会同时启动：
 
 - Gazebo 真值 localization 适配器。
@@ -268,6 +279,56 @@ rostopic echo -n 1 /cmd_vel
 ```
 
 只有直线和转向预检都通过后，才开始完整任务。
+
+### 4.3 固定电梯坐标直接换层测试（可选）
+
+本节只用于使用 `fixed_elevator_hall_enabled:=true` 启动的 Seed 42
+`simulation_truth`。不要调用 `/danger_search/start`；等待 `/mapping/status` 和
+`/navigation/health` 均 ready 后，直接依次执行 `0→1→2→0`：
+
+```bash
+python3 - <<'PY'
+import actionlib
+import rospy
+
+from danger_search_common.msg import TransitFloorAction, TransitFloorGoal
+
+rospy.init_node("seed42_fixed_elevator_test", anonymous=True)
+client = actionlib.SimpleActionClient(
+    "/danger_search/transit_floor", TransitFloorAction
+)
+if not client.wait_for_server(rospy.Duration(10.0)):
+    raise RuntimeError("TransitFloor action server unavailable")
+
+for target in (1, 2, 0):
+    client.send_goal(TransitFloorGoal(target_floor=target, exit_to_hall=True))
+    if not client.wait_for_result(rospy.Duration(500.0)):
+        client.cancel_goal()
+        raise RuntimeError("transit to floor %d timed out" % target)
+    result = client.get_result()
+    print("target=%d result=%s" % (target, result))
+    if result is None or not result.success or result.reached_floor != target:
+        raise RuntimeError(
+            "transit stopped at floor %d: %s" % (target, result)
+        )
+PY
+```
+
+同时观察：
+
+```bash
+rostopic echo /danger_search/transit_floor/feedback
+rostopic echo /danger_search/elevator_cmd_vel
+rostopic echo /danger_search/cmd_vel_sent
+rostopic echo /exploration/status
+rostopic echo /mapping/status
+```
+
+每段必须经过门扫描验证后才进入 `ENTER`；进入速度应约为 `+0.40 m/s`，退出速度约为
+`-0.40 m/s`，到达楼层依次为 `1/2/0`，map epoch 每次递增，结束后最终控制输出归零。
+任一段失败时停止后续目标，记录 action 的 `failure_code`、当前 phase、激光有效点及
+swept-footprint 障碍结果。固定坐标模式不代表正式发现逻辑通过，测试完成后应恢复默认
+`fixed_elevator_hall_enabled:=false`。
 
 ## 5. 终端三：通过 mission 启动完整任务
 

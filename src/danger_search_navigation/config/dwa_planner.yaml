@@ -4,13 +4,14 @@ DWAPlannerROS:
   # Unitree RL only leaves its standing response for a sufficiently large
   # translational command.  min_vel_trans filters out the intermediate DWA
   # samples while still allowing zero-translation in-place rotation.
-  max_vel_trans: 0.40
+  # Ordinary navigation uses two executable Unitree modes: stationary
+  # rotation or the calibrated 0.30 m/s forward gait.  Keeping the minimum
+  # translational magnitude equal to the maximum filters zero-x samples down
+  # to effective in-place rotations only.
+  max_vel_trans: 0.30
   min_vel_trans: 0.30
-  max_vel_x: 0.40
-  # Do not sample the 0.01--0.29 m/s translational commands that the RL gait
-  # predicts as motion but physically treats as standing/shuffling.  DWA's
-  # separate stop/rotate controller still provides zero-x goal orientation.
-  min_vel_x: 0.30
+  max_vel_x: 0.30
+  min_vel_x: 0.0
   # The deployed RL policy shows no measurable response at the mux-safe
   # +/-0.25 m/s lateral command.  Advertising holonomic samples makes DWA
   # predict motion the robot cannot execute and amplifies cross-track error.
@@ -45,7 +46,10 @@ DWAPlannerROS:
   sim_time: 2.0
   sim_granularity: 0.025
   angular_sim_granularity: 0.025
-  vx_samples: 5
+  # With acc_lim_x=3.0 and the 10 Hz controller, the DWA window spans the
+  # complete [0.0, 0.30] domain.  Two samples therefore produce exactly the
+  # stationary and effective-forward modes, with no 0.01--0.29 m/s samples.
+  vx_samples: 2
   # Treat the A1 as nonholonomic until a separately calibrated lateral gait
   # passes the physical response test.
   vy_samples: 1
