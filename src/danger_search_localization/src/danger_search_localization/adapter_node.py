@@ -106,9 +106,6 @@ class LocalizationAdapterNode:
         self.current_floor_topic = rospy.get_param(
             "~current_floor_topic", "/mapping/current_floor"
         )
-        self.set_current_floor_service = rospy.get_param(
-            "~set_current_floor_service", "/localization/set_current_floor"
-        )
         self.mapping_pause_topic = rospy.get_param(
             "~mapping_pause_topic", "/localization/mapping_pause"
         )
@@ -306,11 +303,6 @@ class LocalizationAdapterNode:
         )
         self.current_floor_pub = rospy.Publisher(
             self.current_floor_topic, Int32, queue_size=2, latch=True
-        )
-        self.set_current_floor_server = rospy.Service(
-            self.set_current_floor_service,
-            SetCurrentFloor,
-            self._set_current_floor_callback,
         )
         self.localization_status_pub = rospy.Publisher(
             self.localization_status_topic,

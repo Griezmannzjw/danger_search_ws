@@ -158,22 +158,23 @@ class CompetitionLaunchTest(unittest.TestCase):
 
     def test_exploration_receives_elevator_runtime_parameters(self):
         exploration = next(
-            node for node in self.root.findall("node")
+            node for node in self.system.findall("node")
             if node.attrib.get("name") == "exploration"
         )
         parameters = {
             child.attrib.get("name"): child.attrib.get("value")
             for child in exploration.findall("param")
         }
-        self.assertEqual(parameters["elevator/enabled"], "$(arg elevator_enabled)")
+        self.assertEqual(parameters["run_profile"], "$(arg run_profile)")
+        self.assertEqual(parameters["scene_info_file"], "$(arg scene_info_file)")
         self.assertEqual(
-            parameters["elevator/target_floor"], "$(arg elevator_target_floor)"
+            parameters["fixed_elevator_hall_enabled"],
+            "$(arg fixed_elevator_hall_enabled)",
         )
-        environment = {
-            child.attrib.get("name"): child.attrib.get("value")
-            for child in exploration.findall("env")
-        }
-        self.assertIn("$(arg simenv_root)", environment["PYTHONPATH"])
+        self.assertEqual(
+            parameters["fixed_elevator_hall_into_yaw"],
+            "$(arg fixed_elevator_hall_into_yaw)",
+        )
 
 
 if __name__ == "__main__":

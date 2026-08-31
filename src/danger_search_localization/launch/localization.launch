@@ -16,6 +16,7 @@
   <node name="local_scan_projector"
         pkg="danger_search_localization"
         type="scan_projector.py"
+        clear_params="true"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
     <param name="run_profile" value="$(arg run_profile)" />
@@ -25,10 +26,11 @@
   </node>
 
   <!-- Front depth camera fills the Livox near/low blind zone for costmaps only. -->
-  <node name="depth_obstacle_projector"
-        pkg="danger_search_localization"
-        type="depth_obstacle_projector.py"
-        output="screen">
+    <node name="depth_obstacle_projector"
+          pkg="danger_search_localization"
+          type="depth_obstacle_projector.py"
+          clear_params="true"
+          output="screen">
     <rosparam command="load" file="$(arg config_file)" />
     <param name="run_profile" value="$(arg run_profile)" />
     <param name="competition_mode" value="$(arg competition_mode)" />
@@ -39,6 +41,7 @@
     <node name="lidar_odometry"
           pkg="danger_search_localization"
           type="lidar_odometry_node"
+          clear_params="true"
           output="screen">
       <rosparam command="load" file="$(arg config_file)" />
       <param name="run_profile" value="$(arg run_profile)" />
@@ -53,6 +56,7 @@
     <node name="gazebo_truth_odometry"
           pkg="danger_search_localization"
           type="gazebo_truth_odometry.py"
+          clear_params="true"
           output="screen">
       <rosparam command="load" file="$(arg config_file)" />
       <param name="run_profile" value="$(arg run_profile)" />
@@ -74,6 +78,7 @@
     <node name="local_occupancy_mapper"
           pkg="danger_search_localization"
           type="occupancy_mapper.py"
+          clear_params="true"
           output="screen">
       <rosparam command="load" file="$(arg config_file)" />
       <param name="run_profile" value="$(arg run_profile)" />
@@ -105,6 +110,7 @@
   <node name="localization_adapter"
         pkg="danger_search_localization"
         type="pose_estimator.py"
+        clear_params="true"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
     <param name="run_profile" value="$(arg run_profile)" />

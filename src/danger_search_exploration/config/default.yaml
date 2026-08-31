@@ -49,6 +49,9 @@ goal_timeout_min_s: 30.0
 plan_tolerance: 0.5
 failed_goal_cooldown: 15.0
 failed_goal_radius: 0.50
+success_goal_cooldown: 45.0
+success_goal_radius: 0.50
+success_goal_clear_revisions: 2
 # move_base 在 xy_goal_tolerance 内即可返回成功；更近的候选不能再次下发，
 # 否则会形成“立即成功 -> 原目标重发”的探索活锁。
 min_goal_dispatch_distance_m: 0.45

@@ -710,6 +710,15 @@ class ExplorationPlanner:
         self.plan_tolerance = rospy.get_param("~plan_tolerance", 0.5)
         self.failed_goal_cooldown = rospy.get_param("~failed_goal_cooldown", 30.0)
         self.failed_goal_radius = rospy.get_param("~failed_goal_radius", 0.75)
+        self.success_goal_cooldown = float(
+            rospy.get_param("~success_goal_cooldown", 45.0)
+        )
+        self.success_goal_radius = float(
+            rospy.get_param("~success_goal_radius", 0.50)
+        )
+        self.success_goal_clear_revisions = int(
+            rospy.get_param("~success_goal_clear_revisions", 2)
+        )
         self.min_goal_dispatch_distance_m = float(
             rospy.get_param("~min_goal_dispatch_distance_m", 0.45)
         )
@@ -1297,12 +1306,6 @@ class ExplorationPlanner:
         )
         self.stop_srv = rospy.Service(
             self.stop_service, Trigger, self.stop_exploration_cb
-        )
-        self.start_elevator_srv = rospy.Service(
-            self.start_elevator_service, Trigger, self.start_elevator_cb
-        )
-        self.cancel_elevator_srv = rospy.Service(
-            self.cancel_elevator_service, Trigger, self.cancel_elevator_cb
         )
         self.status_pub = rospy.Publisher(self.status_topic, String, queue_size=10, latch=True)
         self.complete_pub = rospy.Publisher(self.complete_topic, Bool, queue_size=1, latch=True)
