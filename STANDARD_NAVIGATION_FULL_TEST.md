@@ -1,42 +1,33 @@
-# 标准 move_base + DWAPlannerROS 完整仿真测试
+# Seed 42 固定电梯坐标完整多楼层探索测试
 
-本文用于测试当前完整 `danger_search` 系统。测试链路为：
+本文档测试以下完整流程：
 
 ```text
-SimEnv Gazebo + Unitree RL 控制器
-    -> localization 真值位姿与建图
-    -> 标准 move_base / NavfnROS / DWAPlannerROS
-    -> /danger_search/nav_cmd_vel
-    -> cmd_mux
-    -> /cmd_vel
-    -> Unitree RL 控制器
+Seed 42 标准出生点
+→ 探索 0 层
+→ 使用固定电梯坐标到达并验证电梯
+→ 乘梯到 1 层并探索
+→ 乘梯到 2 层并探索
+→ 自动返回 0 层和任务出生点
+→ mission FINISHED
 ```
 
-测试要求：
-
-- 启动全部模块，不单独启动探索节点。
-- 先按 `2` 站立，再按 `6` 进入 RL `/cmd_vel` 模式。
-- 机器人直接出生在一层室内，跳过进门阶段。
-- Gazebo 真值只用于 localization 测试后端，不允许 `state_from_gazebo` 重复发布 TF。
-- `/cmd_vel` 必须只有 `danger_search_control` 一个发布者。
+本测试使用 `simulation_truth`。固定电梯模式只绕过“发现电梯位置”，不会绕过门外目标可达性检查、开—关—开激光验证、进出梯避障、呼梯、楼层地图切换或稳定等待。
 
 ## 0. 首次测试前编译
 
-代码修改后执行一次。已经成功编译过时可跳过本节。
+最新代码尚未编译时执行一次：
 
 ```bash
-cd /home/ruilinli/SimEnv
-source /opt/ros/noetic/setup.bash
-catkin_make --pkg unitree_guide -j2
-
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
-catkin_make -j2
+source /home/ruilinli/SimEnv/devel/setup.bash
+catkin_make -DCMAKE_BUILD_TYPE=Release
 ```
 
-## 1. 终端一：启动带 GUI 的 SimEnv
+## 1. 终端一：启动 Seed 42 仿真
 
-以下位置让机器人直接出生在一层室内大厅 `(0, 5)`：
+先在旧 Gazebo 和 danger_search 终端中按 `Ctrl+C`。然后打开新终端执行：
 
 ```bash
 cd /home/ruilinli/SimEnv
@@ -57,282 +48,186 @@ CONTROLLER_FOREGROUND=1 \
 ./auto.sh
 ```
 
-这里必须保持：
+控制器加载完成后，在该终端中：
 
-- `ENABLE_REFEREE_ODOM=0`：不启动会重复发布 `map -> odom -> base` 的 `state_from_gazebo`。
-- `simulation_truth.launch` 的固定真值后端直接读取 `/gazebo/link_states`，不依赖 `/Odometry_gazebo`。
-- `CONTROLLER_FOREGROUND=1`：终端保留键盘输入能力。
+1. 按一次数字 `2`。
+2. 等待机器人站稳。
+3. 按一次数字 `6`。
 
-等待 Gazebo 完全启动、机器人落地且终端出现 Unitree 控制提示后：
-
-1. 在该终端按 `2`。
-2. 等待至少 `4` 秒，让机器人完全站稳。
-3. 按 `6`，进入 RL `/cmd_vel` 模式。
-
-预期依次看到类似输出：
+必须看到类似输出：
 
 ```text
 Switched from passive to fixed stand
+Switched from fixed stand to RL
 [INFO] Entered RL /cmd_vel mode.
 ```
 
-如果已经处于 RL 状态，再按 `6` 也可能显示：
+注意：
 
-```text
-[INFO] Switched RL command source to /cmd_vel.
-```
-
-终端一必须一直保持运行。不要按 `4`，模式 `4` 是键盘速度模式，不接收导航的 `/cmd_vel`。
+- 不要按 `4`，模式 4 是键盘速度模式。
+- 终端一必须保持运行。
+- 每次重启 SimEnv 后都必须重新按 `2`、`6`。
+- 未进入模式 `6` 时，机器人即使收到 `/cmd_vel` 也不会实际行走。
 
 ## 2. 终端二：启动完整 danger_search 系统
 
-等机器人完成 `2 -> 等待 -> 6` 后再执行：
+确认终端一已进入模式 `6` 后，打开新终端：
 
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
-source devel/setup.bash
-source /home/ruilinli/SimEnv/devel/setup.bash --extend
+source /home/ruilinli/SimEnv/devel/setup.bash
+source devel/setup.bash --extend
 
 roslaunch danger_search_bringup simulation_truth.launch \
   autostart:=false \
   entry_enabled:=false \
+  fixed_elevator_hall_enabled:=true \
+  fixed_elevator_hall_x:=-2.40 \
+  fixed_elevator_hall_y:=-1.65 \
+  fixed_elevator_hall_into_yaw:=-1.5707963 \
   simenv_root:=/home/ruilinli/SimEnv
 ```
 
-只验证 Seed 42 已知电梯坐标下的进梯和换层链路时，在上述命令末尾增加：
-
-```bash
-  fixed_elevator_hall_enabled:=true
-```
-
-该开关仅允许用于 `simulation_truth`，固定门中心为 map 坐标
-`(-2.40, -1.65)`、朝轿厢方向 `yaw=-1.5707963`。它只绕过电梯入口发现；门口
-`make_plan`、开—关—开激光验证、局部避障、进出轿厢、呼梯和换层地图合同仍会执行。
-正式 competition 模式若误开该参数，探索节点必须拒绝启动。
-
-该命令会同时启动：
-
-- Gazebo 真值 localization 适配器。
-- 激光投影与 OccupancyGrid 建图。
-- 标准 `move_base`。
-- `navfn/NavfnROS` 全局规划器。
-- `dwa_local_planner/DWAPlannerROS` 局部规划器。
-- 标准 costmap 和有限 recovery。
-- 探索规划。
-- `cmd_mux` 控制仲裁。
-- 危险源感知。
-- mission 任务总控。
-- 门控制和兼容状态监控。
-
-正确启动时应看到：
+等待并确认出现：
 
 ```text
-[localization] TEST MODE: Gazebo truth ...
-Created global_planner navfn/NavfnROS
-Created local_planner dwa_local_planner/DWAPlannerROS
-[navigation_monitor] standard move_base compatibility ready
+[preflight] simulation_truth runtime contract READY
+[posture_safety_monitor] safety stop cleared
 ```
 
-在 `gazebo_truth` 模式下不应连续出现：
+终端二保持运行。
+
+### 固定电梯坐标说明
+
+标准出生点为：
 
 ```text
-GICP rejected
-raw GICP covariance is unhealthy
+world: x=0.0, y=5.0, yaw=1.5708
 ```
 
-终端二也必须一直保持运行。
+对应的固定电梯门中心和进入方向为：
+
+```text
+map: x=-2.40, y=-1.65, into_yaw=-1.5707963
+```
+
+启用固定模式后，机器人直接使用该入口候选，但每次换层仍执行：
+
+```text
+导航到门外
+→ 检查目标是否可达
+→ 开门扫描
+→ 关门扫描
+→ 重新开门
+→ 验证电梯
+→ 进入轿厢
+→ 呼梯
+→ 切换楼层地图
+→ 退出轿厢
+```
 
 ## 3. 终端三：启动前检查
 
-### 3.1 检查标准规划器确实被加载
+打开新终端并加载环境：
 
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
-source devel/setup.bash
-source /home/ruilinli/SimEnv/devel/setup.bash --extend
-
-rosparam get /move_base/base_global_planner
-rosparam get /move_base/base_local_planner
-rosparam get /move_base/DWAPlannerROS/odom_topic
-rosparam get /move_base/DWAPlannerROS/min_vel_x
-rosparam get /move_base/DWAPlannerROS/min_vel_theta
-rosparam get /move_base/DWAPlannerROS/max_vel_theta
-rosparam get /move_base/local_costmap/obstacles/observation_sources
-rosparam get /move_base/global_costmap/obstacles/observation_sources
-rostopic echo -n 1 /navigation/config_ready
-timeout 5 rostopic hz /localization/depth_obstacle_scan
+source /home/ruilinli/SimEnv/devel/setup.bash
+source devel/setup.bash --extend
 ```
 
-预期输出：
+确认关键节点：
+
+```bash
+rosnode list | sort
+```
+
+至少应该存在：
 
 ```text
-navfn/NavfnROS
-dwa_local_planner/DWAPlannerROS
-/localization/odom
-0.3
-0.4
-0.4
-scan depth_scan
-scan depth_scan
+/competition_preflight
+/control
+/exploration
+/localization_adapter
+/mission
+/move_base
+/navigation_monitor
+/posture_safety_monitor
+```
+
+检查 preflight：
+
+```bash
+rostopic echo -n 1 /danger_search/preflight_ready
+```
+
+预期：
+
+```text
 data: True
 ```
 
-### 3.2 检查定位、地图、导航和感知 readiness
+检查安全状态：
 
 ```bash
-rostopic echo -n 1 /localization/odom
-rostopic echo -n 1 /mapping/status
-rostopic echo -n 1 /navigation/health
-rostopic echo -n 1 /danger_detector/status
+rostopic echo -n 1 /danger_search/safety_stop
 ```
 
-开始任务前至少应满足：
+预期：
 
-- `/localization/odom` 的 `header.frame_id` 为 `odom`，`child_frame_id` 为 `base`。
-- `/mapping/status`：`ready: True`、`stable: True`、`lost: False`。
-- 使用 `simulation_truth.launch` 时，正常 `status_reason` 应为
-  `TRACKING_GAZEBO_TRUTH_WITH_LOCAL_OCCUPANCY_MAP`，不得显示为 GICP tracking。
-- `/navigation/health`：`ready: True`。
-- `/danger_detector/status`：`ready: True`。
+```text
+data: False
+```
 
-若 mapping 还未稳定，等待数秒后重新执行检查，不要直接启动任务。
-
-### 3.3 检查 TF 没有重复发布
+检查初始楼层：
 
 ```bash
-rosnode list | grep state_from_gazebo || true
-rosrun tf tf_echo map base
+rostopic echo -n 1 /mapping/current_floor
 ```
 
-第一条命令正常情况下没有输出。第二条应持续输出平滑、有限的位姿；观察几秒后按 `Ctrl-C` 结束 `tf_echo`。
+预期：
 
-### 3.4 检查速度链路和唯一发布者
+```text
+data: 0
+```
+
+检查固定电梯参数：
 
 ```bash
-rostopic info /danger_search/nav_cmd_vel
-rostopic info /cmd_vel
+rosparam get /exploration/fixed_elevator_hall_enabled
+rosparam get /exploration/fixed_elevator_hall_x
+rosparam get /exploration/fixed_elevator_hall_y
+rosparam get /exploration/fixed_elevator_hall_into_yaw
 ```
 
-必须满足：
+预期：
 
-- `/danger_search/nav_cmd_vel` 的 Publisher 包含 `/move_base`。
-- `/danger_search/nav_cmd_vel` 的 Subscriber 包含 `/control`。
-- `/cmd_vel` 只有一个 Publisher，正常为 `/control`。
-- `/cmd_vel` 的 Subscriber 包含 `/unitree_gazebo_servo`。
+```text
+true
+-2.4
+-1.65
+-1.5707963
+```
 
-如果 `/cmd_vel` 没有 `/unitree_gazebo_servo` 订阅者，先不要启动任务，重新确认终端一中的 `2 -> 等待 -> 6` 和 Unitree 控制器状态。
-
-## 4. 终端三：任务启动前运动预检
-
-预检期间 mission 尚未启动，因此可以单独向标准 `move_base` 发送短距离目标，验证导航到 RL 步态的完整执行链。预检必须在出生点附近的开放区域进行；如果 RViz 中目标方向有障碍物，不要发送目标。
-
-### 4.1 开放区直线预检
-
-当前测试模式以出生位姿作为局部 `map` 原点。发送前方约 `1 m` 的目标：
+检查仿真安全和进出梯超时：
 
 ```bash
-rostopic pub -1 /move_base_simple/goal geometry_msgs/PoseStamped \
-  "{header: {frame_id: map}, pose: {position: {x: 1.0, y: 0.0, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}}"
+rosparam get /posture_safety_monitor/posture_imu_timeout_s
+rosparam get /exploration/elevator_crossing_timeout_s
 ```
 
-在两个终端分别观察：
+预期：
 
-```bash
-rostopic echo /danger_search/nav_cmd_vel
-rostopic echo /cmd_vel
+```text
+1.5
+40.0
 ```
 
-验收要求：
+## 4. 启动完整自主任务
 
-- 路径跟踪阶段 `/danger_search/nav_cmd_vel.linear.x` 应达到 `0.30 m/s`。
-- `/cmd_vel.linear.x` 应受 cmd_mux 限加速度约束平滑上升，且不超过 `0.40 m/s`。
-- Gazebo 中机器人应在 `5 s` 内产生明显前进，真值位移至少 `0.10 m`。
-- 只统计 `/move_base/status` 为 `ACTIVE` 的控制区间：
-  `/danger_search/nav_cmd_vel` 最大间隔应小于 `0.30 s`，P95 应不超过
-  `0.15 s`。目标完成到下一目标发送之间的安全零速选点阶段不计入断流。
-
-如果 `/cmd_vel.linear.x` 已达到 `0.30`，但机器人 `5 s` 内仍完全不动，取消目标并停止预检；此时问题属于 Unitree RL policy 或关节执行层，不要继续提高导航速度。
-
-### 4.2 原地旋转预检
-
-直线预检目标结束后，向相同位置发送约 `90°` 的最终朝向。由于 `xy_goal_tolerance=0.15`，局部规划器会进入标准终点旋转控制：
-
-```bash
-rostopic pub -1 /move_base_simple/goal geometry_msgs/PoseStamped \
-  "{header: {frame_id: map}, pose: {position: {x: 1.0, y: 0.0, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: 0.7071068, w: 0.7071068}}}"
-```
-
-验收要求：
-
-- `/danger_search/nav_cmd_vel` 应出现接近 `|angular.z|=0.40 rad/s` 的原地旋转命令。
-- `/cmd_vel.angular.z` 平滑上升且不超过 `0.40 rad/s`。
-- Gazebo 真值 yaw 应在 `3 s` 内变化至少 `0.20 rad`。
-- 高速转向时长期建图可以暂停，但 `/localization/scan` 和局部 costmap 必须继续更新。
-
-完成预检后取消所有测试目标，并确认 `/cmd_vel` 已归零：
-
-```bash
-rostopic pub -1 /move_base/cancel actionlib_msgs/GoalID "{}"
-rostopic echo -n 1 /cmd_vel
-```
-
-只有直线和转向预检都通过后，才开始完整任务。
-
-### 4.3 固定电梯坐标直接换层测试（可选）
-
-本节只用于使用 `fixed_elevator_hall_enabled:=true` 启动的 Seed 42
-`simulation_truth`。不要调用 `/danger_search/start`；等待 `/mapping/status` 和
-`/navigation/health` 均 ready 后，直接依次执行 `0→1→2→0`：
-
-```bash
-python3 - <<'PY'
-import actionlib
-import rospy
-
-from danger_search_common.msg import TransitFloorAction, TransitFloorGoal
-
-rospy.init_node("seed42_fixed_elevator_test", anonymous=True)
-client = actionlib.SimpleActionClient(
-    "/danger_search/transit_floor", TransitFloorAction
-)
-if not client.wait_for_server(rospy.Duration(10.0)):
-    raise RuntimeError("TransitFloor action server unavailable")
-
-for target in (1, 2, 0):
-    client.send_goal(TransitFloorGoal(target_floor=target, exit_to_hall=True))
-    if not client.wait_for_result(rospy.Duration(500.0)):
-        client.cancel_goal()
-        raise RuntimeError("transit to floor %d timed out" % target)
-    result = client.get_result()
-    print("target=%d result=%s" % (target, result))
-    if result is None or not result.success or result.reached_floor != target:
-        raise RuntimeError(
-            "transit stopped at floor %d: %s" % (target, result)
-        )
-PY
-```
-
-同时观察：
-
-```bash
-rostopic echo /danger_search/transit_floor/feedback
-rostopic echo /danger_search/elevator_cmd_vel
-rostopic echo /danger_search/cmd_vel_sent
-rostopic echo /exploration/status
-rostopic echo /mapping/status
-```
-
-每段必须经过门扫描验证后才进入 `ENTER`；进入速度应约为 `+0.40 m/s`，退出速度约为
-`-0.40 m/s`，到达楼层依次为 `1/2/0`，map epoch 每次递增，结束后最终控制输出归零。
-任一段失败时停止后续目标，记录 action 的 `failure_code`、当前 phase、激光有效点及
-swept-footprint 障碍结果。固定坐标模式不代表正式发现逻辑通过，测试完成后应恢复默认
-`fixed_elevator_hall_enabled:=false`。
-
-## 5. 终端三：通过 mission 启动完整任务
-
-所有 readiness 检查通过后执行：
+上述检查全部正确后，在终端三执行：
 
 ```bash
 rosservice call /danger_search/start "{}"
@@ -345,295 +240,268 @@ success: True
 message: "Mission started"
 ```
 
-因为使用了 `entry_enabled:=false`，任务应直接进入：
+此后不要发送手动导航目标，也不要运行单独的 `TransitFloorAction` 测试脚本。系统将自动执行：
 
 ```text
-[mission] EXPLORING; home pose captured in map
-[exploration] Start exploration
+开始任务
+→ 探索 0 层
+→ 判断 0 层无剩余可达前沿
+→ 标记 0 层完成
+→ 自动前往已知电梯并到达 1 层
+→ 探索 1 层
+→ 自动到达 2 层
+→ 探索 2 层
+→ 全部楼层探索完成
+→ 自动返回 0 层
+→ 返回任务出生点
+→ 连续静止验证
+→ 写入结果文件
+→ mission FINISHED
 ```
 
-随后先进入一次 `INITIAL_HALL_DISCOVERY`：机器人必须保持静止，依次采集 5 帧开门扫描、
-关闭 `elevator_floor_0`、稳定 0.75 秒并采集 5 帧关门扫描。Seed 42 正常应在 35 秒内看到：
+## 5. 监控完整流程
+
+监控终端先加载环境：
+
+```bash
+cd /home/ruilinli/danger_search_ws
+source /opt/ros/noetic/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash
+source devel/setup.bash --extend
+```
+
+### 5.1 探索状态
 
 ```bash
 rostopic echo /exploration/status
+```
+
+0 层探索完成时，终端二日志应出现：
+
+```text
+[exploration] floor 0 complete
+```
+
+随后系统应自动进入换层流程。
+
+### 5.2 电梯换层阶段
+
+在另一个已加载环境的终端执行：
+
+```bash
+rostopic echo /danger_search/transit_floor/feedback
+```
+
+每次换层应依次经过：
+
+```text
+TO_HALL
+OPEN_CURRENT_START
+OPEN_CURRENT_WAIT
+CAPTURE_OPEN_SCAN
+VALIDATE_CLOSE_START
+VALIDATE_CLOSE_WAIT
+CAPTURE_CLOSED_SCAN
+REOPEN_CURRENT_START
+REOPEN_CURRENT_WAIT
+ENTER
+CLOSE_CURRENT_START
+CLOSE_CURRENT_WAIT
+CALL_TARGET_START
+CALL_TARGET_WAIT
+SWITCH_FLOOR_START
+EXIT
+WAIT_STABLE
+DONE
+```
+
+### 5.3 当前楼层
+
+```bash
+rostopic echo /mapping/current_floor
+```
+
+探索阶段预期依次出现 `0`、`1`、`2`；任务返航时最终回到 `0`。
+
+### 5.4 安全状态
+
+```bash
+rostopic echo /danger_search/safety_stop
+```
+
+正常运行应保持：
+
+```text
+data: False
+```
+
+### 5.5 实际速度
+
+```bash
 rostopic echo /danger_search/cmd_vel_sent
 ```
 
-`/exploration/status` 中应出现非空 `elevator_binding`，其 `source` 为 `door_motion`、
-`confidence` 为 `1.0`、`validated` 为 `true`；首次普通导航目标只能在该状态结束后发出。
-成功后 0 层电梯门保持关闭，直到 floor 0 完成并执行实际换层。若差分不可见、有歧义、
-扫描几何改变或机器人位姿漂移超限，节点必须恢复开门并有限转入严格几何回退。
-Livox 投影造成的稀疏无返回允许在同一线段内桥接最多 5 个 bin，拟合点本身仍必须是真实
-变化点，门宽、直线 RMS 和多簇歧义阈值不因此放宽。
+进入电梯时，探索节点的电梯速度约为 `+0.40 m/s`；退出电梯时方向相反。经过控制仲裁后，`cmd_vel_sent` 可能经过缩放，不一定仍显示 `0.40`。
 
-必须调用 `/danger_search/start`。不要直接调用 `/danger_search/start_exploration`，否则会绕过 mission 的任务生命周期、危险源确认和结果保存。
+## 6. 可选：记录完整测试日志
 
-## 6. 终端四：启动 RViz
+任务开始前，在另一个终端执行：
 
 ```bash
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
-source devel/setup.bash
-source /home/ruilinli/SimEnv/devel/setup.bash --extend
+source /home/ruilinli/SimEnv/devel/setup.bash
+source devel/setup.bash --extend
 
-rviz
-```
-
-将 RViz 的 `Fixed Frame` 设置为：
-
-```text
-map
-```
-
-建议添加以下显示项：
-
-| RViz 显示类型 | Topic | 用途 |
-|---|---|---|
-| Map | `/map` | localization 输出的占据地图 |
-| Map | `/move_base/global_costmap/costmap` | 全局 costmap |
-| Map | `/move_base/local_costmap/costmap` | 局部 rolling costmap |
-| PoseWithCovariance | `/localization/pose` | 当前 map 位姿 |
-| LaserScan | `/localization/scan` | costmap 实际使用的二维激光 |
-| LaserScan | `/localization/depth_obstacle_scan` | RealSense 地面过滤后的低矮近场障碍补盲 |
-| PointCloud | `/scan` | Gazebo 原始点云 |
-| PointCloud2 | `/livox/Pointcloud2` | 转换后的 Livox 点云 |
-| Path | `/move_base/NavfnROS/plan` | Navfn 全局路径 |
-| Path | `/move_base/DWAPlannerROS/global_plan` | 局部规划器接收的全局路径 |
-| Path | `/move_base/DWAPlannerROS/local_plan` | DWAPlannerROS 当前局部轨迹 |
-| Polygon | `/move_base/local_costmap/footprint` | 当前固定保守 footprint |
-| TF | 无 | 检查 `map -> odom -> base` 和传感器 TF |
-
-如果局部 costmap 在 `odom` 坐标系，而 RViz Fixed Frame 为 `map`，这是正常的；TF 会负责变换。
-
-## 7. 终端五：运行期间监控与录包
-
-### 7.1 查看导航命令频率
-
-```bash
-cd /home/ruilinli/danger_search_ws
-source /opt/ros/noetic/setup.bash
-source devel/setup.bash
-source /home/ruilinli/SimEnv/devel/setup.bash --extend
-
-rostopic hz /danger_search/nav_cmd_vel
-```
-
-活动控制阶段应接近 move_base 的 `10 Hz`。统计时只保留
-`/move_base/status` 为 `ACTIVE` 的区间；这些区间内命令最大间隔应小于
-`0.30 s`、P95 应不超过 `0.15 s`。目标成功、取消、recovery 切换和下一个
-前沿选点期间本来就应安全输出零速，不算导航命令断流。
-
-可在另一个终端查看最终命令：
-
-```bash
-rostopic hz /cmd_vel
-```
-
-`cmd_mux` 正常应接近 `50 Hz`。
-
-### 7.2 查看导航健康、标准 recovery 和兼容 recovery
-
-以下命令每次选择一个运行：
-
-```bash
-rostopic echo /navigation/health
-rostopic echo /move_base/recovery_status
-rostopic echo /navigation/recovery_event
-rostopic echo /move_base/status
-```
-
-卡死或不可达场景中，`/move_base/recovery_status` 应出现有限序列：
-
-```text
-conservative_reset
-aggressive_reset
-```
-
-恢复失败后 Action 应进入 `ABORTED`，不能无限清图、旋转或持续撞击。
-
-### 7.3 查看探索和危险源识别
-
-```bash
-rostopic echo /exploration/status
-rostopic echo /danger_detector/status
-rostopic echo /danger_detector/detections
-rostopic echo /mission/status
-```
-
-### 7.4 建议录制诊断 rosbag
-
-开始任务前运行：
-
-```bash
-mkdir -p /home/ruilinli/danger_search_ws/test_bags
+mkdir -p test_logs
 
 rosbag record \
-  -O /home/ruilinli/danger_search_ws/test_bags/standard_navigation_full.bag \
-  /tf /tf_static \
-  /map \
+  -O test_logs/seed42_full_multifloor \
+  /mission/status \
+  /mission/active \
+  /exploration/status \
+  /exploration/complete \
   /mapping/status \
   /mapping/current_floor \
-  /mapping/active_map \
-  /mapping/floors/1/map \
-  /localization/pose \
-  /localization/odom \
-  /localization/scan \
-  /localization/depth_obstacle_scan \
-  /move_base/status \
-  /move_base/recovery_status \
-  /move_base/NavfnROS/plan \
-  /move_base/DWAPlannerROS/local_plan \
-  /danger_search/nav_cmd_vel \
+  /navigation/health \
+  /danger_search/transit_floor/goal \
+  /danger_search/transit_floor/feedback \
+  /danger_search/transit_floor/result \
   /danger_search/elevator_cmd_vel \
   /danger_search/cmd_vel_sent \
-  /cmd_vel \
-  /navigation/health \
-  /navigation/recovery_event \
-  /exploration/status \
-  /danger_detector/status \
-  /danger_detector/detections \
-  /mission/status
+  /danger_search/safety_stop
 ```
 
-测试结束后在录包终端按 `Ctrl-C`，不要强制关闭后直接拔掉终端。
+任务结束后按 `Ctrl+C` 停止 rosbag。
 
-### 7.5 检查多楼层换层合同
+## 7. 判断任务是否完成
 
-floor 0 完成、系统开始前往电梯厅时，分别采样 mapping、active-map 和探索状态：
+查看 mission 状态：
 
 ```bash
-rostopic echo -n 1 /mapping/status
-rostopic echo -n 1 --noarr /mapping/active_map
-rostopic echo -n 1 /exploration/status
-rostopic echo /danger_search/transit_floor/status
-rostopic echo /danger_search/elevator_cmd_vel
+rostopic echo -n 1 /mission/status
 ```
 
-第一个 `TO_HALL` 目标应使用启动阶段保存的 `source=door_motion` 绑定，不应导航到电梯
-背面、普通房间或远端墙角。开门成功后应直接进入 `ENTER`，不再执行一次“开—关—开”
-扫描验证；进入时 `/danger_search/elevator_cmd_vel.linear.x` 应达到 `0.40`，跨越门槛的
-定位进度不少于 `0.80 m`。
+查看探索完成信号：
 
-`/mapping/status` 与 `/mapping/active_map` 必须属于相同的 floor 和 map epoch。active-map 的
-正版本允许暂时小于最新 mapping 版本，因为两条 ROS 连接异步发布；只要地图新鲜，系统不应
-因此取消 `TO_HALL`。不得出现目标刚发出便连续报告：
-
-```text
-floor transit failed [UNREACHABLE_HALL]: hall navigation active map context is not committed
-floor_transit_unavailable
+```bash
+rostopic echo -n 1 /exploration/complete
 ```
 
-换层启动前仍必须看到 `ready=True`、`stable=True`。厅导航运行后，move_base recovery
-转向期间 mapping 的 ready/stable 可以短暂降级；只要 `lost=False`、
-`transitioning=False`、位姿和 active-map 新鲜且 floor/epoch 合同有效，目标不应因此被取消。
-`/navigation/recovery_event` 在换层阶段也不应增加 `/exploration/trap_blacklist`。
-
-成功进入下一层后必须同时满足：
+检查最终楼层：
 
 ```bash
 rostopic echo -n 1 /mapping/current_floor
-rostopic echo -n 1 /mapping/status
-rostopic echo -n 1 /mapping/floors/1/map
-rostopic echo -n 1 /exploration/status
 ```
 
-- `/mapping/current_floor` 为 `1`。
-- `/mapping/status` 的 `current_floor` 为 `1`、`map_epoch` 已增加、`stable=True` 且
-  `transitioning=False`。
-- `/mapping/floors/1/map` 已发布，探索状态已离开换层阶段并继续 floor 1 探索。
+最终应为：
 
-## 8. 场景与验收项目
-
-让探索至少覆盖以下情况：
-
-1. 开放区域连续直行。
-2. 90 度墙角转弯。
-3. 家具旁绕行。
-4. 家具夹缝候选目标。
-5. U 形凹区或不可达前沿。
-6. 危险源进入 RGB-D 视野。
-
-重点观察：
-
-- 开放直线路段大部分命令应为 `linear.y = 0`。
-- `/danger_search/nav_cmd_vel` 活动阶段连续输出。
-- `/cmd_vel` 不发生第二发布者抢占。
-- global/local costmap 中 footprint 相交区域不可通行。
-- 机器人卡住后 recovery 次数有限，最终恢复或 `ABORTED`。
-- 失败后探索不立即重复选择同一夹缝或墙角目标。
-- localization 位姿与 Gazebo 中的实际运动方向一致。
-- 探索期间感知、建图、导航和 mission 同时保持运行。
-
-## 9. 检查危险源结果文件
-
-任务运行或结束后执行：
-
-```bash
-python3 -m json.tool /home/ruilinli/SimEnv/results/detected_danger.json
+```text
+data: 0
 ```
 
-同时对照真值文件：
+检查速度归零：
 
 ```bash
-python3 -m json.tool /home/ruilinli/SimEnv/results/danger_truth.json
+rostopic echo -n 1 /danger_search/cmd_vel_sent
 ```
 
-结果文件为空时，先检查：
+预期：
 
-```bash
-rostopic echo -n 1 /danger_detector/status
-rostopic echo -n 1 /danger_detector/detections
-rostopic hz /real_sense/rgb/image_raw
-rostopic hz /real_sense/depth/image_raw
+```text
+linear:
+  x: 0.0
+  y: 0.0
+angular:
+  z: 0.0
 ```
 
-## 10. 正确停止顺序
-
-1. 录包终端按 `Ctrl-C`。
-2. danger_search 的终端二按 `Ctrl-C`，等待所有节点退出。
-3. RViz 终端按 `Ctrl-C`。
-4. 最后在 SimEnv 终端一按 `Ctrl-C`。
-
-不要在 Gazebo 尚运行时再次执行第二份 `auto.sh`，也不要并行启动旧的 `nav_controller.py`、Unitree 自带 move_base 或第二个 cmd_mux。
-
-## 11. 常见失败定位
-
-### `/danger_search/start` 返回 `navigation_not_ready`
-
-依次检查：
+检查安全状态：
 
 ```bash
+rostopic echo -n 1 /danger_search/safety_stop
+```
+
+预期：
+
+```text
+data: False
+```
+
+## 8. 查看最终结果文件
+
+直接查看：
+
+```bash
+cat /home/ruilinli/SimEnv/results/detected_danger.simulation_truth.json
+```
+
+格式化查看：
+
+```bash
+python3 -m json.tool \
+  /home/ruilinli/SimEnv/results/detected_danger.simulation_truth.json
+```
+
+结果应包含类似字段：
+
+```json
+{
+  "mission_status": "FINISHED",
+  "run_profile": "simulation_truth",
+  "localization_backend": "gazebo_truth",
+  "official_eligible": false
+}
+```
+
+`official_eligible=false` 是正常结果，因为这是 `simulation_truth` 测试，不是正式比赛运行。
+
+## 9. 失败时记录的信息
+
+任一换层失败后，不要继续手动发送换层目标。记录：
+
+```bash
+rostopic echo -n 1 /danger_search/transit_floor/result
+rostopic echo -n 1 /danger_search/safety_stop
 rostopic echo -n 1 /mapping/status
 rostopic echo -n 1 /navigation/health
-rostopic echo -n 1 /localization/pose
-rostopic echo -n 1 /localization/scan
-timeout 5 rostopic hz /localization/depth_obstacle_scan
-rostopic echo -n 1 /move_base/status
+rostopic echo -n 1 /danger_search/cmd_vel_sent
 ```
 
-### Gazebo 中机器人站立但完全不走
+同时保存终端二中的：
 
-```bash
-rostopic info /cmd_vel
-rostopic echo -n 5 /danger_search/nav_cmd_vel
-rostopic echo -n 5 /cmd_vel
+- Action `failure_code` 和 `message`。
+- 当前换层 phase。
+- 当前楼层和 map epoch。
+- 门扫描验证结果。
+- swept-footprint 障碍检查结果。
+- 是否出现 `imu_stale`、跌倒或导航超时。
+
+## 10. 停止测试
+
+按以下顺序停止：
+
+1. rosbag 终端按 `Ctrl+C`。
+2. danger_search 的终端二按 `Ctrl+C`。
+3. SimEnv 的终端一按 `Ctrl+C`。
+4. 如果第一次只停止控制器，再按一次 `Ctrl+C` 停止 Gazebo。
+
+## 11. 坐标模式不要混用
+
+本文档使用标准出生点：
+
+```text
+ROBOT_X=0.0
+ROBOT_Y=5.0
+ROBOT_YAW=1.5708
 ```
 
-若导航命令存在但 `/cmd_vel` 为零，检查 cmd_mux 的安全门和看门狗。若 `/cmd_vel` 非零但机器人不动：
+因此必须使用：
 
-1. 确认终端一已经明确显示 `[INFO] Entered RL /cmd_vel mode.`。
-2. 检查路径跟踪期间 `/cmd_vel.linear.x` 是否达到 `0.30 m/s`，不要只看低于步态下限的瞬时加速帧。
-3. 如果命令已稳定达到 `0.30` 但 Gazebo 真值仍无位移，将问题归入 RL policy/关节执行层，不要通过继续提高导航速度掩盖。
-
-### 路径存在但 move_base 持续报 costmap 不可用
-
-```bash
-rostopic hz /localization/scan
-rostopic hz /localization/depth_obstacle_scan
-rostopic hz /localization/odom
-rosrun tf tf_echo odom base
-rosrun tf tf_echo map odom
+```text
+fixed_elevator_hall_x=-2.40
+fixed_elevator_hall_y=-1.65
+fixed_elevator_hall_into_yaw=-1.5707963
 ```
 
-不得通过启动 `state_from_gazebo` 的 TF 来补链路；`map -> odom -> base` 必须由 localization adapter 独占发布。
+不要在该出生点下使用 `0.80, 0.00, 0.00`。该坐标只适用于机器人出生在电梯正前方 `(0.85, 2.60, 0.0)` 的直接进梯测试。
