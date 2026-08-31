@@ -1,0 +1,9 @@
+<library path="lib/libunitree_escape_recovery">
+  <class name="danger_search_navigation/UnitreeEscapeRecovery"
+         type="danger_search_navigation::UnitreeEscapeRecovery"
+         base_class_type="nav_core::RecoveryBehavior">
+    <description>
+      Closed-loop, footprint-checked Unitree backup/strafe recovery for move_base.
+    </description>
+  </class>
+</library>

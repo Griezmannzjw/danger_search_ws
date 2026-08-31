@@ -1,12 +1,24 @@
 <launch>
   <node name="mission" pkg="danger_search_mission" type="mission_manager.py" output="screen">
     <rosparam command="load" file="$(find danger_search_mission)/config/default.yaml" />
-    <param name="result_file" value="/tmp/danger_search_mission_smoke/detected_danger.json" />
+    <param name="result_file" value="/tmp/danger_search_mission_smoke/detected_danger.simulation_truth.json" />
     <param name="autostart" value="false" />
     <param name="min_detections" value="2" />
     <param name="preflight_wait_timeout_s" value="3.0" />
     <param name="input_timeout_s" value="1.0" />
     <param name="return_timeout_s" value="3.0" />
+    <param name="return_attempt_timeout_s" value="2.0" />
+    <param name="return_retry_reserve_s" value="0.5" />
+    <param name="return_terminal_reserve_s" value="0.2" />
+    <param name="return_min_attempt_timeout_s" value="0.1" />
+    <param name="competition_mode" value="false" />
+    <param name="multifloor_enabled" value="true" />
+    <param name="localization_backend" value="gazebo_truth" />
+    <param name="run_profile" value="simulation_truth" />
+    <param name="require_preflight_ready" value="false" />
+    <!-- The legacy action-loop smoke isolates Mission lifecycle. The guarded
+         crossing has its own core/mux tests and real Gazebo acceptance. -->
+    <param name="entry_short_range_enabled" value="false" />
   </node>
 
   <test test-name="mission_smoke"

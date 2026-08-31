@@ -8,6 +8,10 @@ bool fallen                             # 机器人摔倒
 bool has_active_goal                    # 有活动导航目标
 
 string active_goal_id                   # 当前目标ID
+int32 current_floor                     # 与活动地图绑定的楼层
+uint64 map_epoch                        # 与活动地图绑定的 epoch
+uint64 map_version                      # navigation epoch 门禁已提交的活动地图快照版本
+bool transitioning                      # 地图/楼层切换期间，拒绝新的导航目标
 float32 progress                        # 执行进度 0.0~1.0
 time last_cmd_time                      # 最后发送速度指令时间
 

@@ -5,6 +5,8 @@
         output="screen">
     <rosparam command="load" file="$(find danger_search_localization)/config/default.yaml" />
     <param name="multifloor_enabled" value="true" />
+    <param name="localization_backend" value="gazebo_truth" />
+    <param name="explicit_floor_switching" value="true" />
     <param name="map_size" value="64" />
     <param name="map_resolution" value="0.10" />
     <param name="map_pub_period" value="0.10" />
@@ -15,8 +17,10 @@
         type="pose_estimator.py"
         output="screen">
     <rosparam command="load" file="$(find danger_search_localization)/config/default.yaml" />
-    <param name="localization_source" value="gazebo_truth" />
+    <param name="competition_mode" value="false" />
+    <param name="localization_backend" value="gazebo_truth" />
     <param name="multifloor_enabled" value="true" />
+    <param name="explicit_floor_switching" value="true" />
     <param name="pose_stabilizer_mode" value="trusted_passthrough" />
     <param name="status_publish_rate_hz" value="10.0" />
     <param name="tf_publish_future_tolerance_s" value="0.0" />

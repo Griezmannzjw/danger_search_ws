@@ -4,6 +4,36 @@
 import math
 
 
+class GoalEpochTracker:
+    """Bind asynchronous navigation callbacks to one active action goal."""
+
+    def __init__(self):
+        self.active_goal_id = ""
+        self.epoch = 0
+        self.active = False
+
+    def accept_goal(self, goal_id):
+        goal_id = str(goal_id or "")
+        if not goal_id:
+            raise ValueError("goal_id must be non-empty")
+        if not self.active or goal_id != self.active_goal_id:
+            self.epoch += 1
+        self.active_goal_id = goal_id
+        self.active = True
+        return self.epoch
+
+    def matches(self, goal_id, epoch=None):
+        if not self.active or not goal_id or goal_id != self.active_goal_id:
+            return False
+        return epoch is None or epoch == self.epoch
+
+    def close_goal(self, goal_id):
+        if not self.matches(goal_id):
+            return False
+        self.active = False
+        return True
+
+
 def classify_terminal_status(status, text=""):
     """Map actionlib terminal states and move_base text to the legacy code."""
     normalized = (text or "").lower()
@@ -26,6 +56,19 @@ def recovery_maneuver(behavior_name):
     if "rotate" in name:
         return "ROTATE"
     return "NONE"
+
+
+def maneuver_from_command(linear_x, linear_y, angular_z, current="NONE"):
+    """Infer a translating recovery maneuver from its actual velocity output."""
+    if linear_x < -0.02:
+        return "BACKUP"
+    if linear_y > 0.02:
+        return "STRAFE_LEFT"
+    if linear_y < -0.02:
+        return "STRAFE_RIGHT"
+    if abs(angular_z) > 0.05:
+        return "ROTATE"
+    return current
 
 
 def recovery_has_translation_progress(

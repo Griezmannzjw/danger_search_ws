@@ -6,6 +6,7 @@ find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
   std_msgs
   sensor_msgs
+  std_srvs
   danger_search_common
 )
 
@@ -15,6 +16,7 @@ catkin_package(
   geometry_msgs
   std_msgs
   sensor_msgs
+  std_srvs
   danger_search_common
 )
 
@@ -24,9 +26,12 @@ include_directories(
 
 catkin_install_python(PROGRAMS
   scripts/cmd_mux.py
+  scripts/posture_safety_monitor.py
+  scripts/posture_safety_core.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
 if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_cmd_mux.py)
+  catkin_add_nosetests(test/test_posture_safety.py)
 endif()

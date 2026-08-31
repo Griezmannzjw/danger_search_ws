@@ -38,16 +38,20 @@ class TestP0MessageAdapter(unittest.TestCase):
             stamp=stamp,
             transform=transform,
             candidate_index=2,
+            map_epoch=7,
+            correction_version=3,
         )
 
         self.assertEqual(
             result.class_id, DangerSource.CLASS_DANGER_RED_SPHERE
         )
-        self.assertEqual(result.detection_id, "12.34-2")
+        self.assertEqual(result.detection_id, "m7-c3-12.34-2")
         self.assertEqual(result.position.header.frame_id, "map")
         self.assertEqual(result.position.header.stamp, stamp)
         self.assertEqual(result.floor_id, 0)
+        self.assertEqual(result.map_epoch, 7)
         self.assertAlmostEqual(result.confidence, 0.9)
+        self.assertEqual(result.localization_correction_version, 3)
         self.assertEqual(result.source_time, stamp)
 
     def test_tracking_fields_are_populated_without_changing_message_type(self):
@@ -76,11 +80,30 @@ class TestP0MessageAdapter(unittest.TestCase):
         self.assertNotEqual(upper_floor.track_id, second.track_id)
         self.assertTrue(upper_floor.track_id.startswith("danger-f1-"))
 
+    def test_annotation_does_not_cross_map_epoch(self):
+        node = DangerDetectorNode.__new__(DangerDetectorNode)
+        node.tracker = MultiFrameDangerTracker(
+            TrackingConfig(confirmation_hits=2)
+        )
+
+        before_reset = self._danger(
+            0, rospy.Time(30, 0), x=1.0, map_epoch=4
+        )
+        node._annotate_tracks([before_reset], before_reset.source_time)
+        after_reset = self._danger(
+            0, rospy.Time(30, 100000000), x=1.0, map_epoch=5
+        )
+        node._annotate_tracks([after_reset], after_reset.source_time)
+
+        self.assertNotEqual(before_reset.track_id, after_reset.track_id)
+        self.assertFalse(after_reset.confirmed)
+
     @staticmethod
-    def _danger(floor_id, stamp, x=1.0, y=0.0, z=0.15):
+    def _danger(floor_id, stamp, x=1.0, y=0.0, z=0.15, map_epoch=0):
         danger = DangerSource()
         danger.detection_id = "{}.{}".format(stamp.secs, stamp.nsecs)
         danger.floor_id = floor_id
+        danger.map_epoch = map_epoch
         danger.confidence = 0.9
         danger.position.header.frame_id = "map"
         danger.position.header.stamp = stamp

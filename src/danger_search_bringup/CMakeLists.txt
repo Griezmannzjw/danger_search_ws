@@ -7,6 +7,7 @@ catkin_package()
 
 catkin_install_python(PROGRAMS
   scripts/entrance_door.py
+  scripts/competition_preflight.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
@@ -21,4 +22,5 @@ install(DIRECTORY config/
 
 if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_competition_launch.py)
+  catkin_add_nosetests(test/test_preflight.py)
 endif()

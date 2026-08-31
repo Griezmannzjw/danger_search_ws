@@ -27,31 +27,55 @@ complete_topic: /exploration/complete
 # 探索参数
 goal_interval: 2.0
 max_retry: 3
+retry_backoff: 10.0
 min_frontier_length: 0.4
 # 已观测且占据概率低于该值的栅格可作为探索前沿。未知值 -1 始终不可达。
 free_threshold: 40
 # 前沿连通性使用与 navigation 静态规划一致的 0.30 m 本体净空。
 connectivity_occupied_threshold: 65
 connectivity_clearance_radius: 0.30
-max_frontier_candidates: 20
+# Candidates are initially ordered by Euclidean distance but ranked by Navfn
+# path length.  A 64-entry bound prevents a wall/doorway detour from hiding a
+# slightly farther candidate while retaining a finite make_plan budget.
+max_frontier_candidates: 64
 goal_timeout: 120.0
+# Navfn 可能为一个近处 frontier 生成绕完整楼层的长路径。最多下发 8m
+# 已知自由路径前缀，到达后用新地图重新做 WFD/路径排序，避免单一陈旧目标
+# 独占固定 120s。超时按实际下发路径估算，并始终受 goal_timeout 硬上限约束。
+max_frontier_goal_path_m: 8.0
+goal_timeout_base_s: 20.0
+goal_timeout_per_path_m: 4.0
+goal_timeout_min_s: 30.0
 plan_tolerance: 0.5
 failed_goal_cooldown: 15.0
 failed_goal_radius: 0.50
-success_goal_cooldown: 45.0
-success_goal_radius: 0.50
-success_goal_clear_revisions: 2
+# move_base 在 xy_goal_tolerance 内即可返回成功；更近的候选不能再次下发，
+# 否则会形成“立即成功 -> 原目标重发”的探索活锁。
+min_goal_dispatch_distance_m: 0.45
 dependency_check_timeout: 0.1
 input_timeout: 3.0
 no_frontier_cycles_required: 5
+floor_no_frontier_hold_s: 10.0
+# 前沿仍存在但持续不可达/已在观察范围内时，保留拓扑债务并在 30 秒后
+# 允许换层，避免同层永久等待。期间任一可达目标或依赖故障都会重新计时。
+floor_unreachable_hold_s: 30.0
 map_stable_time: 8.0
 map_change_cell_threshold: 5
 
-# 前沿目标放在已知区内侧，并朝向未知区。
-observation_min_distance: 0.30
-observation_target_distance: 0.45
-observation_max_distance: 0.70
-goal_clearance_margin: 0.02
+# 前沿目标留在已知区内侧，并朝向未知区。A1 固定 footprint 加 padding
+# 的外接半径约 0.421m；与 DWA 0.15m 到达容差组成联合合同：
+# min-tolerance >= 0.421 且 target+tolerance <= max。这样进入 stop/rotate
+# 阶段时 footprint 不会伸入未知区，避免近墙原地旋转永久碰撞。
+observation_min_distance: 0.60
+observation_target_distance: 0.70
+observation_max_distance: 0.90
+# Entry-enabled sessions capture their localization start pose and reject only
+# observation goals more than this distance behind it on the anchor floor.
+# system.launch enables this with entry_enabled; direct launches stay disabled.
+entrance_boundary_guard_enabled: false
+entrance_boundary_allowance_m: 1.0
+# connectivity 0.30m + margin 0.15m 同时覆盖上述旋转 footprint。
+goal_clearance_margin: 0.15
 # 使用真实路径长度、前沿信息量和路径最小净空综合排序。
 path_length_weight: 1.0
 frontier_gain_weight: 0.30
@@ -62,31 +86,75 @@ trap_blacklist_radius: 0.70
 trap_clearance_margin: 0.08
 blacklist_clear_revisions: 2
 
-# 参数化电梯任务。默认关闭，只有确认入口几何后才显式触发。
-elevator:
-  enabled: false
-  id: elevator_main
-  target_floor: 1
-  # 当前层连续无前沿且地图稳定后，自主选择最近的未完成楼层。
-  autonomous_when_floor_complete: true
-  # 公开配置，不从场景真值推断；三层场景应显式改为 [0, 1, 2]。
-  served_floors: [0, 1]
-  max_autonomous_transition_failures: 1
-  door_prefix: elevator_floor_
-  # 自主换层必须显式填写；手动服务为空时仍可使用最近成功前沿。
-  portal_pose: []
-  lobby_offset: 0.70
-  portal_near_distance: 0.40
-  # GUI=false 固定场景实测：0.90 m 会在轿厢后壁前振荡，0.60 m 可稳定进舱。
-  cabin_distance: 0.60
-  exit_distance: 0.80
-  navigation_timeout: 45.0
-  service_timeout: 10.0
-  operation_timeout: 45.0
-  floor_timeout: 45.0
-  floor_stable_time: 3.0
-  # 动态门和轿厢会使二维 GICP 在门槛处漂移；由 navigation 内部限时穿越，仍经控制仲裁。
-  portal_traversal_enabled: true
-  portal_speed: 0.25
-  portal_duration: 3.0
-  close_target_door_after_exit: false
+# ========== 多楼层探索 ==========
+multifloor_enabled: true
+# 只允许赛事公开合同，禁止读取 layout/building_config/scene_manifest。
+scene_info_file: ""
+# 当前楼层话题（建图模块发布 Int32，从 0 开始）
+current_floor_topic: /mapping/current_floor
+# 电梯/门服务（强类型 building_generator_interfaces）
+elevator_service: /call_elevator
+door_service: /set_door_state
+switch_floor_service: /localization/switch_floor
+mapping_pause_topic: /localization/mapping_pause
+active_map_topic: /mapping/active_map
+safety_stop_topic: /danger_search/safety_stop
+sent_cmd_topic: /danger_search/cmd_vel_sent
+transit_floor_action_name: /danger_search/transit_floor
+elevator_cmd_topic: /danger_search/elevator_cmd_vel
+scan_topic: /localization/scan
+elevator_id: elevator_main
+# 电梯门 ID 前缀（各楼层为 elevator_floor_0/1/2）
+elevator_door_prefix: elevator_floor
+
+# Seed 42 simulation_truth only: bypass hall discovery but retain runtime
+# door-motion validation and the complete enter/ride/exit state machine.
+fixed_elevator_hall_enabled: false
+fixed_elevator_hall_x: -2.40
+fixed_elevator_hall_y: -1.65
+fixed_elevator_hall_into_yaw: -1.5707963
+
+# 启动时先用公开门服务和全向激光差分定位电梯门；失败才用严格几何回退
+initial_hall_discovery_enabled: true
+initial_hall_discovery_scan_count: 5
+initial_hall_discovery_max_translation_m: 0.03
+initial_hall_discovery_max_yaw_deg: 1.0
+initial_hall_discovery_timeout_s: 60.0
+shaft_min_area_m2: 4.0
+shaft_max_area_m2: 12.0
+shaft_min_side_m: 1.8
+shaft_max_side_m: 3.6
+shaft_wall_support_min: 0.70
+door_gap_min_width_m: 0.9
+door_gap_max_width_m: 1.8
+door_center_tolerance_fraction: 0.25
+elevator_hall_min_score: 0.75
+elevator_hall_min_versions: 3
+elevator_hall_min_duration_s: 2.0
+# 靠近电梯厅/轿厢的安全距离
+elevator_hall_approach_m: 0.8
+elevator_car_target_m: 1.6      # 进轿厢后停靠位置（门缝向井道内推进距离）
+
+# 电梯操作
+elevator_service_timeout_s: 40.0
+elevator_max_retries: 3
+elevator_floor_change_timeout_s: 480.0  # 仅为总安全上限；各阶段有独立超时
+elevator_hall_navigation_max_s: 180.0
+elevator_hall_nominal_speed_mps: 0.25
+elevator_crossing_timeout_s: 40.0
+elevator_crossing_speed_mps: 0.40
+elevator_crossing_distance_m: 1.40
+elevator_crossing_min_progress_m: 0.80
+elevator_crossing_clearance_m: 0.32
+elevator_footprint_min_x: -0.35
+elevator_footprint_max_x: 0.30
+elevator_footprint_min_y: -0.15
+elevator_footprint_max_y: 0.15
+elevator_footprint_margin_m: 0.08
+floor_map_stable_time_s: 15.0
+floor_min_new_map_versions: 2
+floor_height_m: 2.6
+hall_validation_required: true
+elevator_scan_settle_s: 0.75
+elevator_door_change_threshold_m: 0.20
+elevator_door_changed_fraction: 0.08

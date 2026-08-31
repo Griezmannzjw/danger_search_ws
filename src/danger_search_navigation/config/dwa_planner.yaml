@@ -1,0 +1,76 @@
+DWAPlannerROS:
+  odom_topic: /localization/odom
+
+  # Unitree RL only leaves its standing response for a sufficiently large
+  # translational command.  min_vel_trans filters out the intermediate DWA
+  # samples while still allowing zero-translation in-place rotation.
+  # Ordinary navigation uses two executable Unitree modes: stationary
+  # rotation or the calibrated 0.30 m/s forward gait.  Keeping the minimum
+  # translational magnitude equal to the maximum filters zero-x samples down
+  # to effective in-place rotations only.
+  max_vel_trans: 0.30
+  min_vel_trans: 0.30
+  max_vel_x: 0.30
+  min_vel_x: 0.0
+  # The deployed RL policy shows no measurable response at the mux-safe
+  # +/-0.25 m/s lateral command.  Advertising holonomic samples makes DWA
+  # predict motion the robot cannot execute and amplifies cross-track error.
+  max_vel_y: 0.0
+  min_vel_y: 0.0
+  # Gazebo response calibration on the deployed Unitree RL controller found
+  # that pure yaw at <=0.30 rad/s remains in the standing deadband, while
+  # +/-0.40 rad/s and the combined 0.40 m/s + 0.40 rad/s arc are stable.
+  # Upstream DWA uses min_vel_theta only when translation is below
+  # min_vel_trans, so this forces a physically effective stop/rotate command
+  # without removing the smaller angular samples from moving arcs.
+  max_vel_theta: 0.40
+  min_vel_theta: 0.40
+
+  # At 10 Hz these limits put the complete 0.40/0.20/0.30 target domain in
+  # the first dynamic window.  cmd_mux remains the final per-axis limiter.
+  # danger_search_control/cmd_mux uses the same per-axis acceleration contract.
+  acc_lim_x: 3.0
+  acc_lim_y: 2.0
+  acc_lim_theta: 8.0
+  acc_lim_trans: 3.0
+
+  # Frontier goals are at least 0.60m inside known space. A 0.15m XY
+  # tolerance keeps the padded 0.421m A1 rotation envelope out of unknown
+  # cells before stopRotateController takes ownership.
+  xy_goal_tolerance: 0.15
+  yaw_goal_tolerance: 0.80
+  trans_stopped_vel: 0.05
+  theta_stopped_vel: 0.10
+  prune_plan: true
+
+  sim_time: 2.0
+  sim_granularity: 0.025
+  angular_sim_granularity: 0.025
+  # With acc_lim_x=3.0 and the 10 Hz controller, the DWA window spans the
+  # complete [0.0, 0.30] domain.  Two samples therefore produce exactly the
+  # stationary and effective-forward modes, with no 0.01--0.29 m/s samples.
+  vx_samples: 2
+  # Treat the A1 as nonholonomic until a separately calibrated lateral gait
+  # passes the physical response test.
+  vy_samples: 1
+  # Full [-0.40, 0.40] window at 0.10 rad/s spacing.  Moving trajectories can
+  # still use +/-0.10, +/-0.20 and +/-0.30; pure rotations below 0.40 are
+  # rejected by the minimum-magnitude contract above.
+  vth_samples: 9
+  use_dwa: true
+
+  path_distance_bias: 32.0
+  goal_distance_bias: 24.0
+  occdist_scale: 0.02
+  twirling_scale: 0.30
+  forward_point_distance: 0.50
+  stop_time_buffer: 0.30
+  oscillation_reset_dist: 0.05
+  oscillation_reset_angle: 0.20
+
+  # The costmaps already carry a conservative padded footprint.  Do not add
+  # another speed-dependent footprint expansion on top of it.
+  scaling_speed: 0.25
+  max_scaling_factor: 0.0
+  publish_cost_grid_pc: false
+  publish_traj_pc: false

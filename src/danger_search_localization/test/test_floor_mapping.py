@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from danger_search_localization.floor_mapping import (
     FloorHeightClassifier,
+    FloorSwitchState,
     MultiFloorOccupancyStore,
 )
 from danger_search_localization.occupancy_mapping import OccupancyMappingConfig
@@ -91,6 +92,50 @@ class TestMultiFloorOccupancyStore(unittest.TestCase):
         self.assertTrue(
             all(value == -1 for value in self.store.core(2).occupancy_data())
         )
+
+
+class TestFloorSwitchState(unittest.TestCase):
+    def setUp(self):
+        self.state = FloorSwitchState([0.0, 2.6, 5.2], initial_floor=0)
+
+    def test_switch_is_idempotent_by_transition_id(self):
+        first = self.state.request("elevator-run-1", 1)
+        replay = self.state.request("elevator-run-1", 1)
+
+        self.assertTrue(first.success)
+        self.assertTrue(first.changed)
+        self.assertEqual(first.map_epoch, 2)
+        self.assertEqual(replay, first)
+        self.assertEqual(self.state.map_epoch, 2)
+        self.assertEqual(self.state.floor_z_m, 2.6)
+
+    def test_transition_id_cannot_be_reused_for_another_floor(self):
+        self.state.request("elevator-run-1", 1)
+
+        conflict = self.state.request("elevator-run-1", 2)
+
+        self.assertFalse(conflict.success)
+        self.assertEqual(conflict.current_floor, 1)
+        self.assertEqual(conflict.map_epoch, 2)
+
+    def test_same_floor_is_success_without_new_epoch(self):
+        decision = self.state.request("already-home", 0)
+
+        self.assertTrue(decision.success)
+        self.assertFalse(decision.changed)
+        self.assertEqual(decision.map_epoch, 1)
+        self.assertFalse(self.state.transitioning)
+
+    def test_map_reset_invalidates_transition_replay_epoch(self):
+        self.state.request("elevator-run-1", 1)
+        self.state.mark_stable()
+        self.state.reset_map()
+
+        after_reset = self.state.request("elevator-run-1", 1)
+
+        self.assertTrue(after_reset.success)
+        self.assertFalse(after_reset.changed)
+        self.assertEqual(after_reset.map_epoch, 3)
 
 
 if __name__ == "__main__":

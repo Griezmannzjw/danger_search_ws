@@ -1,11 +1,11 @@
-# 标准 move_base + TrajectoryPlannerROS 完整仿真测试
+# 标准 move_base + DWAPlannerROS 完整仿真测试
 
 本文用于测试当前完整 `danger_search` 系统。测试链路为：
 
 ```text
 SimEnv Gazebo + Unitree RL 控制器
     -> localization 真值位姿与建图
-    -> 标准 move_base / NavfnROS / TrajectoryPlannerROS
+    -> 标准 move_base / NavfnROS / DWAPlannerROS
     -> /danger_search/nav_cmd_vel
     -> cmd_mux
     -> /cmd_vel
@@ -60,7 +60,7 @@ CONTROLLER_FOREGROUND=1 \
 这里必须保持：
 
 - `ENABLE_REFEREE_ODOM=0`：不启动会重复发布 `map -> odom -> base` 的 `state_from_gazebo`。
-- `localization_source:=gazebo_truth` 后端仍可直接读取 `/gazebo/link_states`，不依赖 `/Odometry_gazebo`。
+- `simulation_truth.launch` 的固定真值后端直接读取 `/gazebo/link_states`，不依赖 `/Odometry_gazebo`。
 - `CONTROLLER_FOREGROUND=1`：终端保留键盘输入能力。
 
 等待 Gazebo 完全启动、机器人落地且终端出现 Unitree 控制提示后：
@@ -92,14 +92,24 @@ Switched from passive to fixed stand
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
 source devel/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash --extend
 
-roslaunch danger_search_bringup competition.launch \
+roslaunch danger_search_bringup simulation_truth.launch \
   autostart:=false \
   entry_enabled:=false \
-  localization_source:=gazebo_truth \
-  gazebo_base_link:=a1_gazebo::base \
   simenv_root:=/home/ruilinli/SimEnv
 ```
+
+只验证 Seed 42 已知电梯坐标下的进梯和换层链路时，在上述命令末尾增加：
+
+```bash
+  fixed_elevator_hall_enabled:=true
+```
+
+该开关仅允许用于 `simulation_truth`，固定门中心为 map 坐标
+`(-2.40, -1.65)`、朝轿厢方向 `yaw=-1.5707963`。它只绕过电梯入口发现；门口
+`make_plan`、开—关—开激光验证、局部避障、进出轿厢、呼梯和换层地图合同仍会执行。
+正式 competition 模式若误开该参数，探索节点必须拒绝启动。
 
 该命令会同时启动：
 
@@ -107,7 +117,7 @@ roslaunch danger_search_bringup competition.launch \
 - 激光投影与 OccupancyGrid 建图。
 - 标准 `move_base`。
 - `navfn/NavfnROS` 全局规划器。
-- `base_local_planner/TrajectoryPlannerROS` 局部规划器。
+- `dwa_local_planner/DWAPlannerROS` 局部规划器。
 - 标准 costmap 和有限 recovery。
 - 探索规划。
 - `cmd_mux` 控制仲裁。
@@ -120,7 +130,7 @@ roslaunch danger_search_bringup competition.launch \
 ```text
 [localization] TEST MODE: Gazebo truth ...
 Created global_planner navfn/NavfnROS
-Created local_planner base_local_planner/TrajectoryPlannerROS
+Created local_planner dwa_local_planner/DWAPlannerROS
 [navigation_monitor] standard move_base compatibility ready
 ```
 
@@ -141,25 +151,31 @@ raw GICP covariance is unhealthy
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
 source devel/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash --extend
 
 rosparam get /move_base/base_global_planner
 rosparam get /move_base/base_local_planner
-rosparam get /move_base/TrajectoryPlannerROS/odom_topic
-rosparam get /move_base/TrajectoryPlannerROS/min_vel_x
-rosparam get /move_base/TrajectoryPlannerROS/min_in_place_vel_theta
-rosparam get /move_base/TrajectoryPlannerROS/max_vel_theta
+rosparam get /move_base/DWAPlannerROS/odom_topic
+rosparam get /move_base/DWAPlannerROS/min_vel_x
+rosparam get /move_base/DWAPlannerROS/min_vel_theta
+rosparam get /move_base/DWAPlannerROS/max_vel_theta
+rosparam get /move_base/local_costmap/obstacles/observation_sources
+rosparam get /move_base/global_costmap/obstacles/observation_sources
 rostopic echo -n 1 /navigation/config_ready
+timeout 5 rostopic hz /localization/depth_obstacle_scan
 ```
 
 预期输出：
 
 ```text
 navfn/NavfnROS
-base_local_planner/TrajectoryPlannerROS
+dwa_local_planner/DWAPlannerROS
 /localization/odom
 0.3
-0.8
-0.8
+0.4
+0.4
+scan depth_scan
+scan depth_scan
 data: True
 ```
 
@@ -176,7 +192,7 @@ rostopic echo -n 1 /danger_detector/status
 
 - `/localization/odom` 的 `header.frame_id` 为 `odom`，`child_frame_id` 为 `base`。
 - `/mapping/status`：`ready: True`、`stable: True`、`lost: False`。
-- 使用 `localization_source:=gazebo_truth` 时，正常 `status_reason` 应为
+- 使用 `simulation_truth.launch` 时，正常 `status_reason` 应为
   `TRACKING_GAZEBO_TRUTH_WITH_LOCAL_OCCUPANCY_MAP`，不得显示为 GICP tracking。
 - `/navigation/health`：`ready: True`。
 - `/danger_detector/status`：`ready: True`。
@@ -241,7 +257,7 @@ rostopic echo /cmd_vel
 
 ### 4.2 原地旋转预检
 
-直线预检目标结束后，向相同位置发送约 `90°` 的最终朝向。由于 `xy_goal_tolerance=0.40`，局部规划器会进入标准终点旋转控制：
+直线预检目标结束后，向相同位置发送约 `90°` 的最终朝向。由于 `xy_goal_tolerance=0.15`，局部规划器会进入标准终点旋转控制：
 
 ```bash
 rostopic pub -1 /move_base_simple/goal geometry_msgs/PoseStamped \
@@ -250,8 +266,8 @@ rostopic pub -1 /move_base_simple/goal geometry_msgs/PoseStamped \
 
 验收要求：
 
-- `/danger_search/nav_cmd_vel` 应出现 `|angular.z|=0.80 rad/s` 的原地旋转命令。
-- `/cmd_vel.angular.z` 平滑上升且不超过 `0.80 rad/s`。
+- `/danger_search/nav_cmd_vel` 应出现接近 `|angular.z|=0.40 rad/s` 的原地旋转命令。
+- `/cmd_vel.angular.z` 平滑上升且不超过 `0.40 rad/s`。
 - Gazebo 真值 yaw 应在 `3 s` 内变化至少 `0.20 rad`。
 - 高速转向时长期建图可以暂停，但 `/localization/scan` 和局部 costmap 必须继续更新。
 
@@ -263,6 +279,56 @@ rostopic echo -n 1 /cmd_vel
 ```
 
 只有直线和转向预检都通过后，才开始完整任务。
+
+### 4.3 固定电梯坐标直接换层测试（可选）
+
+本节只用于使用 `fixed_elevator_hall_enabled:=true` 启动的 Seed 42
+`simulation_truth`。不要调用 `/danger_search/start`；等待 `/mapping/status` 和
+`/navigation/health` 均 ready 后，直接依次执行 `0→1→2→0`：
+
+```bash
+python3 - <<'PY'
+import actionlib
+import rospy
+
+from danger_search_common.msg import TransitFloorAction, TransitFloorGoal
+
+rospy.init_node("seed42_fixed_elevator_test", anonymous=True)
+client = actionlib.SimpleActionClient(
+    "/danger_search/transit_floor", TransitFloorAction
+)
+if not client.wait_for_server(rospy.Duration(10.0)):
+    raise RuntimeError("TransitFloor action server unavailable")
+
+for target in (1, 2, 0):
+    client.send_goal(TransitFloorGoal(target_floor=target, exit_to_hall=True))
+    if not client.wait_for_result(rospy.Duration(500.0)):
+        client.cancel_goal()
+        raise RuntimeError("transit to floor %d timed out" % target)
+    result = client.get_result()
+    print("target=%d result=%s" % (target, result))
+    if result is None or not result.success or result.reached_floor != target:
+        raise RuntimeError(
+            "transit stopped at floor %d: %s" % (target, result)
+        )
+PY
+```
+
+同时观察：
+
+```bash
+rostopic echo /danger_search/transit_floor/feedback
+rostopic echo /danger_search/elevator_cmd_vel
+rostopic echo /danger_search/cmd_vel_sent
+rostopic echo /exploration/status
+rostopic echo /mapping/status
+```
+
+每段必须经过门扫描验证后才进入 `ENTER`；进入速度应约为 `+0.40 m/s`，退出速度约为
+`-0.40 m/s`，到达楼层依次为 `1/2/0`，map epoch 每次递增，结束后最终控制输出归零。
+任一段失败时停止后续目标，记录 action 的 `failure_code`、当前 phase、激光有效点及
+swept-footprint 障碍结果。固定坐标模式不代表正式发现逻辑通过，测试完成后应恢复默认
+`fixed_elevator_hall_enabled:=false`。
 
 ## 5. 终端三：通过 mission 启动完整任务
 
@@ -286,6 +352,21 @@ message: "Mission started"
 [exploration] Start exploration
 ```
 
+随后先进入一次 `INITIAL_HALL_DISCOVERY`：机器人必须保持静止，依次采集 5 帧开门扫描、
+关闭 `elevator_floor_0`、稳定 0.75 秒并采集 5 帧关门扫描。Seed 42 正常应在 35 秒内看到：
+
+```bash
+rostopic echo /exploration/status
+rostopic echo /danger_search/cmd_vel_sent
+```
+
+`/exploration/status` 中应出现非空 `elevator_binding`，其 `source` 为 `door_motion`、
+`confidence` 为 `1.0`、`validated` 为 `true`；首次普通导航目标只能在该状态结束后发出。
+成功后 0 层电梯门保持关闭，直到 floor 0 完成并执行实际换层。若差分不可见、有歧义、
+扫描几何改变或机器人位姿漂移超限，节点必须恢复开门并有限转入严格几何回退。
+Livox 投影造成的稀疏无返回允许在同一线段内桥接最多 5 个 bin，拟合点本身仍必须是真实
+变化点，门宽、直线 RMS 和多簇歧义阈值不因此放宽。
+
 必须调用 `/danger_search/start`。不要直接调用 `/danger_search/start_exploration`，否则会绕过 mission 的任务生命周期、危险源确认和结果保存。
 
 ## 6. 终端四：启动 RViz
@@ -294,6 +375,7 @@ message: "Mission started"
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
 source devel/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash --extend
 
 rviz
 ```
@@ -313,11 +395,12 @@ map
 | Map | `/move_base/local_costmap/costmap` | 局部 rolling costmap |
 | PoseWithCovariance | `/localization/pose` | 当前 map 位姿 |
 | LaserScan | `/localization/scan` | costmap 实际使用的二维激光 |
+| LaserScan | `/localization/depth_obstacle_scan` | RealSense 地面过滤后的低矮近场障碍补盲 |
 | PointCloud | `/scan` | Gazebo 原始点云 |
 | PointCloud2 | `/livox/Pointcloud2` | 转换后的 Livox 点云 |
 | Path | `/move_base/NavfnROS/plan` | Navfn 全局路径 |
-| Path | `/move_base/TrajectoryPlannerROS/global_plan` | 局部规划器接收的全局路径 |
-| Path | `/move_base/TrajectoryPlannerROS/local_plan` | TrajectoryPlannerROS 当前局部轨迹 |
+| Path | `/move_base/DWAPlannerROS/global_plan` | 局部规划器接收的全局路径 |
+| Path | `/move_base/DWAPlannerROS/local_plan` | DWAPlannerROS 当前局部轨迹 |
 | Polygon | `/move_base/local_costmap/footprint` | 当前固定保守 footprint |
 | TF | 无 | 检查 `map -> odom -> base` 和传感器 TF |
 
@@ -331,6 +414,7 @@ map
 cd /home/ruilinli/danger_search_ws
 source /opt/ros/noetic/setup.bash
 source devel/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash --extend
 
 rostopic hz /danger_search/nav_cmd_vel
 ```
@@ -388,14 +472,20 @@ rosbag record \
   -O /home/ruilinli/danger_search_ws/test_bags/standard_navigation_full.bag \
   /tf /tf_static \
   /map \
+  /mapping/status \
+  /mapping/current_floor \
+  /mapping/active_map \
+  /mapping/floors/1/map \
   /localization/pose \
   /localization/odom \
   /localization/scan \
+  /localization/depth_obstacle_scan \
   /move_base/status \
   /move_base/recovery_status \
   /move_base/NavfnROS/plan \
-  /move_base/TrajectoryPlannerROS/local_plan \
+  /move_base/DWAPlannerROS/local_plan \
   /danger_search/nav_cmd_vel \
+  /danger_search/elevator_cmd_vel \
   /danger_search/cmd_vel_sent \
   /cmd_vel \
   /navigation/health \
@@ -407,6 +497,51 @@ rosbag record \
 ```
 
 测试结束后在录包终端按 `Ctrl-C`，不要强制关闭后直接拔掉终端。
+
+### 7.5 检查多楼层换层合同
+
+floor 0 完成、系统开始前往电梯厅时，分别采样 mapping、active-map 和探索状态：
+
+```bash
+rostopic echo -n 1 /mapping/status
+rostopic echo -n 1 --noarr /mapping/active_map
+rostopic echo -n 1 /exploration/status
+rostopic echo /danger_search/transit_floor/status
+rostopic echo /danger_search/elevator_cmd_vel
+```
+
+第一个 `TO_HALL` 目标应使用启动阶段保存的 `source=door_motion` 绑定，不应导航到电梯
+背面、普通房间或远端墙角。开门成功后应直接进入 `ENTER`，不再执行一次“开—关—开”
+扫描验证；进入时 `/danger_search/elevator_cmd_vel.linear.x` 应达到 `0.40`，跨越门槛的
+定位进度不少于 `0.80 m`。
+
+`/mapping/status` 与 `/mapping/active_map` 必须属于相同的 floor 和 map epoch。active-map 的
+正版本允许暂时小于最新 mapping 版本，因为两条 ROS 连接异步发布；只要地图新鲜，系统不应
+因此取消 `TO_HALL`。不得出现目标刚发出便连续报告：
+
+```text
+floor transit failed [UNREACHABLE_HALL]: hall navigation active map context is not committed
+floor_transit_unavailable
+```
+
+换层启动前仍必须看到 `ready=True`、`stable=True`。厅导航运行后，move_base recovery
+转向期间 mapping 的 ready/stable 可以短暂降级；只要 `lost=False`、
+`transitioning=False`、位姿和 active-map 新鲜且 floor/epoch 合同有效，目标不应因此被取消。
+`/navigation/recovery_event` 在换层阶段也不应增加 `/exploration/trap_blacklist`。
+
+成功进入下一层后必须同时满足：
+
+```bash
+rostopic echo -n 1 /mapping/current_floor
+rostopic echo -n 1 /mapping/status
+rostopic echo -n 1 /mapping/floors/1/map
+rostopic echo -n 1 /exploration/status
+```
+
+- `/mapping/current_floor` 为 `1`。
+- `/mapping/status` 的 `current_floor` 为 `1`、`map_epoch` 已增加、`stable=True` 且
+  `transitioning=False`。
+- `/mapping/floors/1/map` 已发布，探索状态已离开换层阶段并继续 floor 1 探索。
 
 ## 8. 场景与验收项目
 
@@ -473,6 +608,7 @@ rostopic echo -n 1 /mapping/status
 rostopic echo -n 1 /navigation/health
 rostopic echo -n 1 /localization/pose
 rostopic echo -n 1 /localization/scan
+timeout 5 rostopic hz /localization/depth_obstacle_scan
 rostopic echo -n 1 /move_base/status
 ```
 
@@ -494,6 +630,7 @@ rostopic echo -n 5 /cmd_vel
 
 ```bash
 rostopic hz /localization/scan
+rostopic hz /localization/depth_obstacle_scan
 rostopic hz /localization/odom
 rosrun tf tf_echo odom base
 rosrun tf tf_echo map odom

@@ -8,7 +8,8 @@ import unittest
 
 import rospy
 import rostest
-from danger_search_common.msg import MappingStatus
+from danger_search_common.msg import FloorOccupancyGrid, MappingStatus
+from danger_search_common.srv import SwitchFloor
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
@@ -21,6 +22,7 @@ class MultiFloorPipelineTest(unittest.TestCase):
         self.current_floor = None
         self.mapping_status = None
         self.current_map = None
+        self.active_map = None
         self.floor_maps = {}
         self.raw_pose_pub = rospy.Publisher(
             "/localization/raw_pose",
@@ -30,6 +32,9 @@ class MultiFloorPipelineTest(unittest.TestCase):
         self.mapping_scan_pub = rospy.Publisher(
             "/localization/mapping_scan", LaserScan, queue_size=20
         )
+        self.switch_floor = rospy.ServiceProxy(
+            "/localization/switch_floor", SwitchFloor
+        )
         self.subscribers = [
             rospy.Subscriber(
                 "/mapping/current_floor", Int32, self._floor_callback
@@ -38,6 +43,11 @@ class MultiFloorPipelineTest(unittest.TestCase):
                 "/mapping/status", MappingStatus, self._status_callback
             ),
             rospy.Subscriber("/map", OccupancyGrid, self._map_callback),
+            rospy.Subscriber(
+                "/mapping/active_map",
+                FloorOccupancyGrid,
+                self._active_map_callback,
+            ),
             rospy.Subscriber(
                 "/mapping/floors/0/map",
                 OccupancyGrid,
@@ -49,6 +59,12 @@ class MultiFloorPipelineTest(unittest.TestCase):
                 OccupancyGrid,
                 self._archive_callback,
                 callback_args=1,
+            ),
+            rospy.Subscriber(
+                "/mapping/floors/2/map",
+                OccupancyGrid,
+                self._archive_callback,
+                callback_args=2,
             ),
         ]
 
@@ -63,6 +79,10 @@ class MultiFloorPipelineTest(unittest.TestCase):
     def _map_callback(self, message):
         with self.lock:
             self.current_map = copy.deepcopy(message)
+
+    def _active_map_callback(self, message):
+        with self.lock:
+            self.active_map = copy.deepcopy(message)
 
     def _archive_callback(self, message, floor_id):
         with self.lock:
@@ -130,6 +150,22 @@ class MultiFloorPipelineTest(unittest.TestCase):
                 for item in self.mapping_status.floor_maps
             }
 
+    def _active_map_is(self, floor_id, epoch):
+        with self.lock:
+            if self.active_map is None or self.mapping_status is None:
+                return False
+            version = self._floor_versions().get(floor_id)
+            return (
+                self.active_map.floor_id == floor_id
+                and self.active_map.map_epoch == epoch
+                and version is not None
+                and self.active_map.map_version == version
+                and self.current_map is not None
+                and self.active_map.occupancy_grid.data == self.current_map.data
+                and self.active_map.occupancy_grid.header.stamp
+                == self.current_map.header.stamp
+            )
+
     def _wait_for_stable_floor_version(
         self, floor_id, timeout_s=5.0, quiet_s=0.35
     ):
@@ -152,10 +188,16 @@ class MultiFloorPipelineTest(unittest.TestCase):
 
     def test_switch_and_return_preserve_independent_maps(self):
         self.assertTrue(self._wait_for_connections())
+        rospy.wait_for_service("/localization/switch_floor", timeout=5.0)
 
         self._publish_floor_samples(0.0, 0.0)
         self.assertTrue(self._wait_for(lambda: self._status_is(0, True)))
+        with self.lock:
+            self.assertEqual(self.mapping_status.map_epoch, 1)
+            self.assertFalse(self.mapping_status.transitioning)
+            self.assertAlmostEqual(self.mapping_status.floor_z_m, 0.0)
         self.assertTrue(self._wait_for(lambda: 0 in self.floor_maps))
+        self.assertTrue(self._wait_for(lambda: self._active_map_is(0, 1)))
         floor_zero_version = self._wait_for_stable_floor_version(0)
         self.assertIsNotNone(floor_zero_version)
         with self.lock:
@@ -164,19 +206,28 @@ class MultiFloorPipelineTest(unittest.TestCase):
         self.assertEqual(versions_before.get(0), floor_zero_version)
         self.assertGreaterEqual(versions_before.get(0, 0), 2)
 
-        # A sample halfway between configured landings must not enter either
-        # floor map, and the public mapping state must become unstable.
-        self._publish_sample(1.3, math.pi / 4.0)
-        self.assertTrue(self._wait_for(
-            lambda: self.mapping_status is not None
-            and not self.mapping_status.stable
-            and self.mapping_status.status_reason
-            == "FLOOR_TRANSITION_WAITING_FOR_CURRENT_MAP"
-        ))
+        # Pose height is deliberately not a floor selector in truth mode.
+        # An elevator service transition is the only authority that may move
+        # the active map from floor 0 to floor 1.
+        self._publish_sample(2.6, math.pi / 4.0)
+        self.assertTrue(self._wait_for(lambda: self._status_is(0, True)))
+        switch_one = self.switch_floor(
+            transition_id="elevator-run-1", target_floor=1
+        )
+        switch_one_replay = self.switch_floor(
+            transition_id="elevator-run-1", target_floor=1
+        )
+        self.assertTrue(switch_one.success)
+        self.assertEqual(switch_one.map_epoch, 2)
+        self.assertEqual(switch_one_replay.map_epoch, 2)
 
         self._publish_floor_samples(2.6, math.pi / 2.0)
         self.assertTrue(self._wait_for(lambda: self._status_is(1, True)))
+        with self.lock:
+            self.assertEqual(self.mapping_status.map_epoch, 2)
+            self.assertAlmostEqual(self.mapping_status.floor_z_m, 2.6)
         self.assertTrue(self._wait_for(lambda: 1 in self.floor_maps))
+        self.assertTrue(self._wait_for(lambda: self._active_map_is(1, 2)))
         floor_one_version = self._wait_for_stable_floor_version(1)
         self.assertIsNotNone(floor_one_version)
         versions_floor_one = self._floor_versions()
@@ -189,10 +240,42 @@ class MultiFloorPipelineTest(unittest.TestCase):
         self.assertEqual(current_on_one.data, floor_one.data)
         self.assertNotEqual(floor_zero_before.data, floor_one.data)
 
+        switch_two = self.switch_floor(
+            transition_id="elevator-run-2", target_floor=2
+        )
+        self.assertTrue(switch_two.success)
+        self.assertEqual(switch_two.map_epoch, 3)
+        self._publish_floor_samples(5.2, math.pi)
+        self.assertTrue(self._wait_for(lambda: self._status_is(2, True)))
+        with self.lock:
+            self.assertEqual(self.mapping_status.map_epoch, 3)
+            self.assertAlmostEqual(self.mapping_status.floor_z_m, 5.2)
+        self.assertTrue(self._wait_for(lambda: 2 in self.floor_maps))
+        self.assertTrue(self._wait_for(lambda: self._active_map_is(2, 3)))
+        floor_two_version = self._wait_for_stable_floor_version(2)
+        self.assertIsNotNone(floor_two_version)
+        versions_floor_two = self._floor_versions()
+        self.assertEqual(versions_floor_two.get(2), floor_two_version)
+        self.assertEqual(versions_floor_two.get(0), versions_floor_one.get(0))
+        self.assertEqual(versions_floor_two.get(1), versions_floor_one.get(1))
+        with self.lock:
+            floor_two = copy.deepcopy(self.floor_maps[2])
+            current_on_two = copy.deepcopy(self.current_map)
+        self.assertEqual(current_on_two.data, floor_two.data)
+        self.assertNotEqual(floor_one.data, floor_two.data)
+
+        switch_home = self.switch_floor(
+            transition_id="elevator-run-3", target_floor=0
+        )
+        self.assertTrue(switch_home.success)
+        self.assertEqual(switch_home.map_epoch, 4)
         self._publish_floor_samples(0.0, 0.0)
         self.assertTrue(self._wait_for(lambda: self._status_is(0, True)))
+        with self.lock:
+            self.assertEqual(self.mapping_status.map_epoch, 4)
         returned_floor_zero_version = self._wait_for_stable_floor_version(0)
         self.assertIsNotNone(returned_floor_zero_version)
+        self.assertTrue(self._wait_for(lambda: self._active_map_is(0, 4)))
         versions_after_return = self._floor_versions()
         self.assertEqual(
             versions_after_return.get(0), returned_floor_zero_version
@@ -202,6 +285,9 @@ class MultiFloorPipelineTest(unittest.TestCase):
         )
         self.assertEqual(
             versions_after_return[1], versions_floor_one[1]
+        )
+        self.assertEqual(
+            versions_after_return[2], versions_floor_two[2]
         )
         with self.lock:
             floor_zero_after = copy.deepcopy(self.floor_maps[0])

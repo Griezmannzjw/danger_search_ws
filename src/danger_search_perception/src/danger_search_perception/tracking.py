@@ -12,6 +12,10 @@ class DetectionObservation:
     position: tuple
     confidence: float
     stamp_s: float
+    # A map epoch is a coordinate-system identity, not just a monotonic
+    # timestamp.  A floor can be reloaded or reset while retaining its floor
+    # id, so association must never smooth points from two map instances.
+    map_epoch: int = 0
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,7 @@ class _Track:
     def __init__(self, track_id, observation):
         self.track_id = str(track_id)
         self.floor_id = int(observation.floor_id)
+        self.map_epoch = int(observation.map_epoch)
         self.mean = [float(value) for value in observation.position]
         self.m2 = [0.0, 0.0, 0.0]
         self.hit_count = 1
@@ -113,7 +118,10 @@ class MultiFrameDangerTracker:
             candidate_ids = [set() for _ in observations]
             for observation_index, observation in enumerate(observations):
                 for track in available_tracks:
-                    if track.floor_id != int(observation.floor_id):
+                    if (
+                        track.floor_id != int(observation.floor_id)
+                        or track.map_epoch != int(observation.map_epoch)
+                    ):
                         continue
                     distance = track.distance_to(observation)
                     if distance <= self.config.association_distance_m:
@@ -166,8 +174,10 @@ class MultiFrameDangerTracker:
             self._next_sequence = 1
 
     def _new_track(self, observation):
-        track_id = "danger-f{}-{:04d}".format(
-            int(observation.floor_id), self._next_sequence
+        track_id = "danger-f{}-e{}-{:04d}".format(
+            int(observation.floor_id),
+            int(observation.map_epoch),
+            self._next_sequence,
         )
         self._next_sequence += 1
         track = _Track(track_id, observation)
@@ -205,6 +215,8 @@ class MultiFrameDangerTracker:
             raise ValueError("detection_id cannot be empty")
         if int(observation.floor_id) < 0:
             raise ValueError("floor_id cannot be negative")
+        if int(observation.map_epoch) < 0:
+            raise ValueError("map_epoch cannot be negative")
         if len(observation.position) != 3:
             raise ValueError("position must contain x, y and z")
         values = tuple(observation.position) + (

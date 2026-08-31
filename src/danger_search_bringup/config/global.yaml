@@ -2,6 +2,11 @@
 # 对齐接口规范 v1.1-p0
 # 所有话题、服务、Action、frame统一在这里配置
 
+# ========== 正式运行模式 ==========
+competition_mode: true
+multifloor_enabled: true
+localization_backend: gicp
+
 # ========== 坐标系 ==========
 map_frame: map
 odom_frame: odom
@@ -22,6 +27,8 @@ mission_active_topic: /mission/active
 output_cmd_topic: /cmd_vel
 nav_cmd_topic: /danger_search/nav_cmd_vel
 safety_stop_topic: /danger_search/safety_stop
+elevator_cmd_topic: /danger_search/elevator_cmd_vel
+preflight_ready_topic: /danger_search/preflight_ready
 
 # ========== 传感器话题（来自SimEnv） ==========
 lidar_topic: /livox/Pointcloud2
@@ -48,6 +55,10 @@ cancel_portal_service: /navigation/cancel_portal
 start_mission_service: /danger_search/start
 finish_mission_service: /danger_search/finish
 return_home_service: /danger_search/return_home
+transit_floor_action_name: /danger_search/transit_floor
+switch_floor_service: /localization/switch_floor
+elevator_service: /call_elevator
+door_service: /set_door_state
 exploration_status_topic: /exploration/status
 exploration_complete_topic: /exploration/complete
 

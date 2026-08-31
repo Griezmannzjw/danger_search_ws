@@ -37,10 +37,20 @@ class MappingGate:
         self._lost = True
         self._floor_id = self._fallback_floor_id
         self._valid_floor = True
+        self._transitioning = False
         self._received_s = float("-inf")
         self._epoch = 0
 
-    def update(self, ready, stable, lost, floor_id, received_s):
+    def update(
+        self,
+        ready,
+        stable,
+        lost,
+        floor_id,
+        received_s,
+        transitioning=False,
+        map_epoch=None,
+    ):
         received_s = float(received_s)
         floor_id = int(floor_id)
         if not math.isfinite(received_s):
@@ -51,6 +61,7 @@ class MappingGate:
             bool(lost),
             floor_id,
             floor_id >= 0,
+            bool(transitioning),
         )
         with self._lock:
             previous = (
@@ -59,6 +70,7 @@ class MappingGate:
                 self._lost,
                 self._floor_id,
                 self._valid_floor,
+                self._transitioning,
             )
             self._seen = True
             self._ready = semantic[0]
@@ -66,8 +78,14 @@ class MappingGate:
             self._lost = semantic[2]
             self._floor_id = floor_id
             self._valid_floor = semantic[4]
+            self._transitioning = semantic[5]
             self._received_s = received_s
-            if semantic != previous:
+            if map_epoch is not None:
+                map_epoch = int(map_epoch)
+                if map_epoch < 0:
+                    raise ValueError("map_epoch cannot be negative")
+                self._epoch = map_epoch
+            elif semantic != previous:
                 self._epoch += 1
 
     def snapshot(self, now_s, required=True):
@@ -117,6 +135,10 @@ class MappingGate:
             return MappingSnapshot(
                 self._epoch, self._floor_id, False, "MAPPING_LOST"
             )
+        if self._transitioning:
+            return MappingSnapshot(
+                self._epoch, self._floor_id, False, "MAPPING_TRANSITIONING"
+            )
         if not self._ready:
             return MappingSnapshot(
                 self._epoch, self._floor_id, False, "MAPPING_NOT_READY"
@@ -126,6 +148,63 @@ class MappingGate:
                 self._epoch, self._floor_id, False, "MAPPING_UNSTABLE"
             )
         return MappingSnapshot(self._epoch, self._floor_id, True, "OK")
+
+
+@dataclass(frozen=True)
+class CorrectionSnapshot:
+    """Localization correction version captured for one sensor frame."""
+
+    version: int
+    allowed: bool
+    reason: str
+
+
+class LocalizationCorrectionGate:
+    """Require a fresh correction version and detect mid-frame changes."""
+
+    def __init__(self, status_timeout_s):
+        if not math.isfinite(float(status_timeout_s)) or status_timeout_s <= 0.0:
+            raise ValueError("status_timeout_s must be positive and finite")
+        self.status_timeout_s = float(status_timeout_s)
+        self._lock = threading.RLock()
+        self._seen = False
+        self._version = 0
+        self._received_s = float("-inf")
+
+    def update(self, version, received_s):
+        version = int(version)
+        received_s = float(received_s)
+        if version < 0:
+            raise ValueError("correction version cannot be negative")
+        if not math.isfinite(received_s):
+            raise ValueError("received_s must be finite")
+        with self._lock:
+            changed = self._seen and version != self._version
+            self._seen = True
+            self._version = version
+            self._received_s = received_s
+            return changed
+
+    def snapshot(self, now_s, required=True):
+        now_s = float(now_s)
+        if not math.isfinite(now_s):
+            raise ValueError("now_s must be finite")
+        with self._lock:
+            if not required:
+                return CorrectionSnapshot(self._version, True, "OK")
+            if not self._seen:
+                return CorrectionSnapshot(
+                    self._version, False, "WAITING_FOR_LOCALIZATION_STATUS"
+                )
+            if now_s - self._received_s > self.status_timeout_s:
+                return CorrectionSnapshot(
+                    self._version, False, "LOCALIZATION_STATUS_STALE"
+                )
+            return CorrectionSnapshot(self._version, True, "OK")
+
+    def is_current(self, snapshot, now_s, required=True):
+        current = self.snapshot(now_s, required=required)
+        return current.allowed and current.version == snapshot.version
 
 
 class FloorHeightClassifier:

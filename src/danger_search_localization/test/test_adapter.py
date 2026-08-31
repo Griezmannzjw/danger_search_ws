@@ -16,7 +16,10 @@ from danger_search_localization.adapter_node import (
     LocalVelocityEstimator,
 )
 from danger_search_localization.config import AdapterConfig
-from danger_search_localization.floor_mapping import FloorHeightClassifier
+from danger_search_localization.floor_mapping import (
+    FloorHeightClassifier,
+    FloorSwitchState,
+)
 from danger_search_localization.vertical_estimation import quaternion_to_rpy
 
 
@@ -112,7 +115,13 @@ class TestLocalizationAdapter(unittest.TestCase):
     def test_map_callback_keeps_received_grid_without_deep_copy(self):
         self.adapter.lock = threading.RLock()
         self.adapter.latest_raw_map = None
+        self.adapter.latest_raw_map_identity = None
         self.adapter.last_map_received = rospy.Time(0)
+        self.adapter.last_map_load_time = rospy.Time(0)
+        self.adapter.current_floor = 0
+        self.adapter.map_epoch = 1
+        self.adapter.map_version = 0
+        self.adapter.last_map_stamp = rospy.Time(0)
         message = OccupancyGrid()
         message.header.frame_id = "map"
 
@@ -296,7 +305,7 @@ class TestLocalizationAdapter(unittest.TestCase):
             reason, "FLOOR_TRANSITION_WAITING_FOR_CURRENT_MAP"
         )
 
-    def test_height_transition_changes_floor_without_reusing_old_public_map(self):
+    def test_test_only_height_transition_requires_explicit_opt_in(self):
         self.adapter.multifloor_enabled = True
         self.adapter.floor_classifier = FloorHeightClassifier(
             [0.0, 2.6, 5.2], assignment_tolerance_m=0.45
@@ -314,7 +323,10 @@ class TestLocalizationAdapter(unittest.TestCase):
         self.adapter.last_public_map_published = rospy.Time.from_sec(1.0)
         self.adapter.last_map_update = rospy.Time.from_sec(1.0)
         self.adapter.latest_raw_map = OccupancyGrid()
+        self.adapter.latest_raw_map_identity = (0, 1, 8)
         self.adapter.current_floor_pub = mock.Mock()
+        self.adapter.allow_pose_height_floor_assignment = True
+        self.adapter.explicit_floor_switching = False
 
         self.adapter._observe_floor_height(1.3)
         self.assertTrue(self.adapter.floor_transition_active)
@@ -323,12 +335,13 @@ class TestLocalizationAdapter(unittest.TestCase):
 
         self.assertEqual(self.adapter.current_floor, 1)
         self.assertIsNone(self.adapter.latest_raw_map)
+        self.assertIsNone(self.adapter.latest_raw_map_identity)
         self.assertEqual(self.adapter.map_update_count, 0)
         self.adapter.current_floor_pub.publish.assert_called_once()
         published = self.adapter.current_floor_pub.publish.call_args.args[0]
         self.assertEqual(published.data, 1)
 
-    def test_commanded_floor_override_replaces_unobservable_gicp_height(self):
+    def test_truth_height_cannot_change_floor_without_switch_service(self):
         self.adapter.multifloor_enabled = True
         self.adapter.floor_classifier = FloorHeightClassifier(
             [0.0, 2.6, 5.2], assignment_tolerance_m=0.45
@@ -336,29 +349,64 @@ class TestLocalizationAdapter(unittest.TestCase):
         self.adapter.lock = threading.RLock()
         self.adapter.current_floor = 0
         self.adapter.current_height = 0.0
-        self.adapter.commanded_floor_override = None
+        self.adapter.floor_transition_active = False
+        self.adapter.explicit_floor_switching = True
+        self.adapter.allow_pose_height_floor_assignment = False
+        self.adapter.current_floor_pub = mock.Mock()
+
+        self.adapter._observe_floor_height(2.6)
+
+        self.assertEqual(self.adapter.current_floor, 0)
+        self.assertEqual(self.adapter.current_height, 0.0)
+        self.adapter.current_floor_pub.publish.assert_not_called()
+
+    def test_explicit_floor_switch_retries_do_not_repeat_dependencies(self):
+        self.adapter.multifloor_enabled = True
+        self.adapter.lock = threading.RLock()
+        self.adapter.current_floor = 0
+        self.adapter.current_height = 0.0
+        self.adapter.floor_switch_state = FloorSwitchState([0.0, 2.6, 5.2])
+        self.adapter.map_epoch = 1
         self.adapter.floor_transition_active = False
         self.adapter.floor_transition_baseline_version = 0
         self.adapter.floor_map_versions = {0: 8}
-        self.adapter.map_update_count = 8
         self.adapter.map_version = 8
+        self.adapter.map_update_count = 8
         self.adapter.last_map_stamp = rospy.Time.from_sec(1.0)
         self.adapter.last_map_received = rospy.Time.from_sec(1.0)
         self.adapter.last_public_map_published = rospy.Time.from_sec(1.0)
         self.adapter.last_map_update = rospy.Time.from_sec(1.0)
         self.adapter.latest_raw_map = OccupancyGrid()
-        self.adapter.current_floor_pub = mock.Mock()
-
-        response = self.adapter._set_current_floor_callback(
-            SimpleNamespace(floor_id=1, reason="elevator_0_to_1")
+        self.adapter.latest_raw_map_identity = (0, 1, 8)
+        self.adapter.floor_switch_service_timeout_s = 0.1
+        self.adapter.gicp_rebaseline_service_name = "/gicp/rebaseline"
+        self.adapter.mapper_switch_floor_service_name = "/mapper/switch_floor"
+        self.adapter.gicp_rebaseline = mock.Mock(
+            return_value=SimpleNamespace(success=True, message="scheduled")
         )
-        self.assertTrue(response.accepted)
-        self.assertEqual(self.adapter.current_floor, 1)
-        self.assertEqual(self.adapter.commanded_floor_override, 1)
+        self.adapter.mapper_switch_floor = mock.Mock(
+            return_value=SimpleNamespace(
+                success=True, map_epoch=2, message="switched"
+            )
+        )
+        self.adapter.current_floor_pub = mock.Mock()
+        request = SimpleNamespace(
+            transition_id="elevator-run-1", target_floor=1
+        )
 
-        self.adapter._observe_floor_height(0.0)
+        with mock.patch.object(rospy, "wait_for_service"):
+            first = self.adapter._switch_floor_callback(request)
+            replay = self.adapter._switch_floor_callback(request)
+
+        self.assertTrue(first.success)
+        self.assertTrue(replay.success)
+        self.assertEqual(first.map_epoch, 2)
+        self.assertEqual(replay.map_epoch, 2)
         self.assertEqual(self.adapter.current_floor, 1)
-        self.assertAlmostEqual(self.adapter.current_height, 2.6)
+        self.assertEqual(self.adapter.current_height, 2.6)
+        self.assertTrue(self.adapter.floor_transition_active)
+        self.assertEqual(self.adapter.gicp_rebaseline.call_count, 1)
+        self.assertEqual(self.adapter.mapper_switch_floor.call_count, 1)
 
     def test_floor_map_restores_only_after_fresh_updates(self):
         self.adapter.config = AdapterConfig(min_map_updates_for_stable=2)
@@ -366,13 +414,15 @@ class TestLocalizationAdapter(unittest.TestCase):
         self.adapter.lock = threading.RLock()
         self.adapter.map_frame = "map"
         self.adapter.current_floor = 1
+        self.adapter.map_epoch = 2
         self.adapter.floor_transition_active = True
         self.adapter.floor_transition_baseline_version = 5
         self.adapter.floor_map_versions = {0: 8, 1: 5}
+        self.adapter.floor_map_epochs = {0: 1, 1: 2}
         self.adapter.floor_map_last_updates = {
             0: rospy.Time.from_sec(8.0)
         }
-        self.adapter.floor_last_seen_versions = {0: 8, 1: 5}
+        self.adapter.floor_last_seen_versions = {(0, 1): 8, (1, 2): 5}
         self.adapter.floor_map_load_times = {}
         self.adapter.last_map_received = rospy.Time(0)
         self.adapter.last_map_load_time = rospy.Time(0)
@@ -384,6 +434,7 @@ class TestLocalizationAdapter(unittest.TestCase):
         def envelope(version, stamp):
             message = FloorOccupancyGrid()
             message.floor_id = 1
+            message.map_epoch = 2
             message.map_version = version
             message.occupancy_grid.header.frame_id = "map"
             message.occupancy_grid.header.stamp = rospy.Time.from_sec(stamp)
@@ -406,6 +457,49 @@ class TestLocalizationAdapter(unittest.TestCase):
         self.assertEqual(self.adapter.floor_map_versions[0], 8)
         self.assertEqual(self.adapter.floor_map_versions[1], 7)
         self.assertEqual(publish.call_count, 2)
+
+    def test_old_epoch_map_cannot_poison_new_epoch_version_watermark(self):
+        self.adapter.multifloor_enabled = True
+        self.adapter.lock = threading.RLock()
+        self.adapter.current_floor = 1
+        self.adapter.map_epoch = 3
+        self.adapter.floor_transition_active = False
+        self.adapter.floor_map_versions = {1: 2}
+        self.adapter.floor_map_epochs = {1: 3}
+        self.adapter.floor_map_last_updates = {}
+        self.adapter.floor_last_seen_versions = {(1, 3): 2}
+        self.adapter.floor_map_load_times = {1: rospy.Time.from_sec(3.0)}
+        self.adapter.last_map_received = rospy.Time(0)
+        self.adapter.last_map_load_time = rospy.Time(0)
+        self.adapter.latest_raw_map = None
+        self.adapter.latest_raw_map_identity = None
+        self.adapter.map_version = 2
+        self.adapter.map_update_count = 2
+        self.adapter.last_map_update = rospy.Time(0)
+
+        def envelope(epoch, version, stamp):
+            result = FloorOccupancyGrid()
+            result.floor_id = 1
+            result.map_epoch = epoch
+            result.map_version = version
+            result.occupancy_grid.header.frame_id = "map"
+            result.occupancy_grid.header.stamp = rospy.Time.from_sec(stamp)
+            result.occupancy_grid.info.map_load_time = rospy.Time.from_sec(3.0)
+            return result
+
+        with mock.patch.object(
+            self.adapter, "_publish_cached_map_if_safe"
+        ) as publish, mock.patch.object(
+            rospy.Time, "now", return_value=rospy.Time.from_sec(20.0)
+        ), mock.patch.object(rospy, "logwarn_throttle"):
+            self.adapter._floor_map_callback(envelope(2, 99, 10.0))
+            self.adapter._floor_map_callback(envelope(3, 3, 11.0))
+
+        self.assertEqual(self.adapter.floor_map_epochs[1], 3)
+        self.assertEqual(self.adapter.floor_map_versions[1], 3)
+        self.assertNotIn((1, 2), self.adapter.floor_last_seen_versions)
+        self.assertEqual(self.adapter.floor_last_seen_versions[(1, 3)], 3)
+        publish.assert_called_once()
 
     def test_vertical_state_adds_z_and_tilt_without_replacing_slam_yaw(self):
         self.adapter.config = AdapterConfig(vertical_estimation_enabled=True)
@@ -430,3 +524,47 @@ class TestLocalizationAdapter(unittest.TestCase):
         self.assertAlmostEqual(roll, 0.1)
         self.assertAlmostEqual(pitch, -0.2)
         self.assertAlmostEqual(result_yaw, yaw)
+
+    def test_shutdown_stops_all_adapter_timers(self):
+        self.adapter._shutdown_requested = False
+        self.adapter.pose_timer = mock.Mock()
+        self.adapter.status_timer = mock.Mock()
+
+        self.adapter._on_shutdown()
+
+        self.assertTrue(self.adapter._shutdown_requested)
+        self.adapter.pose_timer.shutdown.assert_called_once_with()
+        self.adapter.status_timer.shutdown.assert_called_once_with()
+
+    def test_shutdown_callbacks_exit_before_touching_messages_or_publishers(self):
+        self.adapter._shutdown_requested = True
+
+        self.adapter._gicp_pose_callback(mock.sentinel.gicp_message)
+        self.adapter._publish_pose_and_tf()
+        self.adapter._publish_status()
+
+    def test_publish_swallows_only_closed_publisher_shutdown_race(self):
+        publisher = mock.Mock()
+        publisher.publish.side_effect = rospy.ROSException("publisher closed")
+        self.adapter._shutdown_requested = False
+
+        with mock.patch.object(
+            rospy, "is_shutdown", side_effect=(False, True)
+        ):
+            published = self.adapter._publish_if_running(
+                publisher, mock.sentinel.message
+            )
+
+        self.assertFalse(published)
+        publisher.publish.assert_called_once_with(mock.sentinel.message)
+
+    def test_publish_preserves_non_shutdown_rospy_exception(self):
+        publisher = mock.Mock()
+        publisher.publish.side_effect = rospy.ROSException("transport failed")
+        self.adapter._shutdown_requested = False
+
+        with mock.patch.object(rospy, "is_shutdown", return_value=False):
+            with self.assertRaises(rospy.ROSException):
+                self.adapter._publish_if_running(
+                    publisher, mock.sentinel.message
+                )

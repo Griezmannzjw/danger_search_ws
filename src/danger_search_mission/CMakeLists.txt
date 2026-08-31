@@ -5,6 +5,7 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   std_msgs
   geometry_msgs
+  sensor_msgs
   std_srvs
   actionlib
   actionlib_msgs
@@ -19,6 +20,7 @@ catkin_package(
   rospy
   std_msgs
   geometry_msgs
+  sensor_msgs
   std_srvs
   actionlib
   actionlib_msgs
@@ -32,6 +34,7 @@ include_directories(
 
 catkin_install_python(PROGRAMS
   scripts/mission_manager.py
+  scripts/validate_result.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
@@ -39,5 +42,7 @@ if(CATKIN_ENABLE_TESTING)
   find_package(rostest REQUIRED)
   catkin_add_nosetests(test/test_mission_core.py)
   catkin_add_nosetests(test/test_mission_contract.py)
+  catkin_add_nosetests(test/test_entry_core.py)
+  catkin_add_nosetests(test/test_validate_result_cli.py)
   add_rostest(test/mission_smoke.test)
 endif()

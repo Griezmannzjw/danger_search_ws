@@ -9,13 +9,17 @@ from danger_search_perception.tracking import (
 )
 
 
-def observation(detection_id, x, y, z, floor_id, stamp_s, confidence=0.9):
+def observation(
+    detection_id, x, y, z, floor_id, stamp_s, confidence=0.9,
+    map_epoch=0,
+):
     return DetectionObservation(
         detection_id=detection_id,
         floor_id=floor_id,
         position=(x, y, z),
         confidence=confidence,
         stamp_s=stamp_s,
+        map_epoch=map_epoch,
     )
 
 
@@ -62,6 +66,19 @@ class TestMultiFrameDangerTracker(unittest.TestCase):
         self.assertNotEqual(floor_zero.track_id, floor_one.track_id)
         self.assertTrue(floor_zero.track_id.startswith("danger-f0-"))
         self.assertTrue(floor_one.track_id.startswith("danger-f1-"))
+
+    def test_same_floor_new_map_epoch_never_reuses_old_track(self):
+        old_context = self.tracker.update([
+            observation("before-reset", 1.0, 1.0, 0.2, 0, 0.0, map_epoch=7)
+        ])[0]
+        new_context = self.tracker.update([
+            observation("after-reset", 1.0, 1.0, 0.2, 0, 0.1, map_epoch=8)
+        ])[0]
+
+        self.assertNotEqual(old_context.track_id, new_context.track_id)
+        self.assertIn("-e7-", old_context.track_id)
+        self.assertIn("-e8-", new_context.track_id)
+        self.assertFalse(new_context.confirmed)
 
     def test_far_observation_creates_new_track(self):
         first = self.tracker.update([

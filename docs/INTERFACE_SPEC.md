@@ -1,223 +1,159 @@
-# P0 最小可运行接口规范
-## 1. 文档范围
-- 版本：`v1.1-p0`
-- 日期：`2026-07-26`
-- 目标：冻结单楼层最小可运行、可检测、可结束和可评分闭环。
+# P1 多楼层比赛接口规范
+
+版本：`v2.0-p1`；适用入口：`danger_search_bringup/competition.launch`。
+
+## 1. 模式和输入边界
+
+正式模式必须同时满足：
+
 ```text
-任务启动
-  -> 当前层定位与占据地图
-  -> 地图内自由候选和真实路径查询
-  -> 导航执行与安全停车
-  -> 基础危险源检测
-  -> map 到 world 坐标转换
-  -> 任务结束和结果落盘
-  -> 官方 evaluator 可解析
+competition_mode=true
+multifloor_enabled=true
+localization_backend=gicp
+ENABLE_REFEREE_ODOM=0
+ENABLE_GROUND_TRUTH=0
+POINTCLOUD_USE_GROUND_TRUTH_ODOM=0
 ```
-本规范只要求下文标出的 P0 字段具有约定语义。未要求字段使用类型合法的默认值，P0 消费方不得依赖这些字段决策。
-## 2. 模块边界
-| 模块 | P0 职责 |
-|------|---------|
-| localization | 唯一发布当前 `map` 位姿、`map -> odom -> base` TF 和当前层二维占据地图 |
-| exploration | 从地图生成合法候选，调用 `make_plan` 校验，并向 `/move_base` 发送或取消目标 |
-| navigation | 唯一提供任务导航入口、路径查询和 `MoveBaseAction`，发布 `/danger_search/nav_cmd_vel`，不直接发布 `/cmd_vel` |
-| control | 对导航速度进行安全仲裁、超时停车和加速度限制，唯一发布最终 `/cmd_vel` |
-| perception | 从允许的 RGB/深度输入发布基础检测和检测器健康状态 |
-| mission | 编排任务启停，汇总、过滤、去重和转换检测，唯一写入比赛结果文件 |
-| bringup | 通过 `competition.launch` 拉起上述模块并加载统一配置 |
-用户只通过 `/danger_search/start` 启动整个任务。`/danger_search/start_exploration` 和 `/danger_search/stop_exploration` 是 mission 编排及模块级控制接口，不是另一套任务入口。
-## 3. P0 话题
-### 3.1 定位与地图
-| 话题 | 类型 | 发布者 | 最低要求 |
-|------|------|--------|----------|
-| `/tf` | `tf2_msgs/TFMessage` | localization | 唯一、连续提供 `map -> odom -> base`，建议不低于 `10 Hz` |
-| `/localization/pose` | `geometry_msgs/PoseWithCovarianceStamped` | localization | 有效采集时间、`frame_id=map`、当前位置、合法四元数和数值合法的协方差，建议不低于 `10 Hz` |
-| `/map` | `nav_msgs/OccupancyGrid` | localization | 当前单楼层地图，至少 `1 Hz`/变化时发布，或使用 latch 保证新订阅者取得最新地图 |
-| `/mapping/status` | `danger_search_common/MappingStatus` | localization | 至少真实提供 `ready`、`stable`、`lost`、`current_floor` 和 `status_reason` |
-`/map` 固定使用标准编码：`-1=UNKNOWN`、`0=FREE`、`100=OCCUPIED`。P0 中 `current_floor=0`。地图必须提供可用于选点的已知自由区域；全未知地图不满足该接口语义。
-TF 链中 `odom -> base` 应平滑连续，`map -> odom` 承担 SLAM 坐标校正。localization 是该链的唯一发布方，其他导航或定位实现不得重复发布同一变换。P0 不要求真实在线协方差估计；若 `/localization/pose` 使用保守占位协方差，必须在 `/mapping/status.status_reason` 或配置中明确。
-localization 只能使用第 7 章允许的传感器输入。`/danger_search/cmd_vel_sent` 或其他速度命令可以用于诊断，但不得作为正式里程计来源，因为命令速度不代表机器人实际运动。
-exploration 只有在以下条件同时成立时才能发目标：
-- 已收到有效地图和位姿。
-- `mapping_status.ready=true`、`stable=true`、`lost=false`。
-- 候选位于当前地图范围内且对应已知自由栅格。
-- `/move_base/make_plan` 可用并为候选返回非空路径。
-- `/move_base` Action server 可用。
-### 3.2 导航与控制
-| 话题 | 类型 | 发布者 | 最低要求 |
-|------|------|--------|----------|
-| `/navigation/health` | `danger_search_common/NavigationHealth` | navigation | 至少真实提供 `ready`、`controller_active`、`has_active_goal`、`stuck` 和 `failure_code` |
-| `/navigation/recovery_event` | `danger_search_common/RecoveryEvent` | navigation | 恢复触发/成功/失败、动作、尝试次数、卡死与目标位姿、计划/实际距离和最小净空 |
-| `/danger_search/nav_cmd_vel` | `geometry_msgs/Twist` | navigation | 导航期望速度，只供 control 消费 |
-| `/cmd_vel` | `geometry_msgs/Twist` | control | 发送给机器人控制器的最终速度，control 是唯一发布者 |
-P0 沿用 `/danger_search/nav_cmd_vel` 和 `geometry_msgs/Twist`，不新增 `/navigation/cmd_vel`，也不改为 `TwistStamped`。只能有一套正式 navigation/control 链路对外提供 `/move_base` 和 `/cmd_vel`，禁止多个节点争抢速度输出或重复提供任务导航入口。
-取消、超时、失败或 stop 后，navigation 必须停止旧目标的速度输出，control 必须在配置的命令超时内发布零速度。`/navigation/global_path`、`/navigation/local_trajectory`、`/navigation/footprint`、`/navigation/trap_blacklist`、`/exploration/observation_goals`、`/exploration/trap_blacklist` 和 `/danger_search/cmd_vel_sent` 可作为诊断接口，但不属于 P0 核心契约。
-### 3.3 危险源感知
-| 话题 | 类型 | 发布者 | 最低要求 |
-|------|------|--------|----------|
-| `/danger_detector/detections` | `danger_search_common/DangerSourceArray` | perception | 发布危险源和干扰源检测数组，数组字段为 `dangers` |
-| `/danger_detector/status` | `danger_search_common/DetectionStatus` | perception | 至少真实提供 `ready`、`input_fresh` 和 `status_reason` |
-P0 中单个 `DangerSource` 必须有效的字段：
-| 字段 | P0 语义 |
-|------|---------|
-| `detection_id` | 单次检测唯一 ID |
-| `class_id` | `0=UNKNOWN`、`1=DANGER_RED_SPHERE`、`2=DISTRACTOR_RED_CUBE`、`3=DISTRACTOR_GREEN_SPHERE` |
-| `position` | 带有效时间戳和真实 `frame_id` 的三维位置 |
-| `floor_id` | P0 固定为 `0` |
-| `confidence` | `0..1` 的基础检测置信度 |
-| `source_time` | 原始检测时间 |
-`track_id`、位置协方差、确认、复核、疑似重复和定位修正版本字段可以保留默认值，P0 消费方忽略其后续阶段语义。`DangerSourceArray.dangers` 允许为空，表示本次消息没有检测结果；空数组不表示观察或探索完成。
-### 3.4 任务状态
-| 话题 | 类型 | 发布者 | 模式 | 最低要求 |
-|------|------|--------|------|----------|
-| `/mission/status` | `danger_search_common/MissionStatus` | mission | latch | 真实提供 `mission_state`、`current_floor`、`start_time`、`elapsed_time`、`scored_exploration_time` 和 `finish_reason` |
-| `/mission/active` | `std_msgs/Bool` | mission | latch | 任务成功启动后为 true，完成或错误停止后为 false |
-P0 的 `mission_state` 至少使用 `IDLE`、`EXPLORING`、`FINISHED` 和 `ERROR`。覆盖率、拓扑债务、房间可见域、剩余前沿和定位修正版本字段不是 P0 硬要求。
-## 4. P0 Action 与服务
-### 4.1 `/move_base`
-- 类型：`move_base_msgs/MoveBaseAction`
-- 提供方：navigation
-- 消费方：exploration
-- 用途：exploration 的唯一任务导航目标入口；不使用 `/danger_search/exploration_goal` 作为执行接口。
-- 目标：有效时间戳、`frame_id=map`、地图内已验证自由位姿。
-标准 `MoveBaseAction` 使用 actionlib `GoalStatus` 表达终态：
-- `SUCCEEDED`：到达目标。
-- `ABORTED`：执行失败。
-- `PREEMPTED`：目标被取消。
-`MoveBaseResult` 本身没有团队自定义结果码。细分原因通过 action status text 或 `/navigation/health.failure_code` 表达，并使用 `/navigation/health.active_goal_id` 与对应 Action GoalID 关联。P0 的 `failure_code` 固定为：
+
+允许输入为官方激光、IMU、RGB-D 话题，`/call_elevator`、`/set_door_state` 和公开的
+`team_scene_info.json`。禁止读取 `/Odometry_gazebo`、`/gazebo/link_states`、
+`/ground_truth/*`、layout、building config、scene manifest、world 和危险源真值。
+`gazebo_truth` 只能由 `simulation_truth.launch` 在 `competition_mode=false` 中使用，
+且其结果永远不具备正式验收资格。
+
+## 2. 模块所有权
+
+| 模块 | 所有权 |
+|---|---|
+| localization | 唯一发布 `map -> odom -> base`；维护分层地图和 `map_epoch` |
+| navigation | 唯一提供 `/move_base`、`make_plan` 和有界恢复；只输出 nav cmd |
+| control | 唯一发布 `/cmd_vel`；仲裁 safety/elevator/navigation |
+| exploration | WFD 选点、每层完成状态、served-floor 调度和 TransitFloor server |
+| perception | 红球 RGB-D 三维候选与绑定楼层/epoch 的短时跟踪 |
+| mission | 唯一任务终态、跨层返航、结果坐标转换和文件写入 |
+| bringup/preflight | 统一参数并对正式 ROS graph 执行 fail-closed 检查 |
+
+## 3. 定位与建图
+
+`MappingStatus` 必须真实填写：
+
+- `ready`、`stable`、`lost`、`current_floor`
+- `transitioning`：换层时为 true，且此时 `stable=false`
+- `map_epoch`：每次真实切图/重置单调增加
+- `floor_z_m`：`floor_id * floor_height_m`
+- `floor_maps[]`：各层地图版本与更新时间
+
+localization 必须将同一份占据图同时发布为 `/map` 和锁存的
+`/mapping/active_map: FloorOccupancyGrid`；后者必须填写完全匹配的
+`floor_id/map_epoch/map_version`。过渡期不得重发旧层地图。
+消费者对 `floor_id/map_epoch` 做严格相等检查；同 epoch 内，已核验快照的
+`map_version` 允许因三条独立 ROS 连接短暂落后于 MappingStatus 最新版本，但必须为正、
+单调且不得领先。不得用瞬时版本完全相等作为持续建图时的规划门禁。
+
+`SwitchFloor.srv`：
+
 ```text
-NONE
-SUCCEEDED
-UNREACHABLE
-CANCELED
-TIMEOUT
-CONTROL_FAILED
-SAFETY_STOP
-ROBOT_FALLEN
-LOCALIZATION_LOST
+Request:  string transition_id, int32 target_floor
+Response: bool success, uint64 map_epoch, string message
 ```
-exploration 必须处理成功、失败、取消和目标超时。失败候选不得立即无限重试；stop 时必须取消活动目标。
-### 4.2 导航路径查询
-| 服务 | 类型 | 提供方 | P0 语义 |
-|------|------|--------|----------|
-| `/move_base/make_plan` | `nav_msgs/GetPlan` | navigation | 使用与实际导航一致的地图、机器人尺寸和障碍配置判断可达性 |
-请求的 start 和 goal 必须位于 `map` 坐标系。只有返回非空 `nav_msgs/Path` 的候选可以发送给 `/move_base`。服务不可用、超时或返回空路径时，exploration 跳过该候选并记录原因。
-服务必须根据实际导航使用的地图和障碍判断可达性，不能无条件返回起点到终点的直线。`/move_base/clear_costmaps` 属于后续恢复能力，不是 P0 核心。
-### 4.3 exploration 模块服务
-| 服务 | 类型 | 提供方 | P0 语义 |
-|------|------|--------|----------|
-| `/danger_search/start_exploration` | `std_srvs/Trigger` | exploration | 进入探索；输入未就绪时进入等待，不盲目发目标 |
-| `/danger_search/stop_exploration` | `std_srvs/Trigger` | exploration | 停止选点、取消活动目标并禁止旧回调继续发目标 |
-重复 start/stop 必须返回可预测结果。start 前 exploration 不得发送目标。
-### 4.4 mission 服务
-| 服务 | 类型 | 提供方 | P0 语义 |
-|------|------|--------|----------|
-| `/danger_search/start` | `std_srvs/Trigger` | mission | 初始化状态和计时，调用模块级 start，成功后激活任务 |
-| `/danger_search/finish` | `std_srvs/Trigger` | mission | 停止探索、冻结计分时间、写入结果并结束任务 |
-start 必须遵循：
-1. 拒绝重复启动或返回明确的幂等成功。
-2. 初始化检测汇总、开始时间和任务状态。
-3. 调用 `/danger_search/start_exploration`。
-4. 只有模块级 start 成功后才发布 `EXPLORING` 和 `/mission/active=true`。
-finish 必须遵循：
-1. 调用 `/danger_search/stop_exploration` 并确保活动导航目标已取消。
-2. 冻结 `exploration_time`。
-3. 完成过滤、去重和 `world` 坐标转换。
-4. 原子或等价可靠地写入结果文件。
-5. 写入成功后发布 `FINISHED` 和 `/mission/active=false`。
-6. 写入失败时返回失败并发布 `ERROR`，不能报告成功完成。
-重复 finish 不得重复计时、重复追加检测或破坏已写结果。P0 允许人工调用 finish；自动收敛结束属于后续阶段。`600 s` 是评分阈值，不是自动 finish 的硬截止。
-## 5. 坐标契约
-### 5.1 机器人定位 TF
+
+相同 transition ID 与目标的重试必须返回同一 epoch。切换时保存旧层地图，保持电梯井
+平面 x/y/yaw，重建 GICP 扫描参考，切换/恢复目标层地图。目标层至少出现两个新地图版本、
+定位健康且连续稳定后才可导航。
+
+## 4. 导航和速度
+
+普通目标只经 `/move_base`。所有 Action 结果、恢复事件和 plan generation 必须绑定 goal
+ID/epoch，旧 goal 的迟到结果不能修改新 goal 的 attempt 或 blacklist。
+
+`NavigationHealth` 同时发布 `current_floor/map_epoch/map_version/transitioning`。navigation
+只在 `/map` 与 active-map 签名一致、MappingStatus 身份匹配，且当前 epoch 的
+`/move_base/clear_costmaps` 成功后才设 `ready=true`。其中 `map_version` 是通过该门禁的
+已提交快照版本，不是尚未匹配 envelope 的 MappingStatus 最新值。navigation 是换层
+costmap reset 的唯一所有者。
+
+control 固定优先级：
+
 ```text
-map -> odom -> base
+safety stop > /danger_search/elevator_cmd_vel 短租约 > /danger_search/nav_cmd_vel
 ```
-ROS 坐标约定为 X 向前、Y 向左、Z 向上。所有空间消息必须携带真实 `frame_id` 和有效时间戳。
-### 5.2 `map -> world` 结果转换
-`map` 是 SLAM 坐标系，不能默认等于 Gazebo `world`。最终结果必须使用三维 `world` 坐标。
-若 `map` 与 `world` 不重合，采用以下一种正式方案并在 launch 中固定：
-1. localization 发布 `world -> map` TF；或
-2. mission 使用允许读取的 `generated_building/team_scene_info.json` 起点建立等价静态变换。
-转换来源只能是公开起点和本队定位。不得读取 Gazebo 真值位姿、完整 world、布局元数据或危险源真值建立变换。mission 负责把检测时间对应的源坐标转换到 `world`；转换不可用时不得只修改 `frame_id` 或静默写入 map 坐标。
-## 6. 检测汇总与结果文件
-mission 是结果文件唯一写入方。P0 最低规则：
-- 只有 `class_id=1` 的红色球体候选可以进入危险源结果。
-- UNKNOWN、红方块和绿球不得写入危险源列表。
-- 同一 `detection_id` 不得重复写入。
-- 对空间距离明显重复的检测执行基础合并；阈值从配置读取。
-- 只有成功转换为 `world` 的三维位置可以落盘。
-结果文件格式：
+
+control 是 `/cmd_vel` 唯一发布者。DWA 与 control 的加速度联合合同为 x/y/yaw
+`3.0/2.0/8.0`；每轴禁止单周期跨零反向。Unitree 恢复插件只在 move_base 内执行有限的
+完整 footprint 扫掠，goal/cancel/safety epoch 改变会立即使旧恢复失效。
+
+## 5. TransitFloor Action
+
+```text
+Goal:     int32 target_floor, bool exit_to_hall
+Feedback: string phase, int32 current_floor, float32 progress, uint64 map_epoch
+Result:   bool success, int32 reached_floor, uint64 map_epoch,
+          string failure_code, string message
+```
+
+状态顺序为：
+
+```text
+TO_HALL -> OPEN_CURRENT -> VERIFY_HALL -> ENTER -> CLOSE_CURRENT
+-> CALL_TARGET -> SWITCH_FLOOR -> EXIT -> WAIT_STABLE
+```
+
+厅导航时限由路径长度计算且不超过 180 s；门/电梯服务各 40 s；进、出轿厢各 20 s；
+稳图 15 s。阻塞服务在工作线程执行，取消/超时后用 generation 丢弃迟到结果。任何失败都
+取消普通 goal、停止电梯租约速度、确认最终输出归零，并只推进一次候选索引。
+
+固定失败码：
+
+```text
+NO_HALL UNREACHABLE_HALL SERVICE_UNAVAILABLE SERVICE_REJECTED
+SERVICE_TIMEOUT ENTER_FAILED FLOOR_MISMATCH MAP_NOT_STABLE EXIT_FAILED
+CANCELED STALE_EPOCH
+```
+
+## 6. 探索和任务完成
+
+前沿检测按 `map_epoch/map_version` 缓存，只遍历机器人可达已知区域。每层独立保存
+frontier、失败 goal、trap blacklist、完成状态。地图稳定且连续 10 s 无可达 frontier 后
+才完成该层。`/exploration/complete=true` 只在全部公开 served floors 完成后发布。
+
+Mission 保存 `home_floor=0` 和起点位姿。覆盖完成、FinishMission、ReturnHome 或任务超时
+都先停止探索；若不在 0 层，调用同一个 TransitFloor 回 0 层并出轿厢，再发送 home goal。
+成功条件为位置误差 `<=0.5 m`、yaw `<=20 deg`、导航不活动且实际下发速度连续 2 s 为零。
+只有此后才能冻结计时、写结果并进入 FINISHED；失败进入 ERROR。
+
+## 7. 感知一致性
+
+`DangerSource` 必须填写 `floor_id`、`map_epoch` 和
+`localization_correction_version`。换层、地图不稳定、epoch 不匹配或定位修正版本改变时，
+观测不得进入本轮轨迹；修正版本改变会清理旧的短时关联。Mission 只接受与当前
+`MappingStatus` 同 floor/epoch 的确认红球。
+
+## 8. 结果文件
+
+Mission 是结果文件唯一写入方。任务开始原子写空 `RUNNING` 文档；任务结束原子写：
+
 ```json
 {
   "exploration_time": 98.76,
+  "coordinate_frame": "world",
+  "mission_status": "FINISHED",
+  "run_profile": "formal",
+  "localization_backend": "gicp",
+  "official_eligible": true,
   "detected_danger_sources": [
     {"position": [2.34, -1.56, 0.25]}
   ]
 }
 ```
-结果路径必须由 launch/YAML 解析为唯一绝对路径，并指向 `simenvnew` 约定的 `results/detected_danger.json`，不能依赖 roslaunch 时的当前工作目录。
-结果格式必须兼容 `simenvnew` 官方 evaluator。真值文件只能由独立 evaluator 读取，不能进入 localization、exploration、navigation、perception、control 或 mission。
-## 7. 官方输入边界
-P0 模块可按职责使用以下 `simenvnew` 输入：
-| 输入 | 类型 |
-|------|------|
-| `/scan` | `sensor_msgs/PointCloud` |
-| `/livox/Pointcloud2` | `sensor_msgs/PointCloud2` |
-| `/livox/lidar2` | `unitree_guide/CustomMsg` |
-| `/trunk_imu` | `sensor_msgs/Imu` |
-| `/livox/imu` | `sensor_msgs/Imu` |
-| `/real_sense/rgb/image_raw` | `sensor_msgs/Image` |
-| `/real_sense/rgb/camera_info` | `sensor_msgs/CameraInfo` |
-| `/real_sense/depth/image_raw` | `sensor_msgs/Image` |
-| `/real_sense/depth/camera_info` | `sensor_msgs/CameraInfo` |
-| `/real_sense/depth/points` | `sensor_msgs/PointCloud2` |
-| `generated_building/team_scene_info.json` | 公开场景信息文件 |
-正式节点禁止读取：
-- `/Odometry_gazebo`
-- `/ground_truth/*`
-- `generated_building/layout_metadata.json`
-- `generated_building/building_config.json`
-- `generated_building/scene_manifest.json`
-- `generated_building/competition_scene.world`
-- `generated_building/danger_truth.json`
-- `results/danger_truth.json`
-## 8. 启动与参数
-`danger_search_bringup/launch/competition.launch` 必须拉起 localization、perception、navigation、exploration、control 和 mission。话题、服务、Action、frame、超时和结果路径必须由 launch/YAML 参数或 remap 配置，不能在节点中另行硬编码同一接口。
-P0 至少统一配置：
-```yaml
-map_topic: /map
-pose_topic: /localization/pose
-mapping_status_topic: /mapping/status
-navigation_health_topic: /navigation/health
-detections_topic: /danger_detector/detections
-detection_status_topic: /danger_detector/status
-move_base_action_name: /move_base
-make_plan_service: /move_base/make_plan
-start_service: /danger_search/start_exploration
-stop_service: /danger_search/stop_exploration
-map_frame: map
-world_frame: world
-result_file: /absolute/path/to/simenvnew/results/detected_danger.json
-```
-README、launch、YAML、代码读取位置和运行时 ROS graph 中的名称必须一致。
 
-## 9. 可选电梯联调扩展
+必要字段仍为 `exploration_time` 和 `detected_danger_sources[].position`。`auto` 帧策略只读
+公开 scene contract：声明 world 时对起点相对点执行 `Rz(yaw0)*p+t0`；否则输出
+`start_relative`。零目标必须是空数组，不能保留上次任务结果。
+正式验收还必须通过 `validate_result.py --official`；真值 profile 会被强制拒绝。
 
-本节是默认关闭的 S3/P3 联调扩展，不改变 P0 启动和验收依赖。
+## 9. 正式预检
 
-| 接口 | 类型 | 提供/调用方 | 语义 |
-|------|------|-------------|------|
-| `/danger_search/start_elevator` | `std_srvs/Trigger` | exploration 提供 | 使用当前参数目标楼层和已确认入口位姿启动一次电梯任务 |
-| `/danger_search/cancel_elevator` | `std_srvs/Trigger` | exploration 提供 | 取消活动导航目标并使门梯状态机有限退出 |
-| `/set_door_state` | `building_generator_interfaces/SetDoorState` | exploration 调用 | 打开或关闭当前/目标楼层电梯厅门 |
-| `/call_elevator` | `building_generator_interfaces/CallElevator` | exploration 调用 | 把 `elevator_main` 移动到当前层或目标层 |
-| `/navigation/traverse_portal` | `danger_search_common/TraversePortal` | navigation 提供、exploration 调用 | 在有界速度和时长内穿越门槛；navigation 仍是 `/danger_search/nav_cmd_vel` 的唯一来源 |
-| `/navigation/cancel_portal` | `std_srvs/Trigger` | navigation 提供、exploration 调用 | 立即停止活动门槛穿越并发布零导航速度 |
-| `/localization/set_current_floor` | `danger_search_common/SetCurrentFloor` | localization 提供、exploration 调用 | 仅在 `/call_elevator` 已确认目标层后切换 GICP 分层地图；这是命令确认，不是真值输入 |
-
-状态机顺序固定为：厅前导航、呼梯到当前层、开当前层门、有界门槛穿越进入轿厢、关门、换层、确认 localization 当前层、开目标层门、等待 `current_floor` 与地图稳定、有界门槛穿越离开轿厢。每个导航、服务、门动作、换层和地图恢复步骤必须有独立超时；stop 或 cancel 必须取消 Action 和门槛穿越，迟到服务结果不得重新激活旧任务。
-
-`elevator/portal_pose=[x,y,yaw]` 中 yaw 从厅内指向轿厢。入口位姿可由允许传感器确认后写入参数；为空时只允许在人工已确认最近成功前沿就是电梯门槛的隔离联调中复用该前沿。正式算法不得读取布局、电梯配置、世界文件或真值来获取入口坐标。
-
-启用 `elevator/autonomous_when_floor_complete` 后，探索仅在当前层满足既有稳定收敛条件时把该层记为完成，并从公开参数 `elevator/served_floors` 中选择最近的未完成楼层。楼层列表不得由生成场景、world 或真值推断；自主流程必须显式配置 `portal_pose`，手动 `/danger_search/start_elevator` 才保留最近成功前沿的隔离联调回退。`/exploration/complete=true` 只在全部 `served_floors` 完成后发布；换层边失败达到 `elevator/max_autonomous_transition_failures` 时保持全局未完成并进入 `autonomous_floor_transition_unavailable`。`/exploration/status` 同步发布 `served_floors`、`visited_floors`、`completed_floors`、`next_autonomous_floor` 和逐边失败计数。
-
-GUI=false 固定种子联调确认：动态厅门和轿厢会使二维 GICP 在门槛处发生瞬时平移/偏航漂移，不能用 `move_base` 的绝对轿厢目标作为唯一进出梯机制。当前基线由 navigation 对进入方向执行 `0.25 m/s`、`3.0 s` 的限时穿越，经过 control 的速度上限、超时和安全仲裁；普通场景仍由 `move_base` 控制。
+预检至少验证：强类型服务可导入且 ROS 服务类型匹配、服务存在、传感器/状态话题类型、
+`/mapping/active_map` 与 `/navigation/health` 的消息类型、`map -> base` TF、结果目录可写、
+正式参数一致、没有禁止订阅/文件参数，以及 `/cmd_vel` 唯一发布者为 `/control`。失败时
+required 节点退出，整个正式 launch 终止。

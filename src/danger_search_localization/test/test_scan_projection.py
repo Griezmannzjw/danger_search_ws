@@ -52,13 +52,19 @@ class TestScanProjection(unittest.TestCase):
         self.assertAlmostEqual(float(ranges[zero_bin]), 1.01, places=5)
 
     def test_short_range_outlier_does_not_hide_supported_wall(self):
+        config = ScanProjectionConfig(
+            **{
+                **self.config.__dict__,
+                "min_returns_per_bin": 2,
+            }
+        )
         points = np.array(
             [[0.5, 0.0, 0.5], [3.0, 0.0, 0.5], [3.04, 0.0, 0.5]]
         )
 
-        ranges = project_planar_scan(points, self.config)
+        ranges = project_planar_scan(points, config)
 
-        zero_bin = int((0.0 - self.config.angle_min) / self.config.angle_increment)
+        zero_bin = int((0.0 - config.angle_min) / config.angle_increment)
         self.assertAlmostEqual(float(ranges[zero_bin]), 3.02, places=5)
 
     def test_height_and_range_filters_are_applied(self):
@@ -123,11 +129,26 @@ class TestScanProjection(unittest.TestCase):
         )
 
     def test_single_return_bin_is_rejected(self):
+        config = ScanProjectionConfig(
+            **{
+                **self.config.__dict__,
+                "min_returns_per_bin": 2,
+            }
+        )
         points = np.array([[1.0, 0.0, 0.5]])
 
-        ranges = project_planar_scan(points, self.config)
+        ranges = project_planar_scan(points, config)
 
         self.assertTrue(np.isinf(ranges).all())
+
+    def test_default_single_return_bin_is_retained(self):
+        config = ScanProjectionConfig()
+        points = np.array([[1.0, 0.0, 0.5]])
+
+        ranges = project_planar_scan(points, config)
+
+        zero_bin = int((0.0 - config.angle_min) / config.angle_increment)
+        self.assertAlmostEqual(float(ranges[zero_bin]), 1.0, places=5)
 
     def test_isolated_hit_is_rejected_but_continuous_surface_remains(self):
         config = ScanProjectionConfig(
@@ -142,6 +163,7 @@ class TestScanProjection(unittest.TestCase):
             self_exclusion_max_x=0.1,
             self_exclusion_half_width_y=0.1,
             min_returns_per_bin=1,
+            enable_isolated_hit_filter=True,
             neighbor_window_bins=2,
             max_neighbor_range_jump=0.5,
         )

@@ -2,7 +2,7 @@
 """Open the official main entrance and publish a latched readiness signal."""
 
 import rospy
-import rosservice
+from building_generator_interfaces.srv import SetDoorState, SetDoorStateRequest
 from std_msgs.msg import Bool
 
 
@@ -13,6 +13,7 @@ def main():
     enabled = bool(rospy.get_param("~enabled", True))
     retry_period_s = float(rospy.get_param("~retry_period_s", 1.0))
     ready_pub = rospy.Publisher("/entrance/ready", Bool, queue_size=1, latch=True)
+    door_client = rospy.ServiceProxy(service_name, SetDoorState)
     ready_pub.publish(Bool(data=not enabled))
 
     if not enabled:
@@ -23,13 +24,8 @@ def main():
     while not rospy.is_shutdown():
         try:
             rospy.wait_for_service(service_name, timeout=retry_period_s)
-            service_type = rosservice.get_service_class_by_name(service_name)
-            if service_type is None:
-                raise rospy.ROSException("service type is unavailable")
-            request = service_type._request_class()
-            request.door_id = door_id
-            request.open = True
-            response = rospy.ServiceProxy(service_name, service_type)(request)
+            request = SetDoorStateRequest(door_id=door_id, open=True)
+            response = door_client(request)
             if response.accepted:
                 ready_pub.publish(Bool(data=True))
                 rospy.loginfo(

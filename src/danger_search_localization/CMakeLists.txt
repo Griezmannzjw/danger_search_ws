@@ -53,6 +53,7 @@ install(TARGETS lidar_odometry_node
 catkin_install_python(PROGRAMS
   scripts/pose_estimator.py
   scripts/scan_projector.py
+  scripts/depth_obstacle_projector.py
   scripts/occupancy_mapper.py
   scripts/gazebo_truth_odometry.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
@@ -69,6 +70,7 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_pose_filter.py)
   catkin_add_nosetests(test/test_pose_fusion.py)
   catkin_add_nosetests(test/test_scan_projection.py)
+  catkin_add_nosetests(test/test_depth_obstacle_projection.py)
   catkin_add_nosetests(test/test_occupancy_mapping.py)
   catkin_add_nosetests(test/test_vertical_estimation.py)
   catkin_add_nosetests(test/test_gazebo_truth.py)

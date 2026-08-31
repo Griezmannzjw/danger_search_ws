@@ -45,51 +45,159 @@ class StandardNavigationConfigTest(unittest.TestCase):
         self.assertEqual(config["base_global_planner"], "navfn/NavfnROS")
         self.assertEqual(
             config["base_local_planner"],
-            "base_local_planner/TrajectoryPlannerROS",
+            "dwa_local_planner/DWAPlannerROS",
         )
         self.assertFalse(config["make_plan_clear_costmap"])
         self.assertFalse(config["make_plan_add_unreachable_goal"])
         self.assertFalse(config["clearing_rotation_allowed"])
-        self.assertEqual(len(config["recovery_behaviors"]), 2)
-        self.assertNotIn("rotate_recovery", {
-            behavior["name"] for behavior in config["recovery_behaviors"]
-        })
+        self.assertEqual(
+            [behavior["name"] for behavior in config["recovery_behaviors"]],
+            ["conservative_reset", "escape_recovery_1",
+             "aggressive_reset", "escape_recovery_2"],
+        )
+        for name in ("escape_recovery_1", "escape_recovery_2"):
+            self.assertEqual(config[name]["max_attempts_per_goal"], 2)
+            self.assertEqual(config[name]["simulation_step"], 0.025)
+            self.assertTrue(config[name]["enable_arc"])
+            self.assertEqual(config[name]["arc_distance"], 0.45)
+            self.assertEqual(config[name]["arc_linear_speed"], 0.40)
+            self.assertEqual(config[name]["arc_angular_speed"], 0.40)
+            self.assertFalse(config[name]["enable_strafe"])
+        self.assertNotIn("rotate_recovery", config)
+        self.assertNotIn("TrajectoryPlannerROS", config)
 
-    def test_unitree_velocity_floor_and_supported_parameters(self):
-        config = self._yaml("trajectory_planner.yaml")["TrajectoryPlannerROS"]
+    def test_costmaps_fuse_ground_filtered_depth_obstacles(self):
+        common = self._yaml("costmap_common.yaml")
+        self.assertGreaterEqual(common["max_obstacle_height"], 6.4)
+        for filename in ("local_costmap.yaml", "global_costmap.yaml"):
+            obstacles = self._yaml(filename)["obstacles"]
+            self.assertEqual(
+                obstacles["observation_sources"], "scan depth_scan"
+            )
+            depth = obstacles["depth_scan"]
+            self.assertEqual(depth["data_type"], "LaserScan")
+            self.assertEqual(
+                depth["topic"], "/localization/depth_obstacle_scan"
+            )
+            self.assertTrue(depth["marking"])
+            self.assertFalse(depth["clearing"])
+            self.assertEqual(depth["expected_update_rate"], 0.0)
+            self.assertLessEqual(depth["obstacle_range"], 3.0)
+
+    def test_unitree_dwa_velocity_domain_and_supported_parameters(self):
+        config = self._yaml("dwa_planner.yaml")["DWAPlannerROS"]
         self.assertEqual(config["odom_topic"], "/localization/odom")
-        self.assertEqual(config["min_vel_x"], 0.30)
-        self.assertEqual(config["escape_vel"], -0.30)
-        self.assertEqual(config["max_rotational_vel"], 0.80)
-        self.assertEqual(config["max_vel_theta"], 0.80)
-        self.assertEqual(config["min_vel_theta"], -0.80)
-        self.assertEqual(config["min_in_place_vel_theta"], 0.80)
-        self.assertEqual(config["acc_lim_theta"], 0.80)
-        self.assertEqual(config["path_distance_bias"], 5.0)
-        self.assertEqual(config["goal_distance_bias"], 5.0)
-        self.assertIsInstance(config["y_vels"], str)
-        self.assertIn("0.0", config["y_vels"])
-        self.assertTrue(config["dwa"])
-        self.assertTrue(config["holonomic_robot"])
-        self.assertNotIn("min_vel_y", config)
-        self.assertNotIn("max_vel_y", config)
-        self.assertLessEqual(config["heading_scoring_timestep"], 1.0)
+        self.assertEqual(config["min_vel_trans"], 0.30)
+        self.assertEqual(config["max_vel_trans"], 0.30)
+        self.assertEqual(config["min_vel_x"], 0.0)
+        self.assertEqual(config["max_vel_x"], 0.30)
+        self.assertEqual(config["min_vel_y"], 0.0)
+        self.assertEqual(config["max_vel_y"], 0.0)
+        self.assertEqual(config["max_vel_theta"], 0.40)
+        self.assertEqual(config["min_vel_theta"], 0.40)
+        self.assertEqual((config["vx_samples"], config["vy_samples"],
+                          config["vth_samples"]), (2, 1, 9))
+        self.assertTrue(config["use_dwa"])
+        self.assertEqual(config["path_distance_bias"], 32.0)
+        self.assertEqual(config["goal_distance_bias"], 24.0)
+        self.assertEqual(config["occdist_scale"], 0.02)
+        self.assertEqual(config["twirling_scale"], 0.30)
+        self.assertEqual(config["xy_goal_tolerance"], 0.15)
 
-    def test_rotation_limits_do_not_exceed_cmd_mux_hard_cap(self):
-        planner = self._yaml("trajectory_planner.yaml")["TrajectoryPlannerROS"]
-        mux = self._control_config()
-        limit = mux["max_angular_speed"]
-        self.assertEqual(planner["max_rotational_vel"], limit)
-        self.assertEqual(planner["max_vel_theta"], limit)
-        self.assertEqual(planner["min_in_place_vel_theta"], limit)
-        self.assertGreaterEqual(planner["min_vel_theta"], -limit)
+        self.assertEqual(config["vy_samples"], 1)
+        samples = [
+            -config["max_vel_theta"] + index * (
+                2.0 * config["max_vel_theta"]
+            ) / (config["vth_samples"] - 1)
+            for index in range(config["vth_samples"])
+        ]
+        for actual, expected in zip(
+                samples,
+                [-0.40, -0.30, -0.20, -0.10, 0.0,
+                 0.10, 0.20, 0.30, 0.40]):
+            self.assertAlmostEqual(actual, expected, places=9)
 
-    def test_translation_floor_matches_unitree_and_cmd_mux_cap(self):
-        planner = self._yaml("trajectory_planner.yaml")["TrajectoryPlannerROS"]
+    def test_dwa_speed_and_acceleration_contract_matches_cmd_mux(self):
+        planner = self._yaml("dwa_planner.yaml")["DWAPlannerROS"]
         mux = self._control_config()
-        self.assertEqual(planner["min_vel_x"], 0.30)
-        self.assertLessEqual(planner["min_vel_x"], planner["max_vel_x"])
         self.assertLessEqual(planner["max_vel_x"], mux["max_linear_speed"])
+        self.assertEqual(planner["min_vel_x"], 0.0)
+        self.assertEqual(planner["max_vel_x"], planner["min_vel_trans"])
+        self.assertEqual(planner["max_vel_x"], planner["max_vel_trans"])
+        self.assertEqual(planner["vx_samples"], 2)
+        self.assertLessEqual(planner["max_vel_y"], mux["max_lateral_speed"])
+        safety_limit = 0.40
+        self.assertLessEqual(planner["max_vel_theta"], safety_limit)
+        self.assertLessEqual(planner["min_vel_theta"], safety_limit)
+        self.assertLessEqual(planner["max_vel_theta"], mux["max_angular_speed"])
+        self.assertLessEqual(
+            planner["min_vel_theta"], mux["max_angular_speed"]
+        )
+        self.assertEqual(planner["acc_lim_x"], mux["max_linear_accel"])
+        self.assertEqual(planner["acc_lim_y"], mux["max_lateral_accel"])
+        self.assertEqual(planner["acc_lim_theta"], mux["max_angular_accel"])
+
+        frequency = self._yaml("standard_move_base.yaml")["controller_frequency"]
+        self.assertGreaterEqual(
+            planner["acc_lim_x"] / frequency, planner["min_vel_trans"]
+        )
+        self.assertGreaterEqual(
+            planner["acc_lim_y"] / frequency, planner["max_vel_y"]
+        )
+        self.assertGreaterEqual(
+            planner["acc_lim_theta"] / frequency, planner["max_vel_theta"]
+        )
+        self.assertEqual(planner["min_vel_theta"], safety_limit)
+
+    def test_launch_loads_dwa_and_guard_checks_its_namespace(self):
+        root = ET.parse(PACKAGE / "launch" / "navigation.launch").getroot()
+        move_base = next(node for node in root.findall("node")
+                         if node.attrib.get("name") == "move_base")
+        files = [item.attrib.get("file", "") for item in move_base.findall("rosparam")]
+        self.assertTrue(any("dwa_planner.yaml" in path for path in files))
+        self.assertFalse(any("trajectory_planner.yaml" in path for path in files))
+        guard = next(node for node in root.findall("node")
+                     if node.attrib.get("name") == "navigation_config_guard")
+        params = {item.attrib["name"]: item.attrib["value"]
+                  for item in guard.findall("param")}
+        self.assertEqual(params["planner_name"], "/move_base/DWAPlannerROS")
+        self.assertEqual(params["planner_config_key"], "DWAPlannerROS")
+        self.assertEqual(params["safe_max_angular_speed_rps"], "0.40")
+        self.assertEqual(
+            params["effective_min_in_place_angular_speed_rps"], "0.40"
+        )
+        self.assertEqual(params["effective_forward_speed_mps"], "0.30")
+        self.assertEqual(params["controller_frequency_hz"], "10.0")
+
+    def test_escape_recovery_is_a_nav_core_plugin(self):
+        root = ET.parse(PACKAGE / "recovery_plugin.xml").getroot()
+        plugin = root.find("class")
+        self.assertIsNotNone(plugin)
+        self.assertEqual(
+            plugin.attrib["name"],
+            "danger_search_navigation/UnitreeEscapeRecovery",
+        )
+        self.assertEqual(plugin.attrib["base_class_type"],
+                         "nav_core::RecoveryBehavior")
+        package_xml = ET.parse(PACKAGE / "package.xml").getroot()
+        export = package_xml.find("export/nav_core")
+        self.assertIsNotNone(export)
+        self.assertEqual(export.attrib["plugin"],
+                         "${prefix}/recovery_plugin.xml")
+
+    def test_recovery_declares_direct_tf2_dependencies_and_tests(self):
+        package_xml = ET.parse(PACKAGE / "package.xml").getroot()
+        for tag in ("build_depend", "build_export_depend", "exec_depend"):
+            dependencies = {item.text for item in package_xml.findall(tag)}
+            self.assertIn("tf2", dependencies, msg=tag)
+            self.assertIn("tf2_ros", dependencies, msg=tag)
+
+        cmake = (PACKAGE / "CMakeLists.txt").read_text()
+        self.assertIn("catkin_add_gtest(test_escape_recovery", cmake)
+        self.assertIn(
+            "catkin_add_nosetests(test/test_navigation_monitor_callbacks.py)",
+            cmake,
+        )
 
     def test_costmaps_use_fixed_padded_footprint_and_scan(self):
         common = self._yaml("costmap_common.yaml")

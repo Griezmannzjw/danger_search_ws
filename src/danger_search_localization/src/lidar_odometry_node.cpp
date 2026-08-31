@@ -16,6 +16,7 @@
 #include <ros/ros.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud.h>
+#include <std_srvs/Trigger.h>
 #include <tf2/exceptions.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -31,6 +32,9 @@ class LidarOdometryNode {
     private_nh_.param<std::string>("odom_frame", odom_frame_, "odom");
     private_nh_.param<std::string>("base_frame", base_frame_, "base");
     private_nh_.param<std::string>("imu_topic", imu_topic_, "/trunk_imu");
+    private_nh_.param<std::string>("gicp_rebaseline_service",
+                                   rebaseline_service_name_,
+                                   "/localization/gicp_rebaseline");
     private_nh_.param("enable_imu_leveling", enable_imu_leveling_, true);
     private_nh_.param("imu_fresh_timeout_s", imu_fresh_timeout_s_, 0.20);
     private_nh_.param("gravity_mps2", gravity_mps2_, 9.80665);
@@ -108,6 +112,8 @@ class LidarOdometryNode {
         imu_topic_, 200, &LidarOdometryNode::ImuCallback, this);
     subscriber_ = private_nh_.subscribe(
         input_topic_, 1, &LidarOdometryNode::CloudCallback, this);
+    rebaseline_service_ = private_nh_.advertiseService(
+        rebaseline_service_name_, &LidarOdometryNode::RebaselineCallback, this);
     worker_ = std::thread(&LidarOdometryNode::WorkerLoop, this);
     ROS_INFO(
         "[localization] latest-only SE(2) GICP odometry: %s -> %s "
@@ -173,6 +179,19 @@ class LidarOdometryNode {
     std::lock_guard<std::mutex> lock(pending_mutex_);
     pending_message_ = message;
     pending_condition_.notify_one();
+  }
+
+  bool RebaselineCallback(std_srvs::Trigger::Request&,
+                          std_srvs::Trigger::Response& response) {
+    rebaseline_requested_.store(true);
+    {
+      std::lock_guard<std::mutex> lock(pending_mutex_);
+      pending_message_.reset();
+    }
+    response.success = true;
+    response.message = "GICP rebaseline scheduled for next scan";
+    ROS_WARN("[localization] GICP floor-transition rebaseline requested");
+    return true;
   }
 
   void WorkerLoop() {
@@ -359,6 +378,11 @@ class LidarOdometryNode {
   void ProcessMessage(const sensor_msgs::PointCloud::ConstPtr& message) {
     const ros::WallTime started = ros::WallTime::now();
     if (!message || message->header.frame_id.empty()) return;
+    if (rebaseline_requested_.exchange(false)) {
+      core_->RequestRebaseline();
+      observation_cloud_.reset(new Cloud());
+      observation_count_ = 0;
+    }
     double base_heading_rad = std::numeric_limits<double>::quiet_NaN();
     const Cloud::Ptr current = PrepareCloud(*message, &base_heading_rad);
     const Cloud::Ptr observation = AddObservationFrame(current);
@@ -452,6 +476,7 @@ class LidarOdometryNode {
   ros::Publisher publisher_;
   ros::Subscriber subscriber_;
   ros::Subscriber imu_subscriber_;
+  ros::ServiceServer rebaseline_service_;
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
   std::string input_topic_;
@@ -459,6 +484,7 @@ class LidarOdometryNode {
   std::string odom_frame_;
   std::string base_frame_;
   std::string imu_topic_;
+  std::string rebaseline_service_name_;
   double min_range_ = 0.40;
   double max_range_ = 12.0;
   bool enable_imu_leveling_ = true;
@@ -481,6 +507,7 @@ class LidarOdometryNode {
   std::condition_variable pending_condition_;
   sensor_msgs::PointCloud::ConstPtr pending_message_;
   bool stop_worker_ = false;
+  std::atomic<bool> rebaseline_requested_{false};
   std::thread worker_;
 };
 

@@ -293,6 +293,19 @@ class LidarOdometryCore {
   int recovery_accepts() const { return recovery_accepts_; }
   std::size_t history_size() const { return history_.size(); }
 
+  void RequestRebaseline() {
+    // Keep the accumulated odometry pose, but ensure the next scan becomes a
+    // new floor-local registration reference. Comparing elevator/hall scans
+    // against the previous landing would otherwise create a false SE(2) jump.
+    reference_.reset();
+    reference_stamp_s_ = 0.0;
+    last_increment_.setIdentity();
+    consecutive_failures_ = 0;
+    recovery_accepts_ = 0;
+    history_.clear();
+    trusted_imu_heading_valid_ = false;
+  }
+
  private:
   struct HistoryEntry {
     Cloud::Ptr cloud;

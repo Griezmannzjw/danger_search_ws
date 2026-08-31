@@ -1,123 +1,95 @@
 # danger_search_mission
 
-单楼层 P0 任务总控。该包把定位、感知、探索、导航和控制模块连接成：
+比赛任务总控和结果文件唯一写入方：
 
 ```text
 IDLE -> ENTERING -> EXPLORING -> RETURNING -> FINISHED
-                           \----> ERROR
+                           \----------------> ERROR
 ```
 
-## 实际职责
+## 任务语义
 
-- 启动前等待位姿、建图、导航、相机/检测器和 exploration 服务就绪；
-- 在任务开始时记录本次 `map` 中的起点位姿；
-- 启动 exploration 并接收 `/exploration/complete`；
-- 对红球检测做置信度过滤、空间融合和至少三帧确认；
-- 在门外保存官方出生点，沿初始朝向用短目标滚动前进，确认达到门内距离后才启动 exploration；
-- 探索完成后停止 exploration，独占发送返航 `/move_base` 目标；
-- `600s` 仅是评分满分线，默认任务总超时为 `0`，不会据此中断探索；
-- 返航成功后把坐标转换为以本次起点为原点的任务坐标；
-- 原子写入 `detected_danger.json`，最后发布 `FINISHED`；
-- 返航失败、返航超时或结果写入失败时发布 `ERROR`，并尽量保留已确认结果。
+- 正式启动需等待 preflight、位姿、稳定地图、导航、检测器、入口门和 exploration 服务。
+- 任务开始先清空跟踪器，并原子覆盖为本轮空的 `mission_status=RUNNING` 结果。
+- 保存 `home_floor=0` 和完整起点 `x/y/z/yaw`，分段进入建筑后启动探索。
+- 只融合与当前 `floor_id/map_epoch` 一致的确认红球，按楼层和三维距离去重。
+- `/exploration/complete`、FinishMission、ReturnHome 或任务超时都先停止探索，再进入相同
+  的返航流程。
+- 当前楼层不是 0 时先调用 `/danger_search/transit_floor` 回 0 层并退出轿厢，然后发送
+  二维 home goal。
+- 返航只有在位置误差 `<=0.5 m`、yaw `<=20°`、导航不活动且
+  `/danger_search/cmd_vel_sent` 连续 2 秒静止时成功。
+- 成功后才冻结 `exploration_time`、原子写结果并进入 `FINISHED`；Action、返航验证或写盘
+  失败均进入 `ERROR`，迟到回调由 return epoch 丢弃。
 
-## 接口
+## ROS 接口
 
-订阅：
+订阅：`/localization/pose`、`/mapping/status`、`/navigation/health`、
+`/danger_detector/status`、`/danger_detector/detections`、`/exploration/status`、
+`/exploration/complete`、`/entrance/ready`、`/danger_search/preflight_ready` 和
+`/danger_search/cmd_vel_sent`。
 
-| 话题 | 类型 | 用途 |
-|---|---|---|
-| `/localization/pose` | `geometry_msgs/PoseWithCovarianceStamped` | 记录起点和检查位姿新鲜度 |
-| `/mapping/status` | `danger_search_common/MappingStatus` | 建图就绪门和当前楼层 |
-| `/navigation/health` | `danger_search_common/NavigationHealth` | 导航就绪与活动目标状态 |
-| `/danger_detector/status` | `danger_search_common/DetectionStatus` | 相机、同步输入和 TF 就绪门 |
-| `/danger_detector/detections` | `danger_search_common/DangerSourceArray` | 逐帧红球观测 |
-| `/exploration/status` | `std_msgs/String` | 剩余前沿和覆盖诊断 |
-| `/exploration/complete` | `std_msgs/Bool` | 自动结束探索并开始返航 |
-| `/entrance/ready` | `std_msgs/Bool` | 主入口已经实际打开的就绪信号 |
+调用：`/danger_search/start_exploration`、`/danger_search/stop_exploration`、
+`/move_base` 和 `/danger_search/transit_floor`。
 
-发布：
+提供：
 
-| 话题 | 类型 | 用途 |
-|---|---|---|
-| `/mission/status` | `danger_search_common/MissionStatus` | 状态、耗时、楼层、前沿和结束原因 |
-| `/mission/active` | `std_msgs/Bool` | 任务是否处于活动阶段 |
+| 服务 | 行为 |
+|---|---|
+| `/danger_search/start` | 开始本轮任务；重复活动请求不会重置状态 |
+| `/danger_search/finish` | 提前结束覆盖，但仍执行完整返航 |
+| `/danger_search/return_home` | 立即停止探索并执行相同返航 |
 
-服务：
+发布 `/mission/status` 和 `/mission/active`。`/exploration/complete` 不是 mission 终态。
 
-| 服务 | 类型 | 行为 |
-|---|---|---|
-| `/danger_search/start` | `std_srvs/Trigger` | 等待预检通过并开始探索 |
-| `/danger_search/finish` | `std_srvs/Trigger` | 调试时提前停止探索并开始返航，不跳过返航 |
-| `/danger_search/return_home` | `std_srvs/Trigger` | 调试时立即进入返航 |
+## 结果和坐标
 
-mission 在 `ENTERING` 和 `RETURNING` 阶段作为 `/move_base` Action 客户端；只有入口
-目标成功后才启动 exploration，返航前则先调用其 stop 服务，避免目标竞争。
+必要 evaluator 字段之外增加 `coordinate_frame`、`mission_status`、运行 profile 和定位后端：
 
-入口不是一次发送远处目标：默认每次推进 `0.6 m`，navigation 只沿当前已知自由区执行，
-新点云更新地图后再推进下一段。单段失败会等待地图更新并重试；只有相对门外起点的前向
-进度达到 `entry_distance_m - entry_completion_tolerance_m` 才进入探索。
-
-## 入口参数
-
-| 参数 | 默认值 | 说明 |
-|---|---:|---|
-| `entry_enabled` | `true` | 是否在探索前执行进门阶段 |
-| `entry_distance_m` | `4.2` | 相对门外任务起点的总前向距离 |
-| `entry_step_m` | `0.6` | 滚动短目标增量 |
-| `entry_completion_tolerance_m` | `0.25` | 入口完成距离容差 |
-| `entry_retry_delay_s` | `1.0` | 失败后等待地图刷新的时间 |
-| `entry_map_retry_delay_s` | `2.0` | 地图暂不可达时的低频重试间隔 |
-| `entry_health_settle_s` | `0.3` | Action 完成后等待导航失败码到达的时间 |
-| `entry_max_retries` | `8` | 连续无进展失败上限 |
-| `entry_min_progress_m` | `0.10` | 重置失败计数所需的最小进展 |
-| `entry_timeout_s` | `90.0` | 整个入口阶段总超时 |
-| `require_entrance_ready` | `true` | 要求开门节点确认成功 |
-
-单段 Action 成功后不会在 actionlib 完成回调里直接发送下一目标，而是交给 mission 定时器
-继续推进，避免连续目标触发 `SimpleActionClient` 状态竞争。单段失败不会立即终止任务；
-mission 等待地图清除动态门残影后重试。
-如果导航明确报告 `LOCALIZATION_LOST`，该次失败不计入运动重试次数；mission 会暂停入口
-目标，等待位姿、地图和导航状态恢复。滚动建图阶段的 `UNREACHABLE` 同样视为地图尚未
-展开，而不是机器人控制失败。两者仍受 `entry_timeout_s` 总时限约束。
-
-## 结果路径
-
-统一 launch 默认支持以下零配置布局：
-
-```text
-某个父目录/
-├── simenvnew/
-└── danger_search_ws/
+```json
+{
+  "exploration_time": 98.76,
+  "coordinate_frame": "world",
+  "mission_status": "FINISHED",
+  "run_profile": "formal",
+  "localization_backend": "gicp",
+  "official_eligible": true,
+  "detected_danger_sources": []
+}
 ```
 
-此时自动输出到同级 `simenvnew/results/detected_danger.json`，没有写死用户名，也不依赖
-节点当前工作目录。如果赛事部署布局不同，只需覆盖一次：
+内部统一保存任务起点相对三维坐标。`result_coordinate_frame=auto` 时，只读取公开
+`team_scene_info.json`：若声明 world，则执行 `Rz(yaw0)*p_relative+t_robot_start`；否则
+输出 `start_relative`。非零起点、非零 yaw 和 z 变换均有回归测试。0 个危险源必须输出
+空数组，不能残留上轮结果。
+
+默认结果路径由 bringup 解析到同级 `SimEnv/results/detected_danger.json`，也可通过绝对
+`result_file` 覆盖。
+
+正式调用 evaluator 前先运行 fail-closed profile 门禁：
 
 ```bash
-roslaunch danger_search_bringup competition.launch \
-  simenv_root:=/absolute/path/to/simenvnew
+rosrun danger_search_mission validate_result.py --official \
+  /home/ruilinli/SimEnv/results/detected_danger.json
 ```
 
-也可以用 `result_file:=/absolute/path/to/simenvnew/results/detected_danger.json` 覆盖完整文件。
+只有 `mission_status=FINISHED`、`run_profile=formal`、`localization_backend=gicp` 且
+`official_eligible=true` 时退出码为 0。字段缺失、任务失败、元数据自相矛盾或
+`simulation_truth` 均以退出码 2 拒绝，验收脚本必须在退出码非 0 时停止评分。
 
-## 多帧确认
+## 正式与隔离运行
 
-- `confidence < min_confidence` 的观测不进入候选；
-- 相同 `detection_id` 只处理一次；
-- 同楼层三维距离小于 `dedup_distance` 的观测合并为同一轨迹；
-- 位置使用全部合并观测的运行均值；
-- 轨迹观测数达到 `min_detections` 后才写入最终结果。
-
-P0 默认值为 `0.8 m`、`3` 帧和置信度 `0.60`，需根据多随机场景结果继续标定。
-
-## 启动
-
-正式联调由 bringup 启动。本包独立调试也支持同样的路径与自动开始参数：
+正式 profile 要求 `competition_mode=true`、`multifloor_enabled=true`、GICP 后端、公开
+scene contract 和 preflight ready。真值 profile 固定要求
+`competition_mode=false`、`multifloor_enabled=true` 和 `gazebo_truth` 后端；其结果文件名必须
+为 `detected_danger.simulation_truth.json`，并始终写出 `official_eligible=false`。两个 profile
+均需 preflight ready；请通过 bringup 的对应 wrapper 启动，而不是混用参数。
 
 ```bash
-source /opt/ros/noetic/setup.bash
-source ~/myProject/danger_search_ws/devel/setup.bash
 roslaunch danger_search_mission mission.launch autostart:=false
 ```
 
-独立启动仍要求外部已有 exploration 服务、`/move_base` Action 和四类健康输入。
+入口分段和返航参数见 `config/default.yaml`。默认 `mission_timeout_s=0`，探索期间不会
+因为累计耗时自动触发返航；探索自然完成或收到 FinishMission/ReturnHome 请求后才进入
+RETURNING 闭环。600 秒仍是比赛硬门槛/评分口径，由测试端统计；只有实际回到起点并
+满足位置、朝向和连续静止门槛才写 FINISHED。

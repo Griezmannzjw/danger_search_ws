@@ -1,7 +1,6 @@
 # danger_search_perception
 
-基于 RealSense RGB 与深度数据的红色球体危险源检测模块，对齐团队
-`v1.1-p0` 接口。
+基于 RealSense RGB 与深度数据的红色球体危险源检测模块，对齐 P1 分层地图接口。
 
 ## 职责
 
@@ -10,7 +9,7 @@
 3. 通过深度点、球面拟合和投影半径验证红色球体；
 4. 使用平面残差排除红色方块干扰；
 5. 通过 TF 将球心转换到目标坐标系；
-6. 根据建图健康状态和采集时刻的机器人高度校验当前楼层；
+6. 根据建图健康状态和显式楼层切换状态校验当前楼层；
 7. 在同一楼层内进行三维跨帧关联、位置平滑和有限确认；
 8. 发布检测和检测器健康状态。
 
@@ -35,7 +34,7 @@ perception 负责短时/跨楼层返回后的观测身份和位置平滑；任�
 
 | 默认话题 | 类型 | 说明 |
 |---|---|---|
-| `/danger_detector/detections` | `danger_search_common/DangerSourceArray` | P0 基础检测数组 |
+| `/danger_detector/detections` | `danger_search_common/DangerSourceArray` | 分层危险源检测数组 |
 | `/danger_detector/status` | `danger_search_common/DetectionStatus` | 输入和 TF 健康状态 |
 
 每个红球检测会真实填写：
@@ -44,23 +43,25 @@ perception 负责短时/跨楼层返回后的观测身份和位置平滑；任�
 - `class_id=CLASS_DANGER_RED_SPHERE`；
 - `position`：包含采集时间和实际目标坐标系；
 - `floor_id`：来自稳定的当前楼层，编号从 `0` 开始；
+- `map_epoch`：采集时活动的分层地图 epoch；
 - `confidence`：二维与三维验证的综合置信度；
 - `track_id`：同楼层三维跨帧轨迹 ID；
 - `confirmed`：轨迹达到配置的连续命中次数后为 `true`；
 - `position_covariance`：由轨迹观测离散度和保守先验生成；
 - `source_time`：原始 RGB 图像时间。
 
-`localization_correction_version` 仍保留默认值，等待正式定位后端提供修正版本。
+`localization_correction_version` 来自当前定位状态；版本改变会清除旧短时关联。
 检测数组为空可能表示当前帧没有通过验证的红色球体，也可能表示正在换层或地图不稳定；
 具体原因由 `/danger_detector/status.status_reason` 给出。
 
 ### 多楼层发布门控
 
 完整系统默认要求 `/mapping/status` 新鲜且满足
-`ready && stable && !lost`。节点还会按 RGB 采集时间查询 `map -> base`，将机器人相对
-高度与 `floor_heights: [0.0, 2.6, 5.2]` 复核。两者不一致时整帧丢弃，因此电梯换层
-期间不会把二层目标错标为一层。确认轨迹按 `floor_id` 隔离；不同楼层相同 XY 不会
-合并。确认轨迹在本次节点进程内保留，返回旧楼层后可以恢复原 `track_id`。
+`ready && stable && !lost && !transitioning`。`floor_id` 和 `map_epoch` 只以这个
+显式楼层/地图合同为准；连续定位高度（包括 Gazebo 真值 z）绝不用于决定或推进楼层。
+`verify_floor_height=true` 仅保留为排障时的可选采集时刻高度复核。检测绑定当前
+`floor_id`、`map_epoch` 和定位修正版本；轨迹关联也隔离不同的 `(floor_id, map_epoch)`，
+因此电梯换层、同层地图重置和不同楼层相同 XY 都不会被平滑到同一轨迹中。
 
 ### TF
 
@@ -83,7 +84,7 @@ map -> odom -> base -> camera
 - [x] 已知半径约束的球心估计
 - [x] 球面残差、平面残差和投影半径联合验证
 - [x] 按图像时间戳查询 TF
-- [x] 建图稳定性和传感器时刻楼层高度双重门控
+- [x] 建图稳定性、显式楼层切换和地图 epoch 门控
 - [x] 同楼层三维跨帧关联、轨迹确认和位置协方差
 - [x] `DangerSourceArray` 和 `DetectionStatus` 发布
 

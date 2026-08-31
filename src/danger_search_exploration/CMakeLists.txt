@@ -13,6 +13,7 @@ find_package(catkin REQUIRED COMPONENTS
   actionlib_msgs
   move_base_msgs
   danger_search_common
+  building_generator_interfaces
 )
 
 catkin_package(
@@ -28,6 +29,7 @@ catkin_package(
   actionlib_msgs
   move_base_msgs
   danger_search_common
+  building_generator_interfaces
 )
 
 include_directories(
@@ -40,5 +42,7 @@ catkin_install_python(PROGRAMS
 )
 
 if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test/test_entrance_boundary.py)
   catkin_add_nosetests(test/test_simple_frontier.py)
+  catkin_add_nosetests(test/test_multifloor.py)
 endif()

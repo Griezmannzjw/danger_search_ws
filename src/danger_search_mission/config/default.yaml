@@ -15,15 +15,29 @@ exploration_complete_topic: /exploration/complete
 mission_status_topic: /mission/status
 mission_active_topic: /mission/active
 entrance_ready_topic: /entrance/ready
+preflight_ready_topic: /danger_search/preflight_ready
+sent_cmd_topic: /danger_search/cmd_vel_sent
+entry_cmd_topic: /danger_search/entry_cmd_vel
+scan_topic: /localization/scan
+imu_topic: /trunk_imu
+safety_stop_topic: /danger_search/safety_stop
+posture_fallen_topic: /danger_search/posture_fallen
+posture_reason_topic: /danger_search/posture_safety_reason
 start_exploration_service: /danger_search/start_exploration
 stop_exploration_service: /danger_search/stop_exploration
 start_mission_service: /danger_search/start
 finish_mission_service: /danger_search/finish
 return_home_service: /danger_search/return_home
 move_base_action_name: /move_base
+transit_floor_action_name: /danger_search/transit_floor
 
 # 由 launch 根据同级 SimEnv 自动生成绝对路径，也可在启动时覆盖。
 result_file: ""
+scene_info_file: ""
+# auto follows public team_scene_info.coordinate_frame; missing/unknown falls
+# back to the PDF's task-start-relative contract.
+result_coordinate_frame: auto
+home_floor: 0
 
 # 多帧确认与任务时序
 dedup_distance: 0.8
@@ -31,15 +45,67 @@ min_detections: 3
 min_confidence: 0.60
 input_timeout_s: 2.0
 preflight_wait_timeout_s: 20.0
-# 0 表示不设任务总时限。600 秒只是满分线，不是停止条件。
+# 真实倾倒立即终止；IMU stale/invalid 先由底层停车，持续到该时限才终止任务。
+recoverable_safety_abort_s: 3.0
+# 0 表示不因探索耗时自动触发返航。任务只在探索自然完成，或收到
+# FinishMission/ReturnHome 请求后进入返航；比赛总时限由测试端统计。
 mission_timeout_s: 0.0
 # 入口阶段：先在门外保存返航起点，再沿起始朝向分段进入建筑。
 entry_enabled: true
+# 固定入口前有四足必须跨越的低矮 apron，且开门后的占据图可能短时保留
+# 旧门墙。独立短程租约闭环保持起始直线直到达到正式进入判据，避免
+# Navfn 对门墙规划绕建筑外侧的长路；全程只用 pose/scan/IMU，不读布局真值。
+entry_short_range_enabled: true
+entry_crossing_distance_m: 3.75
+# 实机策略烟测中 0.2/0.3m/s 不能完整跨越 8cm 前缘；0.4m/s 配合小角度
+# 闭环可以稳定跨越，因此速度和 mux 硬上限必须作为同一合同。
+entry_crossing_speed_mps: 0.40
+entry_crossing_max_angular_speed_rps: 0.30
+entry_crossing_yaw_gain: 1.50
+# CROSS captures a local pose reference after PREPARE.  Ignore standing/gait
+# yaw noise below 2.9 deg, then smooth corrections without changing home_pose.
+entry_crossing_yaw_deadband_rad: 0.05
+entry_crossing_yaw_lowpass_alpha: 0.25
+entry_crossing_lateral_gain: 0.80
+entry_crossing_max_lateral_error_m: 0.35
+entry_crossing_max_yaw_error_rad: 0.45
+entry_crossing_max_tilt_rad: 0.30
+entry_crossing_timeout_s: 35.0
+entry_crossing_input_timeout_s: 0.75
+entry_crossing_prepare_zero_s: 0.50
+entry_crossing_handoff_zero_s: 0.50
+# 大于 control 的 0.25s entry lease，确保普通导航恢复前短程租约已释放。
+entry_crossing_release_s: 0.35
+entry_crossing_stall_increment_m: 0.03
+entry_crossing_stall_timeout_s: 6.0
+entry_crossing_sweep_enabled: true
+# 只对当前闭环可承诺的局部直线段做滚动 footprint 扫掠。若把剩余约 4m
+# 全部按当前瞬时偏航外推，步态偏航会把已打开门的侧板误判成正前方障碍。
+# 0.8m 在 0.4m/s 下提供约 2s 前视，并在每个控制周期由新 scan 重算。
+entry_crossing_sweep_lookahead_m: 0.80
+entry_footprint_min_x: -0.35
+entry_footprint_max_x: 0.30
+entry_footprint_min_y: -0.15
+entry_footprint_max_y: 0.15
+entry_footprint_margin_m: 0.05
+# 真实 seed 42001 的开门侧墙回波位于 y=0.18~0.19m：它不侵入
+# Unitree 真实半宽 0.15m，但落入 5cm 安全裕量。此时保留真实 footprint
+# 硬停车，同时在裕量区低速向远离侧墙方向偏航，避免把可通行窄门误报为碰撞。
+entry_margin_avoidance_speed_mps: 0.25
+entry_margin_avoidance_yaw_rps: 0.08
+# 仅根据前方 0.30m 的单侧裕量点转向；更远点保留在 0.80m 直线硬检查中。
+entry_margin_avoidance_lookahead_m: 0.30
+entry_margin_min_side_clearance_m: 0.01
+entry_margin_release_hysteresis_m: 0.02
+# 偏航后按实际 v/w 对 footprint 沿圆弧采样，步长不得超过 1cm。
+entry_arc_sweep_sample_spacing_m: 0.01
 # 从门外任务起点量取的总前向进入距离；达到 distance-tolerance 后开始探索。
 entry_distance_m: 4.2
 # 每段短目标的前向增量。避免目标一次落到尚未建图的室内深处。
 entry_step_m: 0.6
-entry_completion_tolerance_m: 0.25
+# 必须不小于 move_base 局部规划器的 xy_goal_tolerance；否则最终短目标
+# 已被 move_base 判定成功后，Mission 仍会重复发送同一终点形成活锁。
+entry_completion_tolerance_m: 0.45
 # Action 单段失败时先等待新地图，再从当前实际位姿生成下一短目标。
 entry_retry_delay_s: 1.0
 # 地图暂不可达时降低 Action 重发频率，等待更多注册点云进入占据地图。
@@ -53,5 +119,22 @@ entry_min_progress_m: 0.10
 entry_timeout_s: 150.0
 # 正式 P0 必须等 /entrance/ready=true；仅 mission 隔离测试时才关闭。
 require_entrance_ready: true
-return_timeout_s: 120.0
+return_timeout_s: 170.0
+# 首次 home action 不得吞掉整个返航窗口。为近家时的一次短重试和
+# 位姿/静止验证留出硬余量。
+return_attempt_timeout_s: 150.0
+return_retry_reserve_s: 15.0
+return_terminal_reserve_s: 5.0
+return_min_attempt_timeout_s: 5.0
+return_position_tolerance_m: 0.50
+return_yaw_tolerance_rad: 0.3490658504
+return_stationary_hold_s: 2.0
+return_stationary_linear_mps: 0.02
+return_stationary_angular_rps: 0.05
+return_verify_timeout_s: 15.0
+# Actionlib done callback 只登记重试；由 mission timer 在 client 完成 DONE
+# 状态切换后再发新 goal，避免 SimpleActionClient 状态机竞争。
+return_retry_delay_s: 0.3
+return_max_goal_attempts: 2
+require_preflight_ready: true
 autostart: false

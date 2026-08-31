@@ -1,0 +1,13 @@
+int32 target_floor
+bool exit_to_hall
+---
+bool success
+int32 reached_floor
+uint64 map_epoch
+string failure_code
+string message
+---
+string phase
+int32 current_floor
+float32 progress
+uint64 map_epoch
