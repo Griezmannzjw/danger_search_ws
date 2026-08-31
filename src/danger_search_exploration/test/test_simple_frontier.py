@@ -3,6 +3,7 @@
 import importlib.util
 import math
 import pathlib
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -53,6 +54,20 @@ class SimpleFrontierTest(unittest.TestCase):
         self.assertAlmostEqual(config["path_clearance_weight"], 0.15)
         self.assertAlmostEqual(config["failed_goal_cooldown"], 15.0)
         self.assertAlmostEqual(config["failed_goal_radius"], 0.50)
+        self.assertAlmostEqual(config["success_goal_cooldown"], 45.0)
+        self.assertAlmostEqual(config["success_goal_radius"], 0.50)
+        self.assertEqual(config["success_goal_clear_revisions"], 2)
+        self.assertFalse(config["elevator"]["enabled"])
+        self.assertTrue(config["elevator"]["autonomous_when_floor_complete"])
+        self.assertEqual(config["elevator"]["served_floors"], [0, 1])
+        self.assertEqual(
+            config["elevator"]["max_autonomous_transition_failures"], 1
+        )
+        self.assertAlmostEqual(config["elevator"]["portal_near_distance"], 0.40)
+        self.assertAlmostEqual(config["elevator"]["cabin_distance"], 0.60)
+        self.assertTrue(config["elevator"]["portal_traversal_enabled"])
+        self.assertAlmostEqual(config["elevator"]["portal_speed"], 0.25)
+        self.assertAlmostEqual(config["elevator"]["portal_duration"], 3.0)
         self.assertAlmostEqual(config["trap_blacklist_radius"], 0.70)
         self.assertAlmostEqual(config["trap_clearance_margin"], 0.08)
         self.assertEqual(config["blacklist_clear_revisions"], 2)
@@ -408,6 +423,185 @@ class SimpleFrontierTest(unittest.TestCase):
         self.assertIsNone(goal)
         self.assertEqual(reason, "no_frontier")
         self.assertEqual(planner.remaining_frontier_count, 0)
+
+    def test_successful_goal_cools_until_map_progress(self):
+        planner = make_planner(np.zeros((3, 3), dtype=np.int8))
+        planner.failed_goals = []
+        planner.successful_goals = [
+            (1.0, 2.0, 5, MODULE.rospy.Time.from_sec(10.0))
+        ]
+        planner.failed_goal_cooldown = 15.0
+        planner.failed_goal_radius = 0.5
+        planner.success_goal_cooldown = 45.0
+        planner.success_goal_radius = 0.5
+        planner.success_goal_clear_revisions = 2
+        planner.map_revision = 5
+
+        with patch.object(
+                MODULE.rospy.Time, "now",
+                return_value=MODULE.rospy.Time.from_sec(20.0)):
+            self.assertTrue(planner._goal_is_cooled_down(1.2, 2.0))
+
+        planner.map_revision = 7
+        with patch.object(
+                MODULE.rospy.Time, "now",
+                return_value=MODULE.rospy.Time.from_sec(20.0)):
+            self.assertTrue(planner._goal_is_cooled_down(1.2, 2.0))
+
+        with patch.object(
+                MODULE.rospy.Time, "now",
+                return_value=MODULE.rospy.Time.from_sec(60.0)):
+            self.assertFalse(planner._goal_is_cooled_down(1.2, 2.0))
+
+    def test_elevator_poses_follow_portal_heading(self):
+        poses = MODULE.ExplorationPlanner._derive_elevator_poses(
+            (2.0, 3.0, 0.0), 0.7, 0.9, 0.8
+        )
+
+        self.assertEqual(poses["portal"], (2.0, 3.0, 0.0))
+        self.assertAlmostEqual(poses["lobby"][0], 1.3)
+        self.assertAlmostEqual(poses["lobby"][1], 3.0)
+        self.assertAlmostEqual(poses["cabin"][0], 2.9)
+        self.assertAlmostEqual(poses["cabin"][1], 3.0)
+        self.assertAlmostEqual(poses["exit"][0], 1.2)
+        self.assertAlmostEqual(abs(poses["exit"][2]), math.pi)
+
+    def test_autonomous_floor_selection_is_nearest_and_deterministic(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.current_floor = 1
+        planner.elevator_served_floors = [0, 1, 2, 3]
+        planner.completed_floors = {1, 3}
+        planner.autonomous_transition_failures = {}
+        planner.elevator_max_autonomous_transition_failures = 1
+
+        self.assertEqual(planner._select_next_autonomous_floor(), 0)
+
+        planner.completed_floors.add(0)
+        self.assertEqual(planner._select_next_autonomous_floor(), 2)
+
+    def test_blocked_floor_transition_is_not_global_completion(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.current_floor = 0
+        planner.elevator_enabled = True
+        planner.elevator_autonomous_when_floor_complete = True
+        planner.elevator_served_floors = [0, 1]
+        planner.elevator_max_autonomous_transition_failures = 1
+        planner.autonomous_transition_failures = {(0, 1): 1}
+        planner.visited_floors = set()
+        planner.completed_floors = set()
+        planner.complete_published = False
+        planner.next_autonomous_floor = None
+        states = []
+        planner._set_state = lambda state, reason: states.append((state, reason))
+
+        planner._handle_converged_floor("no_frontier")
+
+        self.assertEqual(planner.completed_floors, {0})
+        self.assertFalse(planner.complete_published)
+        self.assertEqual(
+            states[-1], ("FAILED", "autonomous_floor_transition_unavailable")
+        )
+
+    def test_all_served_floors_publish_global_completion(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.current_floor = 1
+        planner.elevator_enabled = True
+        planner.elevator_autonomous_when_floor_complete = True
+        planner.elevator_served_floors = [0, 1]
+        planner.visited_floors = {0}
+        planner.completed_floors = {0}
+        planner.complete_published = False
+        published = []
+        states = []
+        planner.complete_pub = SimpleNamespace(
+            publish=lambda message: published.append(message.data)
+        )
+        planner._set_state = lambda state, reason: states.append((state, reason))
+
+        planner._handle_converged_floor("no_frontier")
+
+        self.assertEqual(planner.completed_floors, {0, 1})
+        self.assertEqual(published, [True])
+        self.assertEqual(states[-1], ("COMPLETE", "all_served_floors_complete"))
+
+    def test_autonomous_floor_change_requires_explicit_portal_pose(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.current_floor = 0
+        planner.elevator_enabled = True
+        planner.elevator_autonomous_when_floor_complete = True
+        planner.elevator_served_floors = [0, 1]
+        planner.elevator_max_autonomous_transition_failures = 1
+        planner.autonomous_transition_failures = {}
+        planner.elevator_portal_pose = None
+        planner.visited_floors = set()
+        planner.completed_floors = set()
+        planner.complete_published = False
+        planner.next_autonomous_floor = None
+        states = []
+        planner._set_state = lambda state, reason: states.append((state, reason))
+
+        with patch.object(MODULE.rospy, "get_param", return_value=[]):
+            planner._handle_converged_floor("no_frontier")
+
+        self.assertFalse(planner.complete_published)
+        self.assertEqual(planner.next_autonomous_floor, 1)
+        self.assertEqual(
+            states[-1], ("FAILED", "autonomous_elevator_portal_not_configured")
+        )
+
+    def test_manual_elevator_keeps_last_successful_goal_fallback(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.state_lock = threading.RLock()
+        planner.elevator_target_floor = 1
+        planner.elevator_portal_pose = None
+        planner.last_successful_goal = (2.0, 3.0, 0.5)
+        calls = []
+        planner._start_elevator_locked = lambda target, portal, autonomous: (
+            calls.append((target, portal, autonomous)) or (True, "started")
+        )
+
+        def get_param(name, default):
+            if name == "~elevator/target_floor":
+                return 1
+            if name == "~elevator/portal_pose":
+                return []
+            return default
+
+        with patch.object(MODULE.rospy, "get_param", side_effect=get_param):
+            response = planner.start_elevator_cb(None)
+
+        self.assertTrue(response.success)
+        self.assertEqual(calls, [(1, (2.0, 3.0, 0.5), False)])
+
+    def test_elevator_completion_resets_floor_local_runtime_state(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.elevator_source_floor = 0
+        planner.elevator_target_floor = 1
+        planner.elevator_active = True
+        planner.elevator_autonomous_transition = True
+        planner.next_autonomous_floor = 1
+        planner.visited_floors = {0}
+        planner.no_reachable_frontier_cycles = 5
+        planner.retry_count = 2
+        planner.failed_goals = [(1.0, 1.0, None)]
+        planner.successful_goals = [(2.0, 2.0, 1, None)]
+        planner.last_successful_goal = (2.0, 2.0, 0.0)
+        planner.trap_blacklist = {(1, 1): 0}
+        planner.observation_goal_cells = [(1, 1)]
+        states = []
+        planner._set_state = lambda state, reason: states.append((state, reason))
+
+        now = MODULE.rospy.Time.from_sec(20.0)
+        with patch.object(MODULE.rospy.Time, "now", return_value=now):
+            planner._complete_elevator()
+
+        self.assertEqual(planner.visited_floors, {0, 1})
+        self.assertEqual(planner.failed_goals, [])
+        self.assertEqual(planner.successful_goals, [])
+        self.assertEqual(planner.trap_blacklist, {})
+        self.assertEqual(planner.no_reachable_frontier_cycles, 0)
+        self.assertEqual(planner.last_significant_map_change, now)
+        self.assertEqual(states[-1], ("WAITING", "elevator_complete"))
 
 
 if __name__ == "__main__":

@@ -38,6 +38,13 @@ start_service: /danger_search/start_exploration
 stop_service: /danger_search/stop_exploration
 start_exploration_service: /danger_search/start_exploration
 stop_exploration_service: /danger_search/stop_exploration
+start_elevator_service: /danger_search/start_elevator
+cancel_elevator_service: /danger_search/cancel_elevator
+set_door_state_service: /set_door_state
+call_elevator_service: /call_elevator
+set_current_floor_service: /localization/set_current_floor
+traverse_portal_service: /navigation/traverse_portal
+cancel_portal_service: /navigation/cancel_portal
 start_mission_service: /danger_search/start
 finish_mission_service: /danger_search/finish
 return_home_service: /danger_search/return_home

@@ -33,7 +33,12 @@ class StandardNavigationConfigTest(unittest.TestCase):
             remap.attrib["from"]: remap.attrib["to"]
             for remap in move_base.findall("remap")
         }
-        self.assertEqual(remaps["cmd_vel"], "/danger_search/nav_cmd_vel")
+        self.assertEqual(
+            remaps["cmd_vel"], "/danger_search/move_base_cmd_vel"
+        )
+        mux = root.find("node[@name='navigation_command_mux']")
+        self.assertIsNotNone(mux)
+        self.assertEqual(mux.attrib["type"], "navigation_command_mux.py")
 
     def test_plugins_and_make_plan_safety_are_explicit(self):
         config = self._yaml("standard_move_base.yaml")

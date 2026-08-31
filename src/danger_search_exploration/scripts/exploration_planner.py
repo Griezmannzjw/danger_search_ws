@@ -33,9 +33,63 @@ from std_srvs.srv import Trigger, TriggerResponse
 from std_msgs.msg import Bool, String
 from nav_msgs.srv import GetPlan
 from danger_search_common.msg import MappingStatus, NavigationHealth, RecoveryEvent
+from danger_search_common.srv import SetCurrentFloor, TraversePortal
+
+try:
+    from building_generator_interfaces.srv import CallElevator, SetDoorState
+except ImportError:
+    CallElevator = None
+    SetDoorState = None
 
 
 class ExplorationPlanner:
+    @staticmethod
+    def _normalize_floor_ids(value):
+        if not isinstance(value, (list, tuple)) or not value:
+            raise rospy.ROSInitException("~elevator/served_floors must be a non-empty list")
+        try:
+            floors = sorted(set(int(item) for item in value))
+        except (TypeError, ValueError):
+            raise rospy.ROSInitException("~elevator/served_floors must contain integers")
+        return floors
+
+    @staticmethod
+    def _parse_optional_pose_param(value):
+        if value in (None, [], ()):
+            return None
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            raise rospy.ROSInitException("~elevator/portal_pose must be [x, y, yaw]")
+        pose = tuple(float(item) for item in value)
+        if not all(math.isfinite(item) for item in pose):
+            raise rospy.ROSInitException("~elevator/portal_pose must be finite")
+        return pose
+
+    @staticmethod
+    def _derive_elevator_poses(portal_pose, lobby_offset, cabin_distance,
+                               exit_distance):
+        portal_x, portal_y, portal_yaw = portal_pose
+        direction_x = math.cos(portal_yaw)
+        direction_y = math.sin(portal_yaw)
+        return {
+            "portal": portal_pose,
+            "lobby": (
+                portal_x - lobby_offset * direction_x,
+                portal_y - lobby_offset * direction_y,
+                portal_yaw,
+            ),
+            "cabin": (
+                portal_x + cabin_distance * direction_x,
+                portal_y + cabin_distance * direction_y,
+                portal_yaw,
+            ),
+            "exit": (
+                portal_x - exit_distance * direction_x,
+                portal_y - exit_distance * direction_y,
+                math.atan2(math.sin(portal_yaw + math.pi),
+                           math.cos(portal_yaw + math.pi)),
+            ),
+        }
+
     def __init__(self):
         rospy.init_node("exploration_planner", anonymous=False)
 
@@ -54,6 +108,27 @@ class ExplorationPlanner:
         self.complete_topic = rospy.get_param("~complete_topic", "/exploration/complete")
         self.recovery_event_topic = rospy.get_param(
             "~recovery_event_topic", "/navigation/recovery_event"
+        )
+        self.start_elevator_service = rospy.get_param(
+            "~start_elevator_service", "/danger_search/start_elevator"
+        )
+        self.cancel_elevator_service = rospy.get_param(
+            "~cancel_elevator_service", "/danger_search/cancel_elevator"
+        )
+        self.set_door_state_service = rospy.get_param(
+            "~set_door_state_service", "/set_door_state"
+        )
+        self.call_elevator_service = rospy.get_param(
+            "~call_elevator_service", "/call_elevator"
+        )
+        self.set_current_floor_service = rospy.get_param(
+            "~set_current_floor_service", "/localization/set_current_floor"
+        )
+        self.traverse_portal_service = rospy.get_param(
+            "~traverse_portal_service", "/navigation/traverse_portal"
+        )
+        self.cancel_portal_service = rospy.get_param(
+            "~cancel_portal_service", "/navigation/cancel_portal"
         )
 
         # 探索参数
@@ -83,6 +158,15 @@ class ExplorationPlanner:
         self.plan_tolerance = rospy.get_param("~plan_tolerance", 0.5)
         self.failed_goal_cooldown = rospy.get_param("~failed_goal_cooldown", 30.0)
         self.failed_goal_radius = rospy.get_param("~failed_goal_radius", 0.75)
+        self.success_goal_cooldown = float(
+            rospy.get_param("~success_goal_cooldown", 45.0)
+        )
+        self.success_goal_radius = float(
+            rospy.get_param("~success_goal_radius", 0.50)
+        )
+        self.success_goal_clear_revisions = int(
+            rospy.get_param("~success_goal_clear_revisions", 2)
+        )
         self.dependency_check_timeout = rospy.get_param("~dependency_check_timeout", 0.1)
         self.input_timeout = rospy.get_param("~input_timeout", 3.0)
         self.no_frontier_cycles_required = rospy.get_param("~no_frontier_cycles_required", 5)
@@ -122,6 +206,85 @@ class ExplorationPlanner:
                 and self.trap_blacklist_radius > 0.0
                 and self.blacklist_clear_revisions >= 1):
             raise rospy.ROSInitException("前沿观察位或长期黑名单参数无效")
+        if (self.success_goal_cooldown < 0.0
+                or self.success_goal_radius <= 0.0
+                or self.success_goal_clear_revisions < 1):
+            raise rospy.ROSInitException("成功目标冷却参数无效")
+
+        self.elevator_enabled = bool(rospy.get_param("~elevator/enabled", False))
+        self.elevator_id = rospy.get_param("~elevator/id", "elevator_main")
+        self.elevator_target_floor = int(
+            rospy.get_param("~elevator/target_floor", 1)
+        )
+        self.elevator_autonomous_when_floor_complete = bool(
+            rospy.get_param("~elevator/autonomous_when_floor_complete", True)
+        )
+        self.elevator_served_floors = self._normalize_floor_ids(
+            rospy.get_param("~elevator/served_floors", [0, 1])
+        )
+        self.elevator_max_autonomous_transition_failures = int(
+            rospy.get_param("~elevator/max_autonomous_transition_failures", 1)
+        )
+        self.elevator_door_prefix = rospy.get_param(
+            "~elevator/door_prefix", "elevator_floor_"
+        )
+        self.elevator_portal_pose = self._parse_optional_pose_param(
+            rospy.get_param("~elevator/portal_pose", [])
+        )
+        self.elevator_lobby_offset = float(
+            rospy.get_param("~elevator/lobby_offset", 0.70)
+        )
+        self.elevator_portal_near_distance = float(
+            rospy.get_param("~elevator/portal_near_distance", 0.40)
+        )
+        self.elevator_cabin_distance = float(
+            rospy.get_param("~elevator/cabin_distance", 0.60)
+        )
+        self.elevator_exit_distance = float(
+            rospy.get_param("~elevator/exit_distance", 0.80)
+        )
+        self.elevator_nav_timeout = float(
+            rospy.get_param("~elevator/navigation_timeout", 45.0)
+        )
+        self.elevator_service_timeout = float(
+            rospy.get_param("~elevator/service_timeout", 10.0)
+        )
+        self.elevator_operation_timeout = float(
+            rospy.get_param("~elevator/operation_timeout", 45.0)
+        )
+        self.elevator_floor_timeout = float(
+            rospy.get_param("~elevator/floor_timeout", 45.0)
+        )
+        self.elevator_floor_stable_time = float(
+            rospy.get_param("~elevator/floor_stable_time", 3.0)
+        )
+        self.elevator_close_target_door = bool(
+            rospy.get_param("~elevator/close_target_door_after_exit", False)
+        )
+        self.elevator_portal_traversal_enabled = bool(
+            rospy.get_param("~elevator/portal_traversal_enabled", True)
+        )
+        self.elevator_portal_speed = float(
+            rospy.get_param("~elevator/portal_speed", 0.25)
+        )
+        self.elevator_portal_duration = float(
+            rospy.get_param("~elevator/portal_duration", 3.0)
+        )
+        if self.elevator_enabled and (CallElevator is None or SetDoorState is None):
+            raise rospy.ROSInitException(
+                "elevator enabled but building_generator_interfaces is unavailable"
+            )
+        if (self.elevator_lobby_offset <= 0.0
+                or self.elevator_portal_near_distance < 0.0
+                or self.elevator_cabin_distance <= 0.0
+                or self.elevator_exit_distance <= 0.0
+                or min(self.elevator_nav_timeout, self.elevator_service_timeout,
+                       self.elevator_operation_timeout, self.elevator_floor_timeout) <= 0.0
+                or self.elevator_floor_stable_time < 0.0
+                or self.elevator_portal_speed <= 0.0
+                or self.elevator_portal_duration <= 0.0
+                or self.elevator_max_autonomous_transition_failures < 1):
+            raise rospy.ROSInitException("电梯流程参数无效")
 
         # ========== 状态 ==========
         self.exploring = False
@@ -132,6 +295,7 @@ class ExplorationPlanner:
         self.mapping_ready = False
         self.mapping_stable = False
         self.mapping_lost = True
+        self.current_floor = 0
         self.nav_ready = False
         self.nav_has_active_goal = False
         self.nav_stuck = False
@@ -152,7 +316,10 @@ class ExplorationPlanner:
         self.retry_count = 0
         self.last_goal_time = rospy.Time(0)
         self.current_goal = None
+        self.goal_context = "exploration"
         self.failed_goals = []
+        self.successful_goals = []
+        self.last_successful_goal = None
         self.trap_blacklist = {}
         self.last_recovery_event_id = 0
         self.last_recovery_trigger_id = 0
@@ -161,6 +328,24 @@ class ExplorationPlanner:
         self.observation_goal_cells = []
         self.session_id = 0
         self.goal_id = 0
+        self.elevator_active = False
+        self.elevator_state = "IDLE"
+        self.elevator_reason = "disabled" if not self.elevator_enabled else "idle"
+        self.elevator_source_floor = 0
+        self.elevator_poses = None
+        self.elevator_portal_body_command = (0.0, 0.0)
+        self.elevator_goal_result = None
+        self.elevator_goal_sent = False
+        self.elevator_step_started = rospy.Time(0)
+        self.elevator_floor_stable_since = rospy.Time(0)
+        self.elevator_operation_token = 0
+        self.elevator_operation_name = ""
+        self.elevator_operation_result = None
+        self.elevator_autonomous_transition = False
+        self.next_autonomous_floor = None
+        self.visited_floors = set()
+        self.completed_floors = set()
+        self.autonomous_transition_failures = {}
         self.state_lock = threading.RLock()
 
         # ========== Action客户端 ==========
@@ -170,6 +355,27 @@ class ExplorationPlanner:
 
         # ========== 服务客户端 ==========
         self.make_plan_client = rospy.ServiceProxy(self.make_plan_service, GetPlan)
+        self.set_door_client = None
+        self.call_elevator_client = None
+        self.set_current_floor_client = None
+        self.traverse_portal_client = None
+        self.cancel_portal_client = None
+        if self.elevator_enabled:
+            self.set_door_client = rospy.ServiceProxy(
+                self.set_door_state_service, SetDoorState
+            )
+            self.call_elevator_client = rospy.ServiceProxy(
+                self.call_elevator_service, CallElevator
+            )
+            self.set_current_floor_client = rospy.ServiceProxy(
+                self.set_current_floor_service, SetCurrentFloor
+            )
+            self.traverse_portal_client = rospy.ServiceProxy(
+                self.traverse_portal_service, TraversePortal
+            )
+            self.cancel_portal_client = rospy.ServiceProxy(
+                self.cancel_portal_service, Trigger
+            )
 
         # ========== 订阅者 ==========
         self.pose_sub = rospy.Subscriber(
@@ -194,6 +400,12 @@ class ExplorationPlanner:
         )
         self.stop_srv = rospy.Service(
             self.stop_service, Trigger, self.stop_exploration_cb
+        )
+        self.start_elevator_srv = rospy.Service(
+            self.start_elevator_service, Trigger, self.start_elevator_cb
+        )
+        self.cancel_elevator_srv = rospy.Service(
+            self.cancel_elevator_service, Trigger, self.cancel_elevator_cb
         )
         self.status_pub = rospy.Publisher(self.status_topic, String, queue_size=10, latch=True)
         self.complete_pub = rospy.Publisher(self.complete_topic, Bool, queue_size=1, latch=True)
@@ -251,6 +463,7 @@ class ExplorationPlanner:
         self.mapping_ready = msg.ready
         self.mapping_stable = msg.stable
         self.mapping_lost = msg.lost
+        self.current_floor = int(msg.current_floor)
         self.last_mapping_status_time = rospy.Time.now()
 
     def nav_health_callback(self, msg):
@@ -391,6 +604,25 @@ class ExplorationPlanner:
             "has_active_goal": bool(self.waiting_for_result or self.nav_has_active_goal),
             "blacklisted_cell_count": len(getattr(self, "trap_blacklist", {})),
             "observation_goal_count": len(getattr(self, "observation_goal_cells", [])),
+            "elevator_enabled": bool(getattr(self, "elevator_enabled", False)),
+            "elevator_active": bool(getattr(self, "elevator_active", False)),
+            "elevator_state": getattr(self, "elevator_state", "IDLE"),
+            "elevator_reason": getattr(self, "elevator_reason", "idle"),
+            "current_floor": int(getattr(self, "current_floor", 0)),
+            "autonomous_floor_change_enabled": bool(
+                getattr(self, "elevator_enabled", False)
+                and getattr(self, "elevator_autonomous_when_floor_complete", False)
+            ),
+            "served_floors": list(getattr(self, "elevator_served_floors", [])),
+            "visited_floors": sorted(getattr(self, "visited_floors", set())),
+            "completed_floors": sorted(getattr(self, "completed_floors", set())),
+            "next_autonomous_floor": getattr(self, "next_autonomous_floor", None),
+            "autonomous_transition_failures": {
+                f"{source}->{target}": count
+                for (source, target), count in sorted(
+                    getattr(self, "autonomous_transition_failures", {}).items()
+                )
+            },
         }
         self.status_pub.publish(String(data=json.dumps(payload, sort_keys=True)))
 
@@ -517,20 +749,46 @@ class ExplorationPlanner:
     def _goal_is_cooled_down(self, goal_x, goal_y):
         now = rospy.Time.now()
         self.failed_goals = [
-            failure for failure in self.failed_goals
-            if (now - failure[2]).to_sec() < self.failed_goal_cooldown
+            failure for failure in getattr(self, "failed_goals", [])
+            if (now - failure[2]).to_sec()
+            < getattr(self, "failed_goal_cooldown", 0.0)
         ]
-        return any(
+        success_goal_cooldown = getattr(self, "success_goal_cooldown", 0.0)
+        success_goal_clear_revisions = getattr(
+            self, "success_goal_clear_revisions", 1
+        )
+        map_revision = getattr(self, "map_revision", 0)
+        self.successful_goals = [
+            success for success in getattr(self, "successful_goals", [])
+            if ((now - success[3]).to_sec() < success_goal_cooldown
+                or map_revision - success[2] < success_goal_clear_revisions)
+        ]
+        failed_nearby = any(
             math.hypot(goal_x - failed_x, goal_y - failed_y)
             < self.failed_goal_radius
             for failed_x, failed_y, _ in self.failed_goals
         )
+        successful_nearby = any(
+            math.hypot(goal_x - success_x, goal_y - success_y)
+            < getattr(self, "success_goal_radius", 0.0)
+            for success_x, success_y, _, _ in self.successful_goals
+        )
+        return failed_nearby or successful_nearby
 
     def _remember_failed_goal(self):
         if self.current_goal is not None:
             self.failed_goals.append(
                 (self.current_goal[0], self.current_goal[1], rospy.Time.now())
             )
+
+    def _remember_successful_goal(self):
+        if self.current_goal is None:
+            return
+        goal = tuple(self.current_goal)
+        self.last_successful_goal = goal
+        self.successful_goals.append(
+            (goal[0], goal[1], self.map_revision, rospy.Time.now())
+        )
 
     def _frontier_mask(self):
         """返回与未知四邻接的已知自由栅格。"""
@@ -819,7 +1077,7 @@ class ExplorationPlanner:
 
         return None, "all_frontiers_unreachable_or_blacklisted"
 
-    def _send_goal(self, gx, gy, yaw=0.0):
+    def _send_goal(self, gx, gy, yaw=0.0, context="exploration"):
         """发送导航目标"""
         if not self.move_base_client.wait_for_server(
                 rospy.Duration(self.dependency_check_timeout)):
@@ -846,8 +1104,12 @@ class ExplorationPlanner:
         )
         self.waiting_for_result = True
         self.current_goal = (gx, gy, yaw)
+        self.goal_context = context
         self.last_goal_time = rospy.Time.now()
-        rospy.loginfo(f"[exploration] Sent goal: ({gx:.2f}, {gy:.2f})")
+        rospy.loginfo(
+            "[exploration] Sent %s goal: (%.2f, %.2f, %.1fdeg)",
+            context, gx, gy, math.degrees(yaw),
+        )
         return True
 
     def goal_done_cb(self, session_id, goal_id, state, result):
@@ -857,14 +1119,30 @@ class ExplorationPlanner:
                     or not self.exploring):
                 return
             self.waiting_for_result = False
+            status_text = ""
+            try:
+                status_text = self.move_base_client.get_goal_status_text()
+            except AttributeError:
+                pass
+            if self.goal_context.startswith("elevator:"):
+                succeeded = state == actionlib.GoalStatus.SUCCEEDED
+                self.elevator_goal_result = (
+                    succeeded,
+                    status_text or ("goal_succeeded" if succeeded else f"state_{state}"),
+                )
+                rospy.loginfo(
+                    "[exploration] Elevator navigation %s: %s",
+                    "succeeded" if succeeded else "failed",
+                    self.elevator_goal_result[1],
+                )
+                self.current_goal = None
+                self.goal_context = "exploration"
+                return
             if state == actionlib.GoalStatus.SUCCEEDED:
                 rospy.loginfo("[exploration] Goal succeeded")
+                self._remember_successful_goal()
                 self.retry_count = 0
             else:
-                try:
-                    status_text = self.move_base_client.get_goal_status_text()
-                except AttributeError:
-                    status_text = ""
                 rospy.loginfo(
                     "[exploration] Goal failed: state=%d action_text=%s "
                     "nav_failure=%s detail=%s",
@@ -889,6 +1167,432 @@ class ExplorationPlanner:
                 self.retry_count += 1
             self.current_goal = None
 
+    def _transition_elevator(self, state, reason):
+        self.elevator_state = state
+        self.elevator_reason = reason
+        self.elevator_goal_result = None
+        self.elevator_goal_sent = False
+        self.elevator_operation_name = ""
+        self.elevator_operation_result = None
+        self.elevator_step_started = rospy.Time.now()
+        self.elevator_floor_stable_since = rospy.Time(0)
+        self._set_state(state, reason)
+        rospy.loginfo("[exploration] Elevator state -> %s: %s", state, reason)
+
+    def _start_elevator_operation(self, name, operation):
+        self.elevator_operation_token += 1
+        token = self.elevator_operation_token
+        self.elevator_operation_name = name
+        self.elevator_operation_result = None
+        self.elevator_step_started = rospy.Time.now()
+
+        def worker():
+            try:
+                success, message = operation()
+            except (rospy.ROSException, rospy.ServiceException) as error:
+                success, message = False, str(error)
+            except Exception as error:
+                success, message = False, f"unexpected service error: {error}"
+            with self.state_lock:
+                if token != self.elevator_operation_token:
+                    return
+                self.elevator_operation_result = (bool(success), str(message))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_elevator_door(self, floor_id, open_state):
+        rospy.wait_for_service(
+            self.set_door_state_service, timeout=self.elevator_service_timeout
+        )
+        response = self.set_door_client(
+            door_id=f"{self.elevator_door_prefix}{floor_id}", open=open_state
+        )
+        return response.accepted, response.message or response.state
+
+    def _call_elevator(self, floor_id):
+        rospy.wait_for_service(
+            self.call_elevator_service, timeout=self.elevator_service_timeout
+        )
+        response = self.call_elevator_client(
+            elevator_id=self.elevator_id,
+            target_floor=floor_id,
+            open_doors=False,
+        )
+        if response.accepted and int(response.current_floor) != int(floor_id):
+            return False, (
+                f"elevator reported floor {response.current_floor}, expected {floor_id}"
+            )
+        return response.accepted, response.message or response.state
+
+    def _set_localization_floor(self, floor_id):
+        rospy.wait_for_service(
+            self.set_current_floor_service, timeout=self.elevator_service_timeout
+        )
+        response = self.set_current_floor_client(
+            floor_id=floor_id,
+            reason=f"elevator_{self.elevator_source_floor}_to_{floor_id}",
+        )
+        return response.accepted, response.message
+
+    def _traverse_elevator_portal(self, direction):
+        rospy.wait_for_service(
+            self.traverse_portal_service, timeout=self.elevator_service_timeout
+        )
+        body_x, body_y = self.elevator_portal_body_command
+        response = self.traverse_portal_client(
+            linear_x=direction * body_x,
+            linear_y=direction * body_y,
+            angular_z=0.0,
+            duration=self.elevator_portal_duration,
+        )
+        return response.accepted, response.message
+
+    def _cancel_portal_traversal(self):
+        if self.cancel_portal_client is None:
+            return
+        try:
+            self.cancel_portal_client()
+        except (rospy.ROSException, rospy.ServiceException):
+            pass
+
+    def _fail_elevator(self, reason):
+        rospy.logerr("[exploration] Elevator flow failed: %s", reason)
+        if self.elevator_autonomous_transition:
+            transition = (self.elevator_source_floor, self.elevator_target_floor)
+            self.autonomous_transition_failures[transition] = (
+                self.autonomous_transition_failures.get(transition, 0) + 1
+            )
+        self._cancel_portal_traversal()
+        self.goal_id += 1
+        self.move_base_client.cancel_all_goals()
+        self.waiting_for_result = False
+        self.current_goal = None
+        self.goal_context = "exploration"
+        self.elevator_operation_token += 1
+        self.elevator_active = False
+        self.elevator_autonomous_transition = False
+        self.next_autonomous_floor = None
+        self.elevator_state = "ELEVATOR_ERROR"
+        self.elevator_reason = reason
+        self.last_goal_time = rospy.Time.now()
+        self._set_state("RECOVERING", f"elevator_failed:{reason}")
+
+    def _complete_elevator(self):
+        rospy.loginfo(
+            "[exploration] Elevator flow completed: floor %d -> %d",
+            self.elevator_source_floor, self.elevator_target_floor,
+        )
+        self.elevator_active = False
+        self.elevator_autonomous_transition = False
+        self.next_autonomous_floor = None
+        self.elevator_state = "ELEVATOR_COMPLETE"
+        self.elevator_reason = "completed"
+        now = rospy.Time.now()
+        self.visited_floors.add(self.elevator_target_floor)
+        self.no_reachable_frontier_cycles = 0
+        self.retry_count = 0
+        self.failed_goals = []
+        self.successful_goals = []
+        self.last_successful_goal = None
+        self.trap_blacklist = {}
+        self.observation_goal_cells = []
+        self.last_significant_map_change = now
+        self.last_goal_time = now
+        self._set_state("WAITING", "elevator_complete")
+
+    def _run_elevator_navigation_step(self, pose_name, next_state):
+        if self.elevator_goal_result is not None:
+            success, message = self.elevator_goal_result
+            self.elevator_goal_result = None
+            if not success:
+                self._fail_elevator(f"{self.elevator_state}:{message}")
+                return
+            self._transition_elevator(next_state, f"{pose_name}_reached")
+            return
+
+        if self.elevator_goal_sent:
+            if ((rospy.Time.now() - self.elevator_step_started).to_sec()
+                    > self.elevator_nav_timeout):
+                self.goal_id += 1
+                self.move_base_client.cancel_goal()
+                self.waiting_for_result = False
+                self.current_goal = None
+                self._fail_elevator(f"{self.elevator_state}:navigation_timeout")
+            return
+
+        pose = self.elevator_poses[pose_name]
+        if not self._send_goal(
+                pose[0], pose[1], pose[2], context=f"elevator:{pose_name}"):
+            self._fail_elevator(f"{self.elevator_state}:move_base_unavailable")
+            return
+        self.elevator_goal_sent = True
+        self.elevator_step_started = rospy.Time.now()
+
+    def _run_elevator_operation_step(self, name, operation, next_state):
+        if not self.elevator_operation_name:
+            self._start_elevator_operation(name, operation)
+            return
+        if self.elevator_operation_result is not None:
+            success, message = self.elevator_operation_result
+            self.elevator_operation_result = None
+            if not success:
+                self._fail_elevator(f"{name}:{message}")
+                return
+            self._transition_elevator(next_state, f"{name}_completed")
+            return
+        if ((rospy.Time.now() - self.elevator_step_started).to_sec()
+                > self.elevator_operation_timeout):
+            self.elevator_operation_token += 1
+            self._fail_elevator(f"{name}:operation_timeout")
+
+    def _elevator_loop(self, now):
+        state = self.elevator_state
+        if state == "NAVIGATE_ELEVATOR_LOBBY":
+            self._run_elevator_navigation_step("lobby", "CALL_ELEVATOR_CURRENT_FLOOR")
+        elif state == "CALL_ELEVATOR_CURRENT_FLOOR":
+            self._run_elevator_operation_step(
+                "call_current_floor",
+                lambda: self._call_elevator(self.elevator_source_floor),
+                "OPEN_ELEVATOR_CURRENT_DOOR",
+            )
+        elif state == "OPEN_ELEVATOR_CURRENT_DOOR":
+            self._run_elevator_operation_step(
+                "open_current_door",
+                lambda: self._set_elevator_door(self.elevator_source_floor, True),
+                "ENTER_ELEVATOR",
+            )
+        elif state == "ENTER_ELEVATOR":
+            if self.elevator_portal_traversal_enabled:
+                self._run_elevator_operation_step(
+                    "enter_elevator",
+                    lambda: self._traverse_elevator_portal(1.0),
+                    "CLOSE_ELEVATOR_CURRENT_DOOR",
+                )
+            else:
+                self._run_elevator_navigation_step(
+                    "cabin", "CLOSE_ELEVATOR_CURRENT_DOOR"
+                )
+        elif state == "CLOSE_ELEVATOR_CURRENT_DOOR":
+            self._run_elevator_operation_step(
+                "close_current_door",
+                lambda: self._set_elevator_door(self.elevator_source_floor, False),
+                "CHANGE_ELEVATOR_FLOOR",
+            )
+        elif state == "CHANGE_ELEVATOR_FLOOR":
+            self._run_elevator_operation_step(
+                "move_elevator",
+                lambda: self._call_elevator(self.elevator_target_floor),
+                "SET_LOCALIZATION_TARGET_FLOOR",
+            )
+        elif state == "SET_LOCALIZATION_TARGET_FLOOR":
+            self._run_elevator_operation_step(
+                "set_localization_floor",
+                lambda: self._set_localization_floor(self.elevator_target_floor),
+                "OPEN_ELEVATOR_TARGET_DOOR",
+            )
+        elif state == "OPEN_ELEVATOR_TARGET_DOOR":
+            self._run_elevator_operation_step(
+                "open_target_door",
+                lambda: self._set_elevator_door(self.elevator_target_floor, True),
+                "WAIT_ELEVATOR_TARGET_MAP",
+            )
+        elif state == "WAIT_ELEVATOR_TARGET_MAP":
+            if self.current_floor == self.elevator_target_floor and self.mapping_stable:
+                if self.elevator_floor_stable_since == rospy.Time(0):
+                    self.elevator_floor_stable_since = now
+                elif ((now - self.elevator_floor_stable_since).to_sec()
+                      >= self.elevator_floor_stable_time):
+                    self._transition_elevator("EXIT_ELEVATOR", "target_floor_stable")
+            else:
+                self.elevator_floor_stable_since = rospy.Time(0)
+            if ((now - self.elevator_step_started).to_sec()
+                    > self.elevator_floor_timeout):
+                self._fail_elevator("target_floor_mapping_timeout")
+        elif state == "EXIT_ELEVATOR":
+            next_state = (
+                "CLOSE_ELEVATOR_TARGET_DOOR"
+                if self.elevator_close_target_door else "ELEVATOR_COMPLETE"
+            )
+            if self.elevator_portal_traversal_enabled:
+                self._run_elevator_operation_step(
+                    "exit_elevator",
+                    lambda: self._traverse_elevator_portal(-1.0),
+                    next_state,
+                )
+            else:
+                self._run_elevator_navigation_step("exit", next_state)
+        elif state == "CLOSE_ELEVATOR_TARGET_DOOR":
+            self._run_elevator_operation_step(
+                "close_target_door",
+                lambda: self._set_elevator_door(self.elevator_target_floor, False),
+                "ELEVATOR_COMPLETE",
+            )
+        elif state == "ELEVATOR_COMPLETE":
+            self._complete_elevator()
+        else:
+            self._fail_elevator(f"invalid_state:{state}")
+
+    def _start_elevator_locked(self, target_floor, portal_pose, autonomous=False):
+        if not self.elevator_enabled:
+            return False, "Elevator flow disabled"
+        if not self.exploring:
+            return False, "Exploration must be running"
+        if self.elevator_active:
+            return True, f"Elevator already active: {self.elevator_state}"
+        if target_floor == self.current_floor:
+            return False, "Target floor equals current floor"
+        if portal_pose is None:
+            return False, "No elevator portal pose"
+        if self.current_pose is None:
+            return False, "Current pose unavailable"
+
+        self.goal_id += 1
+        self.move_base_client.cancel_all_goals()
+        self.waiting_for_result = False
+        self.current_goal = None
+        self.goal_context = "exploration"
+        self.elevator_source_floor = self.current_floor
+        self.elevator_target_floor = int(target_floor)
+        self.elevator_autonomous_transition = bool(autonomous)
+        self.next_autonomous_floor = int(target_floor) if autonomous else None
+        self.elevator_poses = self._derive_elevator_poses(
+            portal_pose,
+            self.elevator_lobby_offset,
+            self.elevator_cabin_distance,
+            self.elevator_exit_distance,
+        )
+        robot_yaw = self._yaw_from_quaternion(self.current_pose.orientation)
+        relative_yaw = portal_pose[2] - robot_yaw
+        self.elevator_portal_body_command = (
+            self.elevator_portal_speed * math.cos(relative_yaw),
+            self.elevator_portal_speed * math.sin(relative_yaw),
+        )
+        self.elevator_operation_token += 1
+        self.elevator_active = True
+        portal_distance = math.hypot(
+            self.current_pose.position.x - portal_pose[0],
+            self.current_pose.position.y - portal_pose[1],
+        )
+        if portal_distance <= self.elevator_portal_near_distance:
+            self._transition_elevator(
+                "CALL_ELEVATOR_CURRENT_FLOOR",
+                f"already_near_portal:{portal_distance:.2f}m",
+            )
+        else:
+            self._transition_elevator(
+                "NAVIGATE_ELEVATOR_LOBBY",
+                f"floor_{self.elevator_source_floor}_to_{self.elevator_target_floor}",
+            )
+        return True, (f"Elevator flow started: floor {self.elevator_source_floor} "
+                      f"-> {self.elevator_target_floor}")
+
+    def start_elevator_cb(self, req):
+        del req
+        with self.state_lock:
+            target_floor = int(rospy.get_param(
+                "~elevator/target_floor", self.elevator_target_floor
+            ))
+            configured_portal = self._parse_optional_pose_param(
+                rospy.get_param(
+                    "~elevator/portal_pose",
+                    list(self.elevator_portal_pose) if self.elevator_portal_pose else [],
+                )
+            )
+            portal_pose = configured_portal or self.last_successful_goal
+            success, message = self._start_elevator_locked(
+                target_floor, portal_pose, autonomous=False
+            )
+            if not success and message == "No elevator portal pose":
+                message = ("No elevator portal pose; configure elevator/portal_pose "
+                           "or first reach the portal frontier")
+            return TriggerResponse(success=success, message=message)
+
+    def _select_next_autonomous_floor(self):
+        candidates = []
+        for floor_id in self.elevator_served_floors:
+            transition = (self.current_floor, floor_id)
+            if (floor_id == self.current_floor
+                    or floor_id in self.completed_floors
+                    or self.autonomous_transition_failures.get(transition, 0)
+                    >= self.elevator_max_autonomous_transition_failures):
+                continue
+            candidates.append(floor_id)
+        if not candidates:
+            return None
+        return min(candidates, key=lambda floor_id: (
+            abs(floor_id - self.current_floor), floor_id
+        ))
+
+    def _publish_global_complete(self, reason):
+        if not self.complete_published:
+            self.complete_published = True
+            self.complete_pub.publish(Bool(data=True))
+            rospy.loginfo(
+                "[exploration] Exploration converged on floors %s",
+                sorted(self.completed_floors),
+            )
+        self._set_state("COMPLETE", reason)
+
+    def _handle_converged_floor(self, selection_reason):
+        self.visited_floors.add(self.current_floor)
+        self.completed_floors.add(self.current_floor)
+        if not (self.elevator_enabled
+                and self.elevator_autonomous_when_floor_complete):
+            self._publish_global_complete(selection_reason)
+            return
+        if set(self.elevator_served_floors).issubset(self.completed_floors):
+            self._publish_global_complete("all_served_floors_complete")
+            return
+
+        target_floor = self._select_next_autonomous_floor()
+        self.next_autonomous_floor = target_floor
+        if target_floor is None:
+            self._set_state("FAILED", "autonomous_floor_transition_unavailable")
+            return
+
+        configured_portal = self._parse_optional_pose_param(rospy.get_param(
+            "~elevator/portal_pose",
+            list(self.elevator_portal_pose) if self.elevator_portal_pose else [],
+        ))
+        if configured_portal is None:
+            self._set_state("FAILED", "autonomous_elevator_portal_not_configured")
+            return
+        self.elevator_portal_pose = configured_portal
+        success, message = self._start_elevator_locked(
+            target_floor, configured_portal, autonomous=True
+        )
+        if not success:
+            self.next_autonomous_floor = None
+            self._set_state("FAILED", f"autonomous_elevator_start_failed:{message}")
+
+    def _cancel_elevator_locked(self, reason):
+        if not self.elevator_active:
+            return False
+        self.goal_id += 1
+        self.move_base_client.cancel_all_goals()
+        self._cancel_portal_traversal()
+        self.waiting_for_result = False
+        self.current_goal = None
+        self.goal_context = "exploration"
+        self.elevator_operation_token += 1
+        self.elevator_active = False
+        self.elevator_autonomous_transition = False
+        self.next_autonomous_floor = None
+        self.elevator_state = "ELEVATOR_CANCELED"
+        self.elevator_reason = reason
+        self.last_goal_time = rospy.Time.now()
+        self._set_state("WAITING", f"elevator_canceled:{reason}")
+        return True
+
+    def cancel_elevator_cb(self, req):
+        del req
+        with self.state_lock:
+            canceled = self._cancel_elevator_locked("service_request")
+            return TriggerResponse(
+                success=True,
+                message="Elevator canceled" if canceled else "Elevator not active",
+            )
+
     def start_exploration_cb(self, req):
         with self.state_lock:
             if self.exploring:
@@ -901,6 +1605,11 @@ class ExplorationPlanner:
             self.retry_count = 0
             self.no_reachable_frontier_cycles = 0
             self.complete_published = False
+            self.visited_floors = {self.current_floor}
+            self.completed_floors = set()
+            self.autonomous_transition_failures = {}
+            self.next_autonomous_floor = None
+            self.elevator_autonomous_transition = False
             self.complete_pub.publish(Bool(data=False))
             self._set_state("WAITING", "waiting_for_inputs")
             return TriggerResponse(success=True, message="Exploration started; waiting for inputs")
@@ -910,6 +1619,7 @@ class ExplorationPlanner:
             if not self.exploring:
                 return TriggerResponse(success=True, message="Exploration already stopped")
             rospy.loginfo("[exploration] Stop exploration")
+            self._cancel_elevator_locked("exploration_stopped")
             self.exploring = False
             self.session_id += 1
             self.goal_id += 1
@@ -927,6 +1637,13 @@ class ExplorationPlanner:
             return
 
         now = rospy.Time.now()
+        if self.elevator_active:
+            if self.mapping_lost:
+                self._fail_elevator("localization_lost")
+                return
+            self._elevator_loop(now)
+            return
+
         healthy, reason = self._inputs_health(now)
         if not healthy:
             self.no_reachable_frontier_cycles = 0
@@ -989,11 +1706,7 @@ class ExplorationPlanner:
             no_active_goal = not self.waiting_for_result and not self.nav_has_active_goal
             if (self.no_reachable_frontier_cycles >= self.no_frontier_cycles_required
                     and map_stable and no_active_goal):
-                if not self.complete_published:
-                    self.complete_published = True
-                    self.complete_pub.publish(Bool(data=True))
-                    rospy.loginfo("[exploration] Exploration converged")
-                self._set_state("COMPLETE", selection_reason)
+                self._handle_converged_floor(selection_reason)
             else:
                 self._set_state("WAITING", selection_reason)
 

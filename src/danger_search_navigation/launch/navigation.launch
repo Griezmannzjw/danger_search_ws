@@ -10,7 +10,14 @@
     <rosparam command="load" file="$(arg config_dir)/costmap_common.yaml" ns="local_costmap" />
     <rosparam command="load" file="$(arg config_dir)/global_costmap.yaml" ns="global_costmap" />
     <rosparam command="load" file="$(arg config_dir)/local_costmap.yaml" ns="local_costmap" />
-    <remap from="cmd_vel" to="/danger_search/nav_cmd_vel" />
+    <remap from="cmd_vel" to="/danger_search/move_base_cmd_vel" />
+  </node>
+
+  <node name="navigation_command_mux"
+        pkg="danger_search_navigation"
+        type="navigation_command_mux.py"
+        output="screen">
+    <rosparam command="load" file="$(arg config_dir)/portal_traversal.yaml" />
   </node>
 
   <!-- This only applies/validates the official dynamic-reconfigure settings;

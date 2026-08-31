@@ -13,7 +13,7 @@
 | 定位用允许的IMU/激光，不用`cmd_vel_sent`做里程计 | ✅ 默认纯 GICP 位移 + 同源占据地图；Hector 仅为可选受限修正 |
 | `make_plan`基于实际地图判断可达性，不返回无条件直线 | ✅ 膨胀占据栅格 A* |
 | 所有话题/服务/frame从ROS参数读取，无硬编码 | ✅ 全部参数化 |
-| 结果文件路径可移植 | ✅ launch自动查找同级SimEnv，可用一个参数覆盖 |
+| 结果文件路径可移植 | ✅ launch自动查找同级simenvnew，可用一个参数覆盖 |
 | 完整任务状态机 | ✅ EXPLORING→RETURNING→FINISHED/ERROR |
 | control是`/cmd_vel`唯一发布者 | ✅ 安全仲裁层唯一输出 |
 | exploration发目标前检查所有前置条件 | ✅ 6项条件全部满足才发 |
@@ -104,7 +104,7 @@ danger_search_ws/
 ### 环境要求
 - Ubuntu 20.04
 - ROS Noetic（desktop-full安装）
-- Unitree A1 仿真环境（SimEnv）
+- Unitree A1 官方仿真环境（simenvnew）
 - Python依赖：numpy（ROS Noetic自带）
 
 ### 1. 获取代码
@@ -134,14 +134,14 @@ find . -name "*.py" -exec chmod +x {} \;
 
 ### 4. 目录布局
 
-默认只要求 `SimEnv` 和 `danger_search_ws` 位于同一父目录，不需要修改 YAML。不同布局可在
-启动时通过 `simenv_root:=/absolute/path/to/SimEnv` 覆盖一次。
+默认只要求 `simenvnew` 和 `danger_search_ws` 位于同一父目录，不需要修改 YAML。不同布局可在
+启动时通过 `simenv_root:=/absolute/path/to/simenvnew` 覆盖一次。
 
 ### 5. 启动仿真
 
 ```bash
-cd ~/myProject/SimEnv
-GUI=false FLOOR_COUNT=1 ENABLE_REFEREE_ODOM=0 ENABLE_GROUND_TRUTH=1 POINTCLOUD_USE_GROUND_TRUTH_ODOM=0 ./auto.sh
+cd /home/langan/simenvnew
+GUI=false FLOOR_COUNT=1 ENABLE_REFEREE_ODOM=0 ENABLE_GROUND_TRUTH=0 POINTCLOUD_USE_GROUND_TRUTH_ODOM=0 UNITREE_RL_DEVICE=cpu ./auto.sh
 ```
 
 Gazebo启动后，在终端按：
@@ -304,9 +304,9 @@ rospack find danger_search_bringup
 |------|--------|---------|--------|
 | localization | 默认 GICP连续里程计 + 同源2D栅格；可选Hector受限修正 | LIO/回环检测、多楼层地图 | 导航组 |
 | navigation | P控制器+直线避障 | 完整move_base：global planner(Dijkstra/A*) + local planner(DWA/TEB) + costmap_2d | 导航组 |
-| exploration | 最近可达前沿+自动收敛 | 信息增益、房间拓扑、多楼层电梯/楼梯 | 探索组 |
+| exploration | 最近可达前沿+自动收敛；可选参数化电梯联调状态机 | 电梯语义发现、信息增益、房间拓扑、多楼层调度 | 探索组 |
 | perception | RGB-D球体识别和map定位 | YOLO/实例分割、跨视角复核 | 识别组 |
-| mission | 自动结束、返航和结果输出 | 多楼层切换、自动电梯调用 | 框架组 |
+| mission | 自动结束、返航和结果输出 | 消费多楼层探索结果并保持任务生命周期一致 | 框架组 |
 | control | 速度平滑+超时停车 | 跌倒检测，紧急避障，步态切换 | 控制组 |
 
 ## 团队分工

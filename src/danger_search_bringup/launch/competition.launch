@@ -2,8 +2,8 @@
   <!-- 危险源自主搜索系统 - P0最小可运行版本 -->
   <!-- 对齐接口规范 v1.1-p0 -->
 
-  <!-- 默认约定 SimEnv 与 danger_search_ws 位于同一父目录；赛事部署可覆盖一次。 -->
-  <arg name="simenv_root" default="$(find danger_search_bringup)/../../../SimEnv" />
+  <!-- 默认约定 simenvnew 与 danger_search_ws 位于同一父目录；赛事部署可覆盖一次。 -->
+  <arg name="simenv_root" default="$(find danger_search_bringup)/../../../simenvnew" />
   <arg name="result_file" default="$(arg simenv_root)/results/detected_danger.json" />
   <arg name="autostart" default="false" />
   <arg name="entry_enabled" default="true" />
@@ -13,6 +13,8 @@
   <arg name="gazebo_base_link" default="a1_gazebo::base" />
   <arg name="enable_multifloor_maps"
        default="$(eval arg('localization_source') == 'gazebo_truth')" />
+  <arg name="elevator_enabled" default="false" />
+  <arg name="elevator_target_floor" default="1" />
 
   <!-- 加载全局参数到根命名空间 -->
   <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
@@ -47,6 +49,9 @@
   <node name="exploration" pkg="danger_search_exploration" type="exploration_planner.py" output="screen">
     <rosparam command="load" file="$(find danger_search_bringup)/config/global.yaml" />
     <rosparam command="load" file="$(find danger_search_exploration)/config/default.yaml" />
+    <param name="elevator/enabled" value="$(arg elevator_enabled)" />
+    <param name="elevator/target_floor" value="$(arg elevator_target_floor)" />
+    <env name="PYTHONPATH" value="$(arg simenv_root)/devel/lib/python3/dist-packages:$(optenv PYTHONPATH)" />
   </node>
 
   <!-- 5. 控制执行与安全模块 -->

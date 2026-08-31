@@ -154,10 +154,10 @@ mission 是结果文件唯一写入方。P0 最低规则：
   ]
 }
 ```
-结果路径必须由 launch/YAML 解析为唯一绝对路径，并指向 SimEnv 约定的 `results/detected_danger.json`，不能依赖 roslaunch 时的当前工作目录。
-结果格式必须兼容 SimEnv 官方 evaluator。真值文件只能由独立 evaluator 读取，不能进入 localization、exploration、navigation、perception、control 或 mission。
+结果路径必须由 launch/YAML 解析为唯一绝对路径，并指向 `simenvnew` 约定的 `results/detected_danger.json`，不能依赖 roslaunch 时的当前工作目录。
+结果格式必须兼容 `simenvnew` 官方 evaluator。真值文件只能由独立 evaluator 读取，不能进入 localization、exploration、navigation、perception、control 或 mission。
 ## 7. 官方输入边界
-P0 模块可按职责使用以下 SimEnv 输入：
+P0 模块可按职责使用以下 `simenvnew` 输入：
 | 输入 | 类型 |
 |------|------|
 | `/scan` | `sensor_msgs/PointCloud` |
@@ -196,6 +196,28 @@ start_service: /danger_search/start_exploration
 stop_service: /danger_search/stop_exploration
 map_frame: map
 world_frame: world
-result_file: /absolute/path/to/SimEnv/results/detected_danger.json
+result_file: /absolute/path/to/simenvnew/results/detected_danger.json
 ```
 README、launch、YAML、代码读取位置和运行时 ROS graph 中的名称必须一致。
+
+## 9. 可选电梯联调扩展
+
+本节是默认关闭的 S3/P3 联调扩展，不改变 P0 启动和验收依赖。
+
+| 接口 | 类型 | 提供/调用方 | 语义 |
+|------|------|-------------|------|
+| `/danger_search/start_elevator` | `std_srvs/Trigger` | exploration 提供 | 使用当前参数目标楼层和已确认入口位姿启动一次电梯任务 |
+| `/danger_search/cancel_elevator` | `std_srvs/Trigger` | exploration 提供 | 取消活动导航目标并使门梯状态机有限退出 |
+| `/set_door_state` | `building_generator_interfaces/SetDoorState` | exploration 调用 | 打开或关闭当前/目标楼层电梯厅门 |
+| `/call_elevator` | `building_generator_interfaces/CallElevator` | exploration 调用 | 把 `elevator_main` 移动到当前层或目标层 |
+| `/navigation/traverse_portal` | `danger_search_common/TraversePortal` | navigation 提供、exploration 调用 | 在有界速度和时长内穿越门槛；navigation 仍是 `/danger_search/nav_cmd_vel` 的唯一来源 |
+| `/navigation/cancel_portal` | `std_srvs/Trigger` | navigation 提供、exploration 调用 | 立即停止活动门槛穿越并发布零导航速度 |
+| `/localization/set_current_floor` | `danger_search_common/SetCurrentFloor` | localization 提供、exploration 调用 | 仅在 `/call_elevator` 已确认目标层后切换 GICP 分层地图；这是命令确认，不是真值输入 |
+
+状态机顺序固定为：厅前导航、呼梯到当前层、开当前层门、有界门槛穿越进入轿厢、关门、换层、确认 localization 当前层、开目标层门、等待 `current_floor` 与地图稳定、有界门槛穿越离开轿厢。每个导航、服务、门动作、换层和地图恢复步骤必须有独立超时；stop 或 cancel 必须取消 Action 和门槛穿越，迟到服务结果不得重新激活旧任务。
+
+`elevator/portal_pose=[x,y,yaw]` 中 yaw 从厅内指向轿厢。入口位姿可由允许传感器确认后写入参数；为空时只允许在人工已确认最近成功前沿就是电梯门槛的隔离联调中复用该前沿。正式算法不得读取布局、电梯配置、世界文件或真值来获取入口坐标。
+
+启用 `elevator/autonomous_when_floor_complete` 后，探索仅在当前层满足既有稳定收敛条件时把该层记为完成，并从公开参数 `elevator/served_floors` 中选择最近的未完成楼层。楼层列表不得由生成场景、world 或真值推断；自主流程必须显式配置 `portal_pose`，手动 `/danger_search/start_elevator` 才保留最近成功前沿的隔离联调回退。`/exploration/complete=true` 只在全部 `served_floors` 完成后发布；换层边失败达到 `elevator/max_autonomous_transition_failures` 时保持全局未完成并进入 `autonomous_floor_transition_unavailable`。`/exploration/status` 同步发布 `served_floors`、`visited_floors`、`completed_floors`、`next_autonomous_floor` 和逐边失败计数。
+
+GUI=false 固定种子联调确认：动态厅门和轿厢会使二维 GICP 在门槛处发生瞬时平移/偏航漂移，不能用 `move_base` 的绝对轿厢目标作为唯一进出梯机制。当前基线由 navigation 对进入方向执行 `0.25 m/s`、`3.0 s` 的限时穿越，经过 control 的速度上限、超时和安全仲裁；普通场景仍由 `move_base` 控制。

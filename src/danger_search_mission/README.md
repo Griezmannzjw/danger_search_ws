@@ -86,19 +86,19 @@ mission 等待地图清除动态门残影后重试。
 
 ```text
 某个父目录/
-├── SimEnv/
+├── simenvnew/
 └── danger_search_ws/
 ```
 
-此时自动输出到同级 `SimEnv/results/detected_danger.json`，没有写死用户名，也不依赖
+此时自动输出到同级 `simenvnew/results/detected_danger.json`，没有写死用户名，也不依赖
 节点当前工作目录。如果赛事部署布局不同，只需覆盖一次：
 
 ```bash
 roslaunch danger_search_bringup competition.launch \
-  simenv_root:=/absolute/path/to/SimEnv
+  simenv_root:=/absolute/path/to/simenvnew
 ```
 
-也可以用 `result_file:=/absolute/path/to/SimEnv/results/detected_danger.json` 覆盖完整文件。
+也可以用 `result_file:=/absolute/path/to/simenvnew/results/detected_danger.json` 覆盖完整文件。
 
 ## 多帧确认
 

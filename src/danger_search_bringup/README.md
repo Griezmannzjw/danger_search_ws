@@ -10,25 +10,27 @@ exploration、control、mission 和入口门控制，共 10 个运行节点。�
 
 ```text
 myProject/
-├── SimEnv/
+├── simenvnew/
 └── danger_search_ws/
 ```
 
-launch 会从自身 ROS 包路径推导同级 `SimEnv`，结果默认写入：
+launch 会从自身 ROS 包路径推导同级 `simenvnew`，结果默认写入：
 
 ```text
-SimEnv/results/detected_danger.json
+simenvnew/results/detected_danger.json
 ```
 
 ## 参数
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `simenv_root` | 自动查找同级 `SimEnv` | 不同部署布局只需覆盖这一项 |
+| `simenv_root` | 自动查找同级 `simenvnew` | 不同部署布局只需覆盖这一项 |
 | `result_file` | `$(arg simenv_root)/results/detected_danger.json` | 可选的完整结果文件覆盖 |
 | `autostart` | `false` | 为 true 时所有预检就绪后自动开始任务 |
 | `open_main_entrance` | `true` | 调用官方服务实际打开主入口；仅隔离调试时关闭 |
 | `localization_source` | `gicp` | `gicp` 为正式默认；`gazebo_truth` 仅用于 SimEnv 模块联调 |
+| `elevator_enabled` | `false` | 启用探索侧参数化电梯联调状态机 |
+| `elevator_target_floor` | `1` | 显式触发电梯任务时的目标楼层 |
 | `gazebo_base_link` | `a1_gazebo::base` | 真值测试模式读取的 Gazebo link 名称 |
 
 零配置启动：
@@ -37,11 +39,11 @@ SimEnv/results/detected_danger.json
 roslaunch danger_search_bringup competition.launch autostart:=true
 ```
 
-赛事组若把 SimEnv 放在其他位置：
+赛事组若把 `simenvnew` 放在其他位置：
 
 ```bash
 roslaunch danger_search_bringup competition.launch \
-  autostart:=true simenv_root:=/absolute/path/to/SimEnv
+  autostart:=true simenv_root:=/absolute/path/to/simenvnew
 ```
 
 隔离定位误差、测试其他模块时可使用起点归零的 Gazebo 真值定位：
@@ -56,7 +58,7 @@ roslaunch danger_search_bringup competition.launch \
 
 ## P0 推荐流程
 
-1. 启动 SimEnv：为官方底层步态控制保留 ground-truth 状态话题，但关闭 referee odom
+1. 启动 `simenvnew`：为官方底层步态控制保留 ground-truth 状态话题，但关闭 referee odom
    和真值点云变换；算法节点不得订阅 `/ground_truth/*`；
 2. 在 junior_ctrl 终端按 `2` 站立，再按 `6` 进入 `/cmd_vel` 模式；
 3. 启动 `competition.launch autostart:=true`；

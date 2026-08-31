@@ -328,6 +328,38 @@ class TestLocalizationAdapter(unittest.TestCase):
         published = self.adapter.current_floor_pub.publish.call_args.args[0]
         self.assertEqual(published.data, 1)
 
+    def test_commanded_floor_override_replaces_unobservable_gicp_height(self):
+        self.adapter.multifloor_enabled = True
+        self.adapter.floor_classifier = FloorHeightClassifier(
+            [0.0, 2.6, 5.2], assignment_tolerance_m=0.45
+        )
+        self.adapter.lock = threading.RLock()
+        self.adapter.current_floor = 0
+        self.adapter.current_height = 0.0
+        self.adapter.commanded_floor_override = None
+        self.adapter.floor_transition_active = False
+        self.adapter.floor_transition_baseline_version = 0
+        self.adapter.floor_map_versions = {0: 8}
+        self.adapter.map_update_count = 8
+        self.adapter.map_version = 8
+        self.adapter.last_map_stamp = rospy.Time.from_sec(1.0)
+        self.adapter.last_map_received = rospy.Time.from_sec(1.0)
+        self.adapter.last_public_map_published = rospy.Time.from_sec(1.0)
+        self.adapter.last_map_update = rospy.Time.from_sec(1.0)
+        self.adapter.latest_raw_map = OccupancyGrid()
+        self.adapter.current_floor_pub = mock.Mock()
+
+        response = self.adapter._set_current_floor_callback(
+            SimpleNamespace(floor_id=1, reason="elevator_0_to_1")
+        )
+        self.assertTrue(response.accepted)
+        self.assertEqual(self.adapter.current_floor, 1)
+        self.assertEqual(self.adapter.commanded_floor_override, 1)
+
+        self.adapter._observe_floor_height(0.0)
+        self.assertEqual(self.adapter.current_floor, 1)
+        self.assertAlmostEqual(self.adapter.current_height, 2.6)
+
     def test_floor_map_restores_only_after_fresh_updates(self):
         self.adapter.config = AdapterConfig(min_map_updates_for_stable=2)
         self.adapter.multifloor_enabled = True

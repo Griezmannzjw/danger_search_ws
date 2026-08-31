@@ -133,6 +133,8 @@ Hector 模式正常时才显示 `TRACKING_FUSED_GICP_ODOMETRY_WITH_BOUNDED_HECTO
 `min_map_updates_for_stable` 次新扫描后，`/map` 才切换到该层；
 `floor_maps[]` 同时保留所有已访问楼层各自的版本与最后更新时间。
 
+正式 GICP 后端当前只估计 SE(2)，其 `raw_pose.z` 固定为 `0`，不能单独确认电梯换层。电梯联调在 `/call_elevator` 响应已确认目标层后调用 `/localization/set_current_floor`（`danger_search_common/SetCurrentFloor`）；adapter 将该命令确认作为分层地图选择覆盖，并继续等待目标层地图刷新。该接口不读取 Gazebo 真值、世界文件或生成场景元数据。
+
 ## 编译与启动
 
 安装运行依赖后：

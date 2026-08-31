@@ -14,6 +14,13 @@ move_base_action_name: /move_base
 make_plan_service: /move_base/make_plan
 start_service: /danger_search/start_exploration
 stop_service: /danger_search/stop_exploration
+start_elevator_service: /danger_search/start_elevator
+cancel_elevator_service: /danger_search/cancel_elevator
+set_door_state_service: /set_door_state
+call_elevator_service: /call_elevator
+set_current_floor_service: /localization/set_current_floor
+traverse_portal_service: /navigation/traverse_portal
+cancel_portal_service: /navigation/cancel_portal
 status_topic: /exploration/status
 complete_topic: /exploration/complete
 
@@ -31,6 +38,9 @@ goal_timeout: 120.0
 plan_tolerance: 0.5
 failed_goal_cooldown: 15.0
 failed_goal_radius: 0.50
+success_goal_cooldown: 45.0
+success_goal_radius: 0.50
+success_goal_clear_revisions: 2
 dependency_check_timeout: 0.1
 input_timeout: 3.0
 no_frontier_cycles_required: 5
@@ -51,3 +61,32 @@ path_clearance_weight: 0.15
 trap_blacklist_radius: 0.70
 trap_clearance_margin: 0.08
 blacklist_clear_revisions: 2
+
+# 参数化电梯任务。默认关闭，只有确认入口几何后才显式触发。
+elevator:
+  enabled: false
+  id: elevator_main
+  target_floor: 1
+  # 当前层连续无前沿且地图稳定后，自主选择最近的未完成楼层。
+  autonomous_when_floor_complete: true
+  # 公开配置，不从场景真值推断；三层场景应显式改为 [0, 1, 2]。
+  served_floors: [0, 1]
+  max_autonomous_transition_failures: 1
+  door_prefix: elevator_floor_
+  # 自主换层必须显式填写；手动服务为空时仍可使用最近成功前沿。
+  portal_pose: []
+  lobby_offset: 0.70
+  portal_near_distance: 0.40
+  # GUI=false 固定场景实测：0.90 m 会在轿厢后壁前振荡，0.60 m 可稳定进舱。
+  cabin_distance: 0.60
+  exit_distance: 0.80
+  navigation_timeout: 45.0
+  service_timeout: 10.0
+  operation_timeout: 45.0
+  floor_timeout: 45.0
+  floor_stable_time: 3.0
+  # 动态门和轿厢会使二维 GICP 在门槛处漂移；由 navigation 内部限时穿越，仍经控制仲裁。
+  portal_traversal_enabled: true
+  portal_speed: 0.25
+  portal_duration: 3.0
+  close_target_door_after_exit: false

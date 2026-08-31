@@ -1,5 +1,7 @@
 # danger_search_navigation
 
+除标准 `move_base` 外，本包包含 `navigation_command_mux.py`：普通导航速度先进入 `/danger_search/move_base_cmd_vel`，再由该节点统一输出 `/danger_search/nav_cmd_vel`。电梯门槛处二维 GICP 会受动态门和轿厢影响，因此 `/navigation/traverse_portal` 可临时覆盖 move_base，执行速度和时长均受配置硬上限约束的平移；`/navigation/cancel_portal` 会立即恢复零速度。最终 `/cmd_vel` 仍只由 `danger_search_control` 发布。
+
 本包在完整系统中启动标准 ROS `move_base`，全局规划器为
 `navfn/NavfnROS`，局部规划器为 Unitree 示例已经采用的
 `base_local_planner/TrajectoryPlannerROS`。旧的 `nav_controller.py` 与

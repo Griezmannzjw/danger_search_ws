@@ -42,6 +42,7 @@ catkin_install_python(PROGRAMS
   scripts/navigation_monitor.py
   scripts/navigation_monitor_core.py
   scripts/navigation_config_guard.py
+  scripts/navigation_command_mux.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

@@ -24,7 +24,11 @@ add_message_files(
   RecoveryEvent.msg
 )
 
-## P0统一使用std_srvs/Trigger，不需要自定义srv
+add_service_files(
+  FILES
+  SetCurrentFloor.srv
+  TraversePortal.srv
+)
 
 ## Generate added messages and services with any dependencies listed here
 generate_messages(

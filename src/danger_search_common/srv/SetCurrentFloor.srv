@@ -1,0 +1,5 @@
+int32 floor_id
+string reason
+---
+bool accepted
+string message

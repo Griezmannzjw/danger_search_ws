@@ -17,6 +17,7 @@ from danger_search_common.msg import (
     LocalizationStatus,
     MappingStatus,
 )
+from danger_search_common.srv import SetCurrentFloor, SetCurrentFloorResponse
 
 from .config import AdapterConfig
 from .floor_mapping import FloorHeightClassifier
@@ -102,6 +103,9 @@ class LocalizationAdapterNode:
         )
         self.current_floor_topic = rospy.get_param(
             "~current_floor_topic", "/mapping/current_floor"
+        )
+        self.set_current_floor_service = rospy.get_param(
+            "~set_current_floor_service", "/localization/set_current_floor"
         )
         self.mapping_pause_topic = rospy.get_param(
             "~mapping_pause_topic", "/localization/mapping_pause"
@@ -189,6 +193,7 @@ class LocalizationAdapterNode:
         self.current_height = float(
             self.config.floor_heights[self.current_floor]
         )
+        self.commanded_floor_override = None
         self.floor_transition_active = False
         self.floor_transition_baseline_version = 0
         self.floor_map_versions = {}
@@ -233,6 +238,11 @@ class LocalizationAdapterNode:
         )
         self.current_floor_pub = rospy.Publisher(
             self.current_floor_topic, Int32, queue_size=2, latch=True
+        )
+        self.set_current_floor_server = rospy.Service(
+            self.set_current_floor_service,
+            SetCurrentFloor,
+            self._set_current_floor_callback,
         )
         self.localization_status_pub = rospy.Publisher(
             self.localization_status_topic,
@@ -426,6 +436,9 @@ class LocalizationAdapterNode:
             )
             return
         self._observe_floor_height(raw_height)
+        if self.multifloor_enabled:
+            with self.lock:
+                raw_height = self.current_height
         raw_delta_xy = math.hypot(
             local_pose.x - float(raw_position.x),
             local_pose.y - float(raw_position.y),
@@ -535,6 +548,10 @@ class LocalizationAdapterNode:
     def _observe_floor_height(self, height):
         if not getattr(self, "multifloor_enabled", False):
             return
+        with self.lock:
+            override = getattr(self, "commanded_floor_override", None)
+        if override is not None:
+            height = float(self.config.floor_heights[override])
         assignment = self.floor_classifier.classify(height)
         publish_floor = None
         with self.lock:
@@ -572,6 +589,31 @@ class LocalizationAdapterNode:
                 )
         if publish_floor is not None:
             self.current_floor_pub.publish(Int32(data=publish_floor))
+
+    def _set_current_floor_callback(self, request):
+        if not self.multifloor_enabled:
+            return SetCurrentFloorResponse(
+                accepted=False,
+                message="multifloor mapping is disabled",
+            )
+        floor_id = int(request.floor_id)
+        if floor_id < 0 or floor_id >= len(self.config.floor_heights):
+            return SetCurrentFloorResponse(
+                accepted=False,
+                message="floor_id is outside configured floor_heights",
+            )
+        with self.lock:
+            self.commanded_floor_override = floor_id
+        self._observe_floor_height(self.config.floor_heights[floor_id])
+        rospy.loginfo(
+            "[localization] accepted commanded floor %d: %s",
+            floor_id,
+            request.reason or "unspecified",
+        )
+        return SetCurrentFloorResponse(
+            accepted=True,
+            message="current floor set to %d" % floor_id,
+        )
 
     def _map_callback(self, message):
         if message.header.frame_id != self.map_frame:

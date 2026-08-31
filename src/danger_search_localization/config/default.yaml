@@ -22,6 +22,7 @@ validated_gicp_pose_topic: /localization/validated_pose
 raw_map_topic: /localization/raw_map
 raw_floor_map_topic: /localization/raw_floor_map
 current_floor_topic: /mapping/current_floor
+set_current_floor_service: /localization/set_current_floor
 floor_map_topic_prefix: /mapping/floors
 use_hector_correction: false
 

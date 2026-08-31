@@ -1,7 +1,7 @@
 <launch>
   <arg name="config_file" default="$(find danger_search_mission)/config/default.yaml" />
   <!-- 默认支持 SimEnv 与 danger_search_ws 位于同一父目录。其他布局只需覆盖 simenv_root。 -->
-  <arg name="simenv_root" default="$(find danger_search_mission)/../../../SimEnv" />
+  <arg name="simenv_root" default="$(find danger_search_mission)/../../../simenvnew" />
   <arg name="result_file" default="$(arg simenv_root)/results/detected_danger.json" />
   <arg name="autostart" default="false" />
   <!-- 独立调试通常不启动 bringup 的开门节点；正式 competition.launch 仍强制等待。 -->

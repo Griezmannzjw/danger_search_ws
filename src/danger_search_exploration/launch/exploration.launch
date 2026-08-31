@@ -1,7 +1,13 @@
 <launch>
   <arg name="config_file" default="$(find danger_search_exploration)/config/default.yaml" />
+  <arg name="simenv_root" default="$(find danger_search_exploration)/../../../simenvnew" />
+  <arg name="elevator_enabled" default="false" />
+  <arg name="elevator_target_floor" default="1" />
 
   <node name="exploration_planner" pkg="danger_search_exploration" type="exploration_planner.py" output="screen">
     <rosparam command="load" file="$(arg config_file)" />
+    <param name="elevator/enabled" value="$(arg elevator_enabled)" />
+    <param name="elevator/target_floor" value="$(arg elevator_target_floor)" />
+    <env name="PYTHONPATH" value="$(arg simenv_root)/devel/lib/python3/dist-packages:$(optenv PYTHONPATH)" />
   </node>
 </launch>
