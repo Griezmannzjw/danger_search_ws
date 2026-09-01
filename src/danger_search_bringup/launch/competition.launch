@@ -1,6 +1,6 @@
 <launch>
   <!-- Formal entry point: runtime identity is intentionally not user-overridable. -->
-  <arg name="simenv_root" default="$(find danger_search_bringup)/../../../SimEnv" />
+  <arg name="simenv_root" default="$(find danger_search_bringup)/../../../simenvnew" />
   <arg name="result_file" default="$(arg simenv_root)/results/detected_danger.json" />
   <arg name="scene_info_file" default="$(arg simenv_root)/generated_building/team_scene_info.json" />
   <arg name="result_coordinate_frame" default="auto" />

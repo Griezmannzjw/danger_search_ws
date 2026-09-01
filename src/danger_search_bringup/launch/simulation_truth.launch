@@ -1,6 +1,6 @@
 <launch>
   <!-- Non-official integration profile.  Its result file can never overwrite formal output. -->
-  <arg name="simenv_root" default="$(find danger_search_bringup)/../../../SimEnv" />
+  <arg name="simenv_root" default="$(find danger_search_bringup)/../../../simenvnew" />
   <arg name="result_file" default="$(arg simenv_root)/results/detected_danger.simulation_truth.json" />
   <arg name="scene_info_file" default="$(arg simenv_root)/generated_building/team_scene_info.json" />
   <arg name="result_coordinate_frame" default="auto" />
@@ -15,6 +15,7 @@
        costmaps update.  Keep fall detection enabled, but tolerate that
        simulation-only scheduling jitter. -->
   <arg name="posture_imu_timeout_s" default="1.5" />
+  <arg name="posture_recovery_tilt_deg" default="25.0" />
 
   <include file="$(find danger_search_bringup)/launch/system.launch">
     <arg name="simenv_root" value="$(arg simenv_root)" />
@@ -37,5 +38,6 @@
     <arg name="fixed_elevator_hall_y" value="$(arg fixed_elevator_hall_y)" />
     <arg name="fixed_elevator_hall_into_yaw" value="$(arg fixed_elevator_hall_into_yaw)" />
     <arg name="posture_imu_timeout_s" value="$(arg posture_imu_timeout_s)" />
+    <arg name="posture_recovery_tilt_deg" value="$(arg posture_recovery_tilt_deg)" />
   </include>
 </launch>

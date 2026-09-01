@@ -5,8 +5,9 @@
   <arg name="multifloor_enabled" default="true" />
   <arg name="localization_backend" default="gicp" />
 
-  <!-- Standard ROS navigation owns /move_base.  Its velocity output remains
-       behind danger_search_control/cmd_mux. -->
+  <!-- Standard ROS navigation owns /move_base.  Its velocity output first
+       passes through navigation_command_mux so bounded portal traversal can
+       temporarily override it without bypassing danger_search_control. -->
   <node name="move_base" pkg="move_base" type="move_base" output="screen" clear_params="true">
     <rosparam command="load" file="$(arg config_dir)/standard_move_base.yaml" />
     <rosparam command="load" file="$(arg config_dir)/dwa_planner.yaml" />
@@ -18,7 +19,18 @@
     <param name="competition_mode" value="$(arg competition_mode)" />
     <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
     <param name="localization_backend" value="$(arg localization_backend)" />
-    <remap from="cmd_vel" to="/danger_search/nav_cmd_vel" />
+    <remap from="cmd_vel" to="/danger_search/move_base_cmd_vel" />
+  </node>
+
+  <node name="navigation_command_mux"
+        pkg="danger_search_navigation"
+        type="navigation_command_mux.py"
+        output="screen">
+    <rosparam command="load" file="$(arg config_dir)/portal_traversal.yaml" />
+    <param name="run_profile" value="$(arg run_profile)" />
+    <param name="competition_mode" value="$(arg competition_mode)" />
+    <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
+    <param name="localization_backend" value="$(arg localization_backend)" />
   </node>
 
   <!-- This only applies/validates the official dynamic-reconfigure settings;

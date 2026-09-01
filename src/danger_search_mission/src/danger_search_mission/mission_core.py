@@ -8,6 +8,16 @@ import os
 DEFAULT_ENTRY_COMPLETION_TOLERANCE_M = 0.45
 
 
+def exploration_failure_reason(payload):
+    """Return a normalized terminal exploration failure, if present."""
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("state", "")).strip().upper() != "FAILED":
+        return None
+    reason = str(payload.get("reason", "") or "unknown").strip()
+    return reason.replace(":", "_").replace(" ", "_") or "unknown"
+
+
 class PostureSafetyGate:
     """Classify posture stops without coupling sensor faults to true falls."""
 

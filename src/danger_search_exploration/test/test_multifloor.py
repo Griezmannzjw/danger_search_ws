@@ -223,6 +223,8 @@ class PublicTopologyTest(unittest.TestCase):
         self.assertEqual(config["elevator_crossing_timeout_s"], 40.0)
         self.assertEqual(config["floor_map_stable_time_s"], 15.0)
         self.assertEqual(config["elevator_crossing_speed_mps"], 0.40)
+        self.assertEqual(config["elevator_crossing_distance_m"], 1.00)
+        self.assertEqual(config["elevator_exit_hall_side_margin_m"], 0.05)
         self.assertEqual(config["shaft_max_area_m2"], 12.0)
         self.assertEqual(config["door_gap_min_width_m"], 0.9)
         self.assertEqual(config["door_gap_max_width_m"], 1.8)
@@ -669,6 +671,70 @@ class TransitStateMachineTest(unittest.TestCase):
         sent_x = planner._send_goal.call_args.args[0]
         self.assertGreater(sent_x, 3.0)
 
+    def test_hall_goal_uses_reachable_make_plan_endpoint(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=0.0, y=0.0)
+        )
+        planner.elevator_halls = [MODULE.ElevatorHallCandidate(
+            -2.47, -1.40, -math.pi / 2.0, score=1.0,
+        )]
+        planner.elevator_hall_index = 0
+        planner.elevator_hall_min_score = 0.75
+        planner.elevator_hall_approach_m = 0.8
+        planner.elevator_hall_navigation_max_s = 180.0
+        planner.elevator_hall_nominal_speed_mps = 0.25
+        planner.elevator_car_target_m = 1.4
+        planner.plan_tolerance = 0.5
+        planner._world_to_map = Mock(return_value=(1, 1))
+        planner._is_free = Mock(return_value=True)
+        planner._check_path = Mock(return_value="reachable")
+        planner.last_checked_path_metrics = {
+            "path_length": 2.5,
+            "points": [(0.0, 0.0), (-2.47, -0.55)],
+        }
+        planner._send_goal = Mock(return_value=True)
+        planner._set_floor_change_phase = Mock()
+
+        with patch.object(
+                MODULE.rospy.Time, "now",
+                return_value=MODULE.rospy.Time.from_sec(1.0)):
+            self.assertTrue(planner._pick_elevator_hall_and_send())
+
+        planner._send_goal.assert_called_once_with(
+            -2.47, -0.55, -math.pi / 2.0
+        )
+
+    def test_fixed_hall_inside_plan_tolerance_skips_make_plan(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=0.0, y=0.0)
+        )
+        planner.elevator_halls = [MODULE.ElevatorHallCandidate(
+            1.15, 0.0, 0.0, score=1.0,
+        )]
+        planner.elevator_hall_index = 0
+        planner.elevator_hall_min_score = 0.75
+        planner.elevator_hall_approach_m = 0.8
+        planner.elevator_hall_navigation_max_s = 180.0
+        planner.elevator_hall_nominal_speed_mps = 0.25
+        planner.elevator_car_target_m = 1.4
+        planner.plan_tolerance = 0.5
+        planner.fixed_elevator_hall_enabled = True
+        planner._world_to_map = Mock()
+        planner._is_free = Mock()
+        planner._check_path = Mock()
+        planner._send_goal = Mock()
+        planner._set_floor_change_phase = Mock()
+
+        self.assertTrue(planner._pick_elevator_hall_and_send())
+
+        planner._check_path.assert_not_called()
+        planner._send_goal.assert_not_called()
+        planner._set_floor_change_phase.assert_called_once_with(
+            "OPEN_CURRENT_START", "already_at_fixed_hall_approach"
+        )
+
     def test_motion_validated_binding_skips_runtime_close_reopen(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
         planner.floor_change_deadline = MODULE.rospy.Time.from_sec(100.0)
@@ -724,6 +790,56 @@ class TransitStateMachineTest(unittest.TestCase):
         candidate = planner._save_hall_binding.call_args.args[0]
         self.assertTrue(candidate.validated)
         self.assertEqual(candidate.source, "fixed_test")
+
+    def test_floor_switch_skips_reverse_exit_when_pose_is_already_in_hall(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_deadline = MODULE.rospy.Time.from_sec(100.0)
+        planner.floor_change_step = "SWITCH_FLOOR_WAIT"
+        planner.floor_change_start_epoch = 1
+        planner.floor_change_target = 1
+        planner.floor_change_exit_to_hall = True
+        planner.floor_change_hall_point = (1.15, 0.0, 0.0)
+        planner.elevator_exit_hall_side_margin_m = 0.05
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=1.04, y=0.0)
+        )
+        planner.floor_change_stable_since = MODULE.rospy.Time.from_sec(9.0)
+        planner._service_outcome = Mock(return_value=(
+            "success", SimpleNamespace(success=True, map_epoch=2, message="ok")
+        ))
+        planner._set_floor_change_phase = Mock()
+        planner._start_crossing = Mock()
+
+        planner._advance_floor_change(MODULE.rospy.Time.from_sec(10.0))
+
+        self.assertEqual(planner.floor_change_expected_epoch, 2)
+        self.assertEqual(planner.floor_change_stable_since, MODULE.rospy.Time(0))
+        planner._start_crossing.assert_not_called()
+        planner._set_floor_change_phase.assert_called_once_with(
+            "WAIT_STABLE", "already_on_target_hall_side"
+        )
+
+    def test_floor_switch_reverses_when_pose_remains_inside_car(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_deadline = MODULE.rospy.Time.from_sec(100.0)
+        planner.floor_change_step = "SWITCH_FLOOR_WAIT"
+        planner.floor_change_start_epoch = 1
+        planner.floor_change_target = 1
+        planner.floor_change_exit_to_hall = True
+        planner.floor_change_hall_point = (1.15, 0.0, 0.0)
+        planner.elevator_exit_hall_side_margin_m = 0.05
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=1.40, y=0.0)
+        )
+        planner._service_outcome = Mock(return_value=(
+            "success", SimpleNamespace(success=True, map_epoch=2, message="ok")
+        ))
+        planner._set_floor_change_phase = Mock()
+        planner._start_crossing = Mock()
+
+        planner._advance_floor_change(MODULE.rospy.Time.from_sec(10.0))
+
+        planner._start_crossing.assert_called_once_with(-1.0)
 
     def test_wait_stable_requires_epoch_two_versions_and_full_hold(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)

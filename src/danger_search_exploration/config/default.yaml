@@ -146,9 +146,10 @@ elevator_hall_navigation_max_s: 180.0
 elevator_hall_nominal_speed_mps: 0.25
 elevator_crossing_timeout_s: 40.0
 elevator_crossing_speed_mps: 0.40
-elevator_crossing_distance_m: 1.40
+elevator_crossing_distance_m: 1.00
 elevator_crossing_min_progress_m: 0.80
 elevator_crossing_clearance_m: 0.32
+elevator_exit_hall_side_margin_m: 0.05
 elevator_footprint_min_x: -0.35
 elevator_footprint_max_x: 0.30
 elevator_footprint_min_y: -0.15

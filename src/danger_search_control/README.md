@@ -98,7 +98,7 @@ safety_stop
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source /home/ruilinli/SimEnv/danger_search_ws/devel/setup.bash
+source /home/langan/danger_search_ws/devel/setup.bash
 roscore
 ```
 
@@ -106,7 +106,7 @@ roscore
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source /home/ruilinli/SimEnv/danger_search_ws/devel/setup.bash
+source /home/langan/danger_search_ws/devel/setup.bash
 rosrun danger_search_control cmd_mux.py \
   _nav_cmd_topic:=/test/nav_cmd_vel \
   _elevator_cmd_topic:=/test/elevator_cmd_vel \
@@ -144,8 +144,8 @@ rostopic pub -1 /test/safety_stop std_msgs/Bool '{data: false}'
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source /home/ruilinli/SimEnv/danger_search_ws/devel/setup.bash
-python3 /home/ruilinli/SimEnv/danger_search_ws/src/danger_search_control/test/cmd_mux_smoke_test.py
+source /home/langan/danger_search_ws/devel/setup.bash
+/usr/bin/python3 /home/langan/danger_search_ws/src/danger_search_control/test/cmd_mux_smoke_test.py
 ```
 
 该脚本只发布和订阅 `/test/*`，不会启动 Gazebo，也不会向真实 `/cmd_vel` 发送命令。

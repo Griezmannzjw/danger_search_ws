@@ -42,6 +42,7 @@ from danger_search_mission.mission_core import (
     DangerTrackStore,
     DEFAULT_ENTRY_COMPLETION_TOLERANCE_M,
     entry_progress,
+    exploration_failure_reason,
     MissionLifecycle,
     next_entry_target,
     normalize_run_profile,
@@ -800,6 +801,7 @@ class MissionManager:
         except (TypeError, ValueError):
             rospy.logwarn_throttle(5.0, "[mission] invalid exploration status JSON")
             return
+        terminal_failure = exploration_failure_reason(payload)
         with self.lock:
             self.remaining_frontier_count = max(
                 0, int(payload.get("remaining_frontier_count", 0))
@@ -814,6 +816,21 @@ class MissionManager:
             self.topology_debt_summary = (
                 "coverage_debt=%d" % debt_count if debt_count else ""
             )
+            should_fail = (
+                terminal_failure is not None
+                and self.mission_state == MissionLifecycle.EXPLORING
+                and not self.finalized
+            )
+        if not should_fail:
+            return
+        rospy.logerr(
+            "[mission] exploration terminal failure: %s", terminal_failure
+        )
+        try:
+            self.stop_explore_client()
+        except (rospy.ROSException, rospy.ServiceException) as exc:
+            rospy.logwarn("[mission] failed to stop exploration: %s", str(exc))
+        self._finalize("exploration_failed:" + terminal_failure, error=True)
 
     def _detections_callback(self, message):
         with self.lock:

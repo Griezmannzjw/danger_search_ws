@@ -15,6 +15,9 @@ IDLE -> ENTERING -> EXPLORING -> RETURNING -> FINISHED
 - 只融合与当前 `floor_id/map_epoch` 一致的确认红球，按楼层和三维距离去重。
 - `/exploration/complete`、FinishMission、ReturnHome 或任务超时都先停止探索，再进入相同
   的返航流程。
+- `/exploration/status` 若稳定报告 `state=FAILED`，mission 立即停止 exploration，并以
+  `exploration_failed:<reason>` 进入 `ERROR`；不得在探索不可恢复失败后继续保持
+  `EXPLORING`。
 - 当前楼层不是 0 时先调用 `/danger_search/transit_floor` 回 0 层并退出轿厢，然后发送
   二维 home goal。
 - 返航只有在位置误差 `<=0.5 m`、yaw `<=20°`、导航不活动且
@@ -63,14 +66,14 @@ IDLE -> ENTERING -> EXPLORING -> RETURNING -> FINISHED
 输出 `start_relative`。非零起点、非零 yaw 和 z 变换均有回归测试。0 个危险源必须输出
 空数组，不能残留上轮结果。
 
-默认结果路径由 bringup 解析到同级 `SimEnv/results/detected_danger.json`，也可通过绝对
+默认结果路径由 bringup 解析到同级 `simenvnew/results/detected_danger.json`，也可通过绝对
 `result_file` 覆盖。
 
 正式调用 evaluator 前先运行 fail-closed profile 门禁：
 
 ```bash
 rosrun danger_search_mission validate_result.py --official \
-  /home/ruilinli/SimEnv/results/detected_danger.json
+  /home/langan/simenvnew/results/detected_danger.json
 ```
 
 只有 `mission_status=FINISHED`、`run_profile=formal`、`localization_backend=gicp` 且

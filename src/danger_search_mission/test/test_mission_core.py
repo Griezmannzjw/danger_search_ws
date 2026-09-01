@@ -10,6 +10,7 @@ from danger_search_mission.mission_core import (
     build_result_document,
     DangerTrack,
     DangerTrackStore,
+    exploration_failure_reason,
     entry_progress,
     MissionLifecycle,
     next_entry_target,
@@ -117,6 +118,21 @@ class MissionLifecycleTest(unittest.TestCase):
         lifecycle.finish()
         lifecycle.fail()
         self.assertEqual(lifecycle.state, MissionLifecycle.ERROR)
+
+    def test_exploration_failure_reason_only_accepts_terminal_failure(self):
+        self.assertIsNone(exploration_failure_reason(None))
+        self.assertIsNone(exploration_failure_reason({"state": "WAITING"}))
+        self.assertEqual(
+            exploration_failure_reason({
+                "state": "FAILED",
+                "reason": "floor_transit_unavailable",
+            }),
+            "floor_transit_unavailable",
+        )
+        self.assertEqual(
+            exploration_failure_reason({"state": "failed", "reason": ""}),
+            "unknown",
+        )
 
 
 class DangerTrackStoreTest(unittest.TestCase):

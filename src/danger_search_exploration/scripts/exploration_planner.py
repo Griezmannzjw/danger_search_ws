@@ -255,6 +255,8 @@ class ElevatorHallCandidate:
     confidence: float = 0.0
     validated: bool = False
     path_length: float = float("inf")
+    approach_x: float = float("nan")
+    approach_y: float = float("nan")
 
     def __iter__(self):
         return iter((self.x, self.y, self.into_yaw))
@@ -846,13 +848,16 @@ class ExplorationPlanner:
             rospy.get_param("~elevator_crossing_speed_mps", 0.40)
         )
         self.elevator_crossing_distance_m = float(
-            rospy.get_param("~elevator_crossing_distance_m", 1.4)
+            rospy.get_param("~elevator_crossing_distance_m", 1.0)
         )
         self.elevator_crossing_min_progress_m = float(
             rospy.get_param("~elevator_crossing_min_progress_m", 0.8)
         )
         self.elevator_crossing_clearance_m = float(
             rospy.get_param("~elevator_crossing_clearance_m", 0.32)
+        )
+        self.elevator_exit_hall_side_margin_m = float(
+            rospy.get_param("~elevator_exit_hall_side_margin_m", 0.05)
         )
         self.elevator_footprint_min_x = float(
             rospy.get_param("~elevator_footprint_min_x", -0.35)
@@ -2448,7 +2453,8 @@ class ExplorationPlanner:
 
         return None, "all_frontiers_unreachable_or_blacklisted"
 
-    def _send_goal(self, gx, gy, yaw=0.0, planned_path_length=None):
+    def _send_goal(self, gx, gy, yaw=0.0, planned_path_length=None,
+                   context="exploration"):
         """发送导航目标"""
         if not self.move_base_client.wait_for_server(
                 rospy.Duration(self.dependency_check_timeout)):
@@ -4486,6 +4492,16 @@ class ExplorationPlanner:
                 approach_y = candidate.y - self.elevator_hall_approach_m * math.sin(
                     candidate.into_yaw
                 )
+                approach_distance = math.hypot(
+                    approach_x - cx, approach_y - cy
+                )
+                if (bool(getattr(self, "fixed_elevator_hall_enabled", False))
+                        and approach_distance <= self.plan_tolerance):
+                    candidate.approach_x = float(cx)
+                    candidate.approach_y = float(cy)
+                    candidate.path_length = 0.0
+                    ranked.append(candidate)
+                    continue
                 map_x, map_y = self._world_to_map(approach_x, approach_y)
                 if not self._is_free(map_x, map_y):
                     continue
@@ -4495,6 +4511,17 @@ class ExplorationPlanner:
                 candidate.path_length = float(metrics.get(
                     "path_length", math.hypot(approach_x - cx, approach_y - cy)
                 ))
+                points = metrics.get("points") or []
+                if points:
+                    planned_x, planned_y = points[-1]
+                    if (math.hypot(planned_x - approach_x, planned_y - approach_y)
+                            <= self.plan_tolerance + 1e-6):
+                        planned_map_x, planned_map_y = self._world_to_map(
+                            planned_x, planned_y
+                        )
+                        if self._is_free(planned_map_x, planned_map_y):
+                            candidate.approach_x = float(planned_x)
+                            candidate.approach_y = float(planned_y)
                 ranked.append(candidate)
             ranked.sort(key=lambda candidate: (
                 0 if candidate.validated else 1,
@@ -4510,8 +4537,17 @@ class ExplorationPlanner:
             candidate = self.elevator_halls[self.elevator_hall_index]
             hx, hy, into_yaw = candidate
             self.elevator_hall_index += 1
-            approach_x = hx - self.elevator_hall_approach_m * math.cos(into_yaw)
-            approach_y = hy - self.elevator_hall_approach_m * math.sin(into_yaw)
+            nominal_approach_x = (
+                hx - self.elevator_hall_approach_m * math.cos(into_yaw)
+            )
+            nominal_approach_y = (
+                hy - self.elevator_hall_approach_m * math.sin(into_yaw)
+            )
+            approach_x = float(getattr(candidate, "approach_x", float("nan")))
+            approach_y = float(getattr(candidate, "approach_y", float("nan")))
+            if not (math.isfinite(approach_x) and math.isfinite(approach_y)):
+                approach_x = nominal_approach_x
+                approach_y = nominal_approach_y
             path_length = float(getattr(candidate, "path_length", float("inf")))
             if not math.isfinite(path_length):
                 path_length = math.hypot(approach_x - cx, approach_y - cy)
@@ -4527,6 +4563,14 @@ class ExplorationPlanner:
                 hy + self.elevator_car_target_m * math.sin(into_yaw),
             )
             self._floor_change_goal_succeeded = None
+            if (bool(getattr(self, "fixed_elevator_hall_enabled", False))
+                    and math.hypot(approach_x - cx, approach_y - cy)
+                    <= self.plan_tolerance):
+                self._floor_change_goal_succeeded = True
+                self._set_floor_change_phase(
+                    "OPEN_CURRENT_START", "already_at_fixed_hall_approach"
+                )
+                return True
             if self._send_goal(approach_x, approach_y, into_yaw):
                 self.floor_change_hall_deadline = (
                     rospy.Time.now() + rospy.Duration(navigation_timeout)
@@ -4585,6 +4629,16 @@ class ExplorationPlanner:
         self.floor_change_stage_deadline = rospy.Time.now() + rospy.Duration(
             self.elevator_crossing_timeout_s
         )
+
+    def _robot_is_on_hall_side(self):
+        if self.current_pose is None or self.floor_change_hall_point is None:
+            return False
+        hall_x, hall_y, into_yaw = self.floor_change_hall_point
+        signed_into_distance = (
+            (self.current_pose.position.x - hall_x) * math.cos(into_yaw)
+            + (self.current_pose.position.y - hall_y) * math.sin(into_yaw)
+        )
+        return signed_into_distance <= -self.elevator_exit_hall_side_margin_m
 
     def _advance_crossing(self, now):
         entering = self.floor_change_crossing_direction > 0.0
@@ -5007,7 +5061,13 @@ class ExplorationPlanner:
                 )
                 return
             if self.floor_change_exit_to_hall:
-                self._start_crossing(-1.0)
+                if self._robot_is_on_hall_side():
+                    self.floor_change_stable_since = rospy.Time(0)
+                    self._set_floor_change_phase(
+                        "WAIT_STABLE", "already_on_target_hall_side"
+                    )
+                else:
+                    self._start_crossing(-1.0)
             else:
                 self.floor_change_stable_since = rospy.Time(0)
                 self._set_floor_change_phase("WAIT_STABLE", "wait_navigation_epoch")

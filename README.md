@@ -29,7 +29,7 @@ roslaunch danger_search_bringup simulation_truth.launch autostart:=true
 `multifloor_enabled=true` 与 `localization_backend=gazebo_truth`。仅
 `/gazebo_truth_odometry` 可读取 `/gazebo/link_states` 的 `a1_gazebo::base`；楼层身份仍只
 来自电梯服务。真值模式输出到
-`SimEnv/results/detected_danger.simulation_truth.json`，绝不可作为正式通过证据。
+`simenvnew/results/detected_danger.simulation_truth.json`，绝不可作为正式通过证据。
 
 ## 系统闭环
 
@@ -52,12 +52,15 @@ perception:   HSV + RGB-D 已知半径球拟合 + 分层/epoch 跟踪
 
 ## 构建和启动
 
-环境必须按 ROS、SimEnv、算法工作区的顺序加载，以解析官方强类型服务：
+环境必须按 ROS、`simenvnew`、算法工作区的顺序加载，以解析官方强类型服务。登录 shell
+若优先使用 Miniconda，先把系统 Python 放回 PATH，避免 ROS Python 误用 3.14：
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source /home/ruilinli/SimEnv/devel/setup.bash
-cd /home/ruilinli/danger_search_ws
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH
+test "$(command -v python3)" = /usr/bin/python3
+source /home/langan/simenvnew/devel/setup.bash
+cd /home/langan/danger_search_ws
 catkin_make -j4
 source devel/setup.bash
 ```
@@ -65,7 +68,7 @@ source devel/setup.bash
 正式仿真：
 
 ```bash
-cd /home/ruilinli/SimEnv
+cd /home/langan/simenvnew
 GUI=false \
 ENABLE_REFEREE_ODOM=0 \
 ENABLE_GROUND_TRUTH=0 \
@@ -73,20 +76,22 @@ POINTCLOUD_USE_GROUND_TRUTH_ODOM=0 \
 ./auto.sh
 ```
 
-Unitree 控制器完成站立并进入 `/cmd_vel` 模式后，另开终端：
+Unitree 控制器输入 `2` 完成站立，等待至少 15 秒并确认 IMU 姿态可接受，再输入 `6`
+进入 `/cmd_vel` 模式。之后另开终端启动算法；算法运行期间禁止输入 `8` 重置机器人：
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source /home/ruilinli/SimEnv/devel/setup.bash
-source /home/ruilinli/danger_search_ws/devel/setup.bash
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH
+source /home/langan/simenvnew/devel/setup.bash
+source /home/langan/danger_search_ws/devel/setup.bash
 roslaunch danger_search_bringup competition.launch autostart:=true
 ```
 
 默认公开场景合同和结果路径分别为：
 
 ```text
-/home/ruilinli/SimEnv/generated_building/team_scene_info.json
-/home/ruilinli/SimEnv/results/detected_danger.json
+/home/langan/simenvnew/generated_building/team_scene_info.json
+/home/langan/simenvnew/results/detected_danger.json
 ```
 
 不同目录布局可通过 `simenv_root`、`scene_info_file` 和 `result_file` 覆盖。正式运行不需要
@@ -126,7 +131,7 @@ roslaunch danger_search_bringup competition.launch autostart:=true
 - 启动阶段保持静止，通过公开门服务取得开/关门各 5 帧全向激光差分，直接绑定未知场景中的
   电梯门中心和朝向；成功绑定跨同一 floor/epoch/map-load 的后续地图版本有效。差分失败时才
   使用严格的单门洞矩形井道几何和跨 3 个地图版本的累计评分，距离只作最终同分项。
-- 电梯门槛穿越默认使用 `0.40 m/s`，主动门运动绑定在换层开门后直接进入，不重复执行
+- 电梯门槛穿越默认使用 `1.00 m @ 0.40 m/s`，主动门运动绑定在换层开门后直接进入，不重复执行
   “开—关—开”验证。拓扑按 served floors 选择最少换乘路线。
 - 每层独立保存失败目标、trap blacklist、地图版本和完成状态。连续 10 s 无可达前沿且
   地图稳定后才标记当前层完成。
@@ -158,7 +163,7 @@ roslaunch danger_search_bringup competition.launch autostart:=true
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source /home/ruilinli/SimEnv/devel/setup.bash
+source /home/langan/simenvnew/devel/setup.bash
 source devel/setup.bash
 catkin_make run_tests -j4
 catkin_test_results --all
@@ -169,7 +174,10 @@ catkin_test_results --all
 坐标变换、空结果和 mission 返航 smoke。
 
 这些测试不等于正式比赛闭环实测。12 个固定 seed、覆盖率、600 s、召回/虚警/误差、
-CPU/内存和重复稳定性仍必须在真实 SimEnv 上按验收矩阵运行并归档后，才能宣布比赛闭环
+CPU/内存和重复稳定性仍必须在真实 `simenvnew` 上按验收矩阵运行并归档后，才能宣布比赛闭环
 通过。2026-08-27 的首轮正式模式 smoke 已通过 preflight，但在入场导航阶段以
 `entry_timeout` 结束；当前不得标记为比赛闭环通过，证据和整改顺序见
 [seed 42001 正式 smoke 记录](docs/FORMAL_SMOKE_SEED42001.md)。
+
+完整的 `GUI=false` 启动顺序、状态采集、隔离测试和停止步骤见
+[`command_bringup_flow.md`](command_bringup_flow.md)。

@@ -57,19 +57,24 @@ roslaunch danger_search_bringup simulation_truth.launch autostart:=true
 该入口固定为 `simulation_truth / false / true / gazebo_truth`，仅
 `/gazebo_truth_odometry` 可以订阅 `/gazebo/link_states`，并检查指定
 `a1_gazebo::base` link 的新鲜存在。它不会打开 referee odom、ground-truth 点云或危险源
-真值，且独立写入 `SimEnv/results/detected_danger.simulation_truth.json`；该结果的
+真值，且独立写入 `simenvnew/results/detected_danger.simulation_truth.json`；该结果的
 `official_eligible=false`，不得用于正式比赛验收。
 
 ## 正式推荐流程
 
-1. 以 `ENABLE_REFEREE_ODOM=0 ENABLE_GROUND_TRUTH=0
-   POINTCLOUD_USE_GROUND_TRUTH_ODOM=0` 启动 SimEnv；
-2. 在 junior_ctrl 终端按 `2` 站立，再按 `6` 进入 `/cmd_vel` 模式；
+1. 以 `GUI=false ENABLE_REFEREE_ODOM=0 ENABLE_GROUND_TRUTH=0
+   POINTCLOUD_USE_GROUND_TRUTH_ODOM=0` 启动 `simenvnew`；
+2. 在 junior_ctrl 终端按 `2` 站立，等待至少 15 秒并检查 IMU，再按 `6` 进入
+   `/cmd_vel` 模式；
 3. 启动 `competition.launch autostart:=true`；
 4. bringup 调用官方门服务打开 `main_entrance`；
 5. mission 在门外记录出生点，以短目标滚动进入建筑，确认前向进度后再进入 `EXPLORING`；
 6. exploration 完成全部 served floors 后，mission 必要时乘电梯回 0 层，再返回出生点；
 7. 返回起点后自动写结果并进入 `FINISHED`。
+
+算法运行期间禁止输入 `8` reset；完整命令、状态检查、隔离测试与停止顺序见工作区根目录
+`command_bringup_flow.md`。`simulation_truth.launch` 默认只在隔离模式放宽姿态恢复阈值到
+25°，正式 profile 保持 15°，二者的姿态触发阈值都保持 30°。
 
 官方生成场景当前把主入口设为 `initial_open: true`；`entrance_door` 仍会在
 `competition.launch` 启动后调用 `/set_door_state` 再次确认打开。只有服务成功返回后才

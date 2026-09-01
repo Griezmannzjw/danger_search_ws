@@ -49,8 +49,10 @@ TO_HALL -> OPEN_CURRENT -> VERIFY_HALL -> ENTER -> CLOSE_CURRENT
 - 厅导航超时按 `make_plan` 路径长度计算，上限 180 秒。
 - `CallElevator`/`SetDoorState` 是强类型同步服务，每阶段超时 40 秒；调用在工作线程执行，
   取消、超时或新 action generation 会忽略迟到响应。
-- 进入和退出轿厢各限 20 秒，默认门槛穿越速度为 `0.40 m/s`，使用局部激光避障，速度只发布到
+- 进入和退出轿厢各限 40 秒，默认门槛穿越为 `1.00 m @ 0.40 m/s`，使用局部激光避障，速度只发布到
   `/danger_search/elevator_cmd_vel`；control 以短租约仲裁。
+- 楼层切换后先用已确认厅门平面检查机器人中心位置；若已在目标厅侧至少 `0.05 m`，直接
+  进入地图稳定门禁，不再要求 Unitree 执行其当前策略无法可靠完成的反向穿越。
 - `/localization/switch_floor` 成功后要求 epoch 增加，并等待至少两个目标层
   新地图版本、active-map 原子身份、定位健康以及 navigation 完成当前 epoch
   的 costmap reset，再进行 15 秒稳定保持。探索不直接调用清图服务。
@@ -111,4 +113,31 @@ catkin_test_results --all build/test_results/danger_search_exploration
 
 测试覆盖 WFD 性能、扫描过滤默认合同、多楼层拓扑、连通墙/房间凹口/多候选、服务拒绝和
 超时、迟到响应、候选重试及 WAIT_STABLE。真实电梯运动、Unitree 进出轿厢和 12-seed
-比赛闭环仍需在 SimEnv 正式环境完成。
+比赛闭环仍需在 `simenvnew` 正式环境完成。
+
+### 2026-08-31 GUI=false 当前边界
+
+当前三层场景尚未通过自动逐层探索。无 GUI 环境、A1、传感器和门/电梯服务可以启动，
+纯逻辑测试为 `44+5+70` 通过；但公开输入下初始厅门差分进入 `FALLBACK`，0 层曾在仍有
+前沿和覆盖债务时被记为完成，随后稳定为 `FAILED/floor_transit_unavailable`。测试专用的
+厅外出生能够执行普通导航，但长时间运行后出现 `MAP_STALE` 和 costmap 传感器原点越界，
+未到达第一次真实换层。完整复现、隔离条件和下一步验收顺序见
+`docs/gui_false_multifloor_test_2026-08-31.md`。历史单次 `ELEVATOR_COMPLETE` 只证明状态机
+骨架，不代表当前 S3/P3 或三层比赛闭环通过。
+
+### 2026-09-01 复测进展
+
+- 修复固定厅隔离测试中“机器人已位于 nominal approach 附近却被未知栅格拒绝”的问题：
+  仅当 `fixed_elevator_hall_enabled=true` 且距离不超过 `plan_tolerance` 时跳过厅前
+  `make_plan`，直接进入开门验证；正式候选不使用该旁路。
+- seed 42 的最佳真实门服务链已达到 `OPEN_CURRENT -> VALIDATE_CLOSE -> ENTER ->
+  CALL_TARGET -> SWITCH_FLOOR -> EXIT`，得到 `current_floor=1,map_epoch=2` 和 0/1 层独立
+  地图；Unitree 不执行负向离梯速度，Action 以 `EXIT_FAILED` 结束。门槛缩短为
+  `1.00 m @ 0.40 m/s`，并加入“中心已在目标厅侧则直接 WAIT_STABLE”的几何门禁，但重复
+  实测仍可能在入梯后触发姿态安全，尚未形成可重复完整换层。
+- mission 已把 exploration 的 `FAILED` 上卷为 `ERROR`，对应纯逻辑回归已覆盖。
+- 正式公开出生在输入 `6` 后姿态约为 `roll=11.5°、pitch=-19.4°`，且入口、普通导航和
+  门槛运动均未获得足够位移。该 `simenvnew` 控制条件阻塞解决前，不宣称正式 S3/P3 通过。
+
+完整命令和证据见工作区根目录 `command_bringup_flow.md` 与
+`docs/gui_false_multifloor_test_2026-08-31.md`。
