@@ -223,8 +223,9 @@ class PublicTopologyTest(unittest.TestCase):
         self.assertEqual(config["elevator_crossing_timeout_s"], 40.0)
         self.assertEqual(config["floor_map_stable_time_s"], 15.0)
         self.assertEqual(config["elevator_crossing_speed_mps"], 0.40)
-        self.assertEqual(config["elevator_crossing_distance_m"], 1.00)
+        self.assertEqual(config["elevator_crossing_distance_m"], 0.85)
         self.assertEqual(config["elevator_exit_hall_side_margin_m"], 0.05)
+        self.assertEqual(config["elevator_entry_cabin_side_margin_m"], 0.43)
         self.assertEqual(config["shaft_max_area_m2"], 12.0)
         self.assertEqual(config["door_gap_min_width_m"], 0.9)
         self.assertEqual(config["door_gap_max_width_m"], 1.8)
@@ -597,6 +598,22 @@ class TransitStateMachineTest(unittest.TestCase):
         planner.accepted_map_context = (0, 1, 12)
         return planner
 
+    @staticmethod
+    def wait_stable_health_planner():
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_step = "WAIT_STABLE"
+        planner.safety_stop_active = False
+        planner.current_pose = object()
+        planner.input_timeout = 2.0
+        recent = MODULE.rospy.Time.from_sec(9.5)
+        planner.last_pose_time = recent
+        planner.last_mapping_status_time = recent
+        planner.last_map_time = recent
+        planner.last_nav_health_time = recent
+        planner.waiting_for_result = False
+        planner.nav_has_active_goal = False
+        return planner
+
     def test_service_timeout_invalidates_late_response_epoch(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
         old = self.Future(value=SimpleNamespace(accepted=True), done=False)
@@ -841,6 +858,100 @@ class TransitStateMachineTest(unittest.TestCase):
 
         planner._start_crossing.assert_called_once_with(-1.0)
 
+    def test_exit_stops_as_soon_as_robot_reaches_hall_side(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_crossing_direction = -1.0
+        planner.floor_change_stage_deadline = MODULE.rospy.Time.from_sec(20.0)
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=1.05, y=0.0)
+        )
+        planner.floor_change_hall_point = (1.15, 0.0, 0.0)
+        planner.elevator_exit_hall_side_margin_m = 0.05
+        planner.floor_change_crossing_start = (1.25, 0.0)
+        planner._stop_elevator_motion = Mock()
+        planner._set_floor_change_phase = Mock()
+
+        planner._advance_crossing(MODULE.rospy.Time.from_sec(10.0))
+
+        planner._stop_elevator_motion.assert_called_once()
+        planner._set_floor_change_phase.assert_called_once_with(
+            "WAIT_STABLE", "reached_target_hall_side"
+        )
+        self.assertEqual(planner.floor_change_stable_since, MODULE.rospy.Time(0))
+
+    @staticmethod
+    def entering_crossing_planner(current_x):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_crossing_direction = 1.0
+        planner.floor_change_stage_deadline = MODULE.rospy.Time.from_sec(20.0)
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=current_x, y=0.0)
+        )
+        planner.floor_change_hall_point = (1.15, 0.0, 0.0)
+        planner.elevator_entry_cabin_side_margin_m = 0.43
+        planner.floor_change_crossing_start = (0.50, 0.0)
+        planner.floor_change_crossing_target_m = 0.85
+        planner.elevator_crossing_min_progress_m = 0.80
+        planner.elevator_crossing_clearance_m = 0.32
+        planner.elevator_footprint_min_x = -0.35
+        planner.elevator_footprint_max_x = 0.30
+        planner.elevator_footprint_min_y = -0.15
+        planner.elevator_footprint_max_y = 0.15
+        planner.elevator_footprint_margin_m = 0.08
+        planner.elevator_crossing_speed_mps = 0.40
+        planner.input_timeout = 2.0
+        planner.last_scan_time = MODULE.rospy.Time.from_sec(9.5)
+        planner.latest_scan = SimpleNamespace(
+            ranges=[float("inf")] * 360,
+            angle_min=-math.pi,
+            angle_increment=2.0 * math.pi / 360.0,
+            range_min=0.05,
+            range_max=10.0,
+        )
+        planner._scan_window = Mock(return_value=np.array([float("inf")]))
+        planner._stop_elevator_motion = Mock()
+        planner._set_floor_change_phase = Mock()
+        planner._floor_change_fail = Mock()
+        planner.elevator_cmd_pub = Mock()
+        return planner
+
+    def test_entry_distance_does_not_close_door_before_full_body_clearance(self):
+        planner = self.entering_crossing_planner(1.35)
+
+        with patch.object(MODULE, "swept_footprint_obstacle", return_value=None):
+            planner._advance_crossing(MODULE.rospy.Time.from_sec(10.0))
+
+        planner._stop_elevator_motion.assert_not_called()
+        planner._set_floor_change_phase.assert_not_called()
+        planner._floor_change_fail.assert_not_called()
+        command = planner.elevator_cmd_pub.publish.call_args.args[0]
+        self.assertEqual(command.linear.x, 0.40)
+
+    def test_entry_closes_door_only_after_full_body_clears_threshold(self):
+        planner = self.entering_crossing_planner(1.60)
+
+        planner._advance_crossing(MODULE.rospy.Time.from_sec(10.0))
+
+        planner._stop_elevator_motion.assert_called_once()
+        planner._set_floor_change_phase.assert_called_once_with(
+            "CLOSE_CURRENT_START", "fully_inside_elevator_cabin"
+        )
+        planner.elevator_cmd_pub.publish.assert_not_called()
+
+    def test_entry_obstacle_after_minimum_progress_fails_without_closing_door(self):
+        planner = self.entering_crossing_planner(1.35)
+
+        with patch.object(
+                MODULE, "swept_footprint_obstacle", return_value=(1.0, 0.0)):
+            planner._advance_crossing(MODULE.rospy.Time.from_sec(10.0))
+
+        planner._stop_elevator_motion.assert_called_once()
+        planner._floor_change_fail.assert_called_once_with(
+            "ENTER_FAILED",
+            "obstacle detected before full elevator cabin entry",
+        )
+        planner._set_floor_change_phase.assert_not_called()
+
     def test_wait_stable_requires_epoch_two_versions_and_full_hold(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
         planner.floor_change_deadline = MODULE.rospy.Time.from_sec(1000.0)
@@ -1048,6 +1159,46 @@ class TransitStateMachineTest(unittest.TestCase):
         self.assertFalse(healthy)
         self.assertEqual(code, "UNREACHABLE_HALL")
         self.assertIn("stale", detail)
+
+    def test_wait_stable_tolerates_stale_active_map(self):
+        planner = self.wait_stable_health_planner()
+        planner.last_map_time = MODULE.rospy.Time.from_sec(7.0)
+
+        with patch.object(MODULE.rospy, "logwarn_throttle") as warning:
+            healthy, code, detail = planner._transit_phase_health(
+                MODULE.rospy.Time.from_sec(10.0)
+            )
+
+        self.assertTrue(healthy)
+        self.assertEqual(code, "")
+        self.assertEqual(detail, "")
+        warning.assert_called_once()
+
+    def test_wait_stable_tolerates_stale_navigation_health(self):
+        planner = self.wait_stable_health_planner()
+        planner.last_nav_health_time = MODULE.rospy.Time.from_sec(7.0)
+
+        with patch.object(MODULE.rospy, "logwarn_throttle") as warning:
+            healthy, code, detail = planner._transit_phase_health(
+                MODULE.rospy.Time.from_sec(10.0)
+            )
+
+        self.assertTrue(healthy)
+        self.assertEqual(code, "")
+        self.assertEqual(detail, "")
+        warning.assert_called_once()
+
+    def test_wait_stable_rejects_surviving_navigation_goal(self):
+        planner = self.wait_stable_health_planner()
+        planner.nav_has_active_goal = True
+
+        healthy, code, detail = planner._transit_phase_health(
+            MODULE.rospy.Time.from_sec(10.0)
+        )
+
+        self.assertFalse(healthy)
+        self.assertEqual(code, "MAP_NOT_STABLE")
+        self.assertIn("navigation goal", detail)
 
     def test_floor_map_reset_clears_only_that_floor_coordinates(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)

@@ -94,6 +94,11 @@ rostopic info /cmd_vel
 - `move_base` 先输出 `/danger_search/move_base_cmd_vel`，再由
   `navigation_command_mux` 输出 `/danger_search/nav_cmd_vel`。
 - 电梯门槛穿越由 `/danger_search/elevator_cmd_vel` 租约输入 control。
+- 进梯完成不能只按累计位移判断。机器人中心必须沿厅门 `into_yaw` 方向越过门平面至少
+  `elevator_entry_cabin_side_margin_m`；当前实验值为 `0.43 m`，对应后端机身
+  `0.35 m` 加 `0.08 m` 足迹余量。未达到该条件时，即使累计位移超过
+  `elevator_crossing_distance_m` 也不得关门；若扫掠足迹遇障则保持门开启并返回
+  `ENTER_FAILED`。
 - 换层期间 mapping/navigation 的 `transitioning=true`；恢复时两者的
   `current_floor/map_epoch/map_version` 一致。
 - 新层至少产生配置要求的新地图版本并稳定后，exploration 才恢复普通目标。
@@ -128,11 +133,11 @@ PY
 该 profile 只用于隔离 GICP、入口和厅门发现问题。它使用仿真真值定位，固定厅参数也来自
 隔离诊断，严禁作为正式规划输入或 S3/P3 通过证据。
 
-2026-09-01、seed 42 的一次固定厅诊断使用以下算法命令：
+2026-09-01、seed 42 的手工 Action 固定厅诊断使用以下算法命令：
 
 ```bash
 roslaunch danger_search_bringup simulation_truth.launch \
-  autostart:=true \
+  autostart:=false \
   entry_enabled:=false \
   fixed_elevator_hall_enabled:=true \
   fixed_elevator_hall_x:=1.15 \
@@ -144,30 +149,51 @@ roslaunch danger_search_bringup simulation_truth.launch \
 approach 距机器人不超过 `plan_tolerance` 时，exploration 可直接开始开门验证，不再因
 局部未知栅格把“已经位于厅前”误报为 `UNREACHABLE_HALL`。门运动差分仍必须通过。
 
-本轮最佳真实服务链已达到：
+本轮真实服务链已达到：
 
 ```text
 OPEN_CURRENT_START -> CAPTURE_OPEN_SCAN -> VALIDATE_CLOSE_START
 -> CAPTURE_CLOSED_SCAN -> REOPEN_CURRENT_START -> ENTER
--> CLOSE_CURRENT -> CALL_TARGET -> SWITCH_FLOOR -> EXIT
+-> CLOSE_CURRENT -> CALL_TARGET -> SWITCH_FLOOR -> EXIT -> WAIT_STABLE -> DONE
 ```
 
-该次运行成功得到 `current_floor=1, map_epoch=2` 和 0/1 层独立地图，但 Unitree 不执行
-负向 `linear.x`，最终以 `EXIT_FAILED: elevator crossing timed out` 结束。门槛参数已改为
-`1.00 m @ 0.40 m/s`，并增加目标层厅门平面判定：机器人中心若已在厅侧至少 `0.05 m`，
-直接进入 `WAIT_STABLE`，不再强制倒车。该分支已有纯逻辑测试；后续重复实测又在入梯后以
-`excessive_tilt` 安全取消，说明当前门槛动力学仍不稳定，尚未形成可重复的完整 Action 成功。
+门槛实验参数为最小穿越距离 `0.85 m @ 0.40 m/s`，进梯整机净空为门内 `0.43 m`。修复后
+`WAIT_STABLE` 不再因目标层 active map 或 navigation health 短暂迟到而立即失败，仍由总换层 deadline 保持 fail-closed；残留普通导航
+目标继续立即返回 `MAP_NOT_STABLE`。目标层离梯过程中也会持续检查厅门平面，机器人中心一旦
+到达厅侧 `0.05 m` 就停止穿越并进入 `WAIT_STABLE`，不再只在离梯开始前检查一次。
+
+`GUI=true` 完整重启复测中，旧逻辑曾在机器人中心仅进入门内约 `0.20 m` 时停止并关门，导致
+机身尾部仍位于门缝并发生碰撞。修复后机器人到达 `x=1.670 m` 才进入关门阶段；固定厅门平面
+为 `x=1.150 m`，实际门内净空 `0.520 m`，超过 `0.430 m` 阈值，随后 `0 -> 1` Action 返回
+`success=true,current_floor=1,map_epoch=2`。另一运行从
+首层直达三层，真实完成呼梯和地图切换到 `current_floor=2,map_epoch=2`，随后在加载动态厅侧
+修复后完成 `2 -> 0` 返回，结果为 `success=true,current_floor=0,map_epoch=3`，并保留 0/2 层
+独立地图。由于测试中途重启过 exploration 节点，不能把这组隔离证据解释为自主三层探索完成。
 
 ## 5. 2026-09-01 已知外部阻塞
 
-官方默认出生朝向下，输入 `2` 固定站立时 IMU 约为 `roll=-0.1°、pitch=3.0°`；输入 `6`
-后稳定到约 `roll=11.5°、pitch=-19.4°`。正式 profile 的 15°恢复阈值因此不能解除启动安全
-门。仅隔离 profile 使用 25°恢复阈值，触发阈值仍保持 30°。
+RL 初始姿态异常不是必现：本轮固定站立约为 `roll=-0.05°、pitch=-0.42°`，输入 `6` 后约为
+`roll=-0.29°、pitch=-1.24°`。此前 `pitch≈-19.4°` 应记录为运行不稳定样本，而非固定事实。
 
-即使隔离 profile 安全门解除，Unitree 对低速和负向速度的执行仍不一致；`0.25 m/s` 基本
-无位移，`0.40 m/s` 可入梯但重复运行存在翻倒。该现象位于官方 `simenvnew` 的 Unitree RL
-运行条件/控制器与门槛动力学侧；本任务未修改 `simenvnew`。在该阻塞解决前，只能确认算法
-纯逻辑、门服务、楼层切换和独立地图链，不能宣称正式公开出生三层闭环或 S3/P3 通过。
+控制器输出 `Switched from passive to fixed stand` 不能单独证明真实站立。一次异常运行中，
+执行 `8 -> 2` 后状态机报告 fixed stand，但 `a1_gazebo::base` 高度仅 `0.120 m`，实际仍趴地；
+完整停止并重启 `auto.sh` 后，同一检查恢复为 `0.257 m`，切换 RL 后稳定在 `0.307 m`。因此每次
+输入 `2` 后至少等待 10 秒，并在输入 `6` 前通过 GUI 或 `/gazebo/get_link_state` 确认 base 高度
+和姿态；若 fixed stand 仍趴地，优先完整重启仿真，不要直接启动算法。
+
+该站立失败不是“RL 未使用 GPU”导致：`State_FixedStand` 不加载或调用策略模型，GPU 只影响
+输入 `4/6` 后的 `State_RL`。宿主 RTX 5060 可被 `nvidia-smi` 识别，但当前已确认
+`libtorch-cu118` 与该 GPU 不兼容，正式基线仍使用 `UNITREE_RL_DEVICE=cpu`。开启
+`UNITREE_LOG_WAIT_WARNINGS=1` 后，本次 GUI RL 运行观察到 4 ms 循环偶发耗时约
+`4.5–6.6 ms`，另有 20 ms 线程耗时约 `22–42 ms`；这是步态实时性风险，但本次仍完成换层，
+不能解释固定站立阶段的趴地。
+
+Unitree 速度矩阵显示：平地 `+0.25` 可前进但门槛处静止后无法继续，`-0.25` 基本无效，
+`+0.40/-0.40` 在首层平地均可执行，横移 `±0.25` 基本无效，原地转向 `±0.8` 有效。但目标层
+重复测试中 `-0.40` 仍可能完全无位移，原地转向也可能随机长时间不收敛；转身后使用正向
+`0.40` 又可退回厅前。主要外部阻塞因此是 Unitree RL 在门槛/接触状态和不同运行样本中的
+运动可重复性，不是“所有负向速度都不响应”。`simenvnew` 未被修改；在公开出生、正式 GICP、
+无固定厅条件下完成自主逐层探索前，仍不能宣称正式三层闭环或 S3/P3 通过。
 
 ## 6. 停止顺序
 

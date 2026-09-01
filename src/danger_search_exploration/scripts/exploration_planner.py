@@ -848,7 +848,7 @@ class ExplorationPlanner:
             rospy.get_param("~elevator_crossing_speed_mps", 0.40)
         )
         self.elevator_crossing_distance_m = float(
-            rospy.get_param("~elevator_crossing_distance_m", 1.0)
+            rospy.get_param("~elevator_crossing_distance_m", 0.85)
         )
         self.elevator_crossing_min_progress_m = float(
             rospy.get_param("~elevator_crossing_min_progress_m", 0.8)
@@ -859,6 +859,9 @@ class ExplorationPlanner:
         self.elevator_exit_hall_side_margin_m = float(
             rospy.get_param("~elevator_exit_hall_side_margin_m", 0.05)
         )
+        self.elevator_entry_cabin_side_margin_m = float(rospy.get_param(
+            "~elevator_entry_cabin_side_margin_m", 0.43
+        ))
         self.elevator_footprint_min_x = float(
             rospy.get_param("~elevator_footprint_min_x", -0.35)
         )
@@ -952,6 +955,7 @@ class ExplorationPlanner:
                 and 0.0 < self.elevator_crossing_min_progress_m
                 <= self.elevator_crossing_distance_m
                 and self.elevator_crossing_clearance_m > 0.0
+                and self.elevator_entry_cabin_side_margin_m > 0.0
                 and self.elevator_footprint_min_x < self.elevator_footprint_max_x
                 and self.elevator_footprint_min_y < self.elevator_footprint_max_y
                 and self.elevator_footprint_margin_m >= 0.0
@@ -4640,6 +4644,29 @@ class ExplorationPlanner:
         )
         return signed_into_distance <= -self.elevator_exit_hall_side_margin_m
 
+    def _robot_is_inside_cabin(self):
+        if self.current_pose is None or self.floor_change_hall_point is None:
+            return False
+        hall_x, hall_y, into_yaw = self.floor_change_hall_point
+        signed_into_distance = (
+            (self.current_pose.position.x - hall_x) * math.cos(into_yaw)
+            + (self.current_pose.position.y - hall_y) * math.sin(into_yaw)
+        )
+        return signed_into_distance >= self.elevator_entry_cabin_side_margin_m
+
+    def _entry_distance_remaining(self):
+        if self.current_pose is None or self.floor_change_hall_point is None:
+            return self.floor_change_crossing_target_m
+        hall_x, hall_y, into_yaw = self.floor_change_hall_point
+        signed_into_distance = (
+            (self.current_pose.position.x - hall_x) * math.cos(into_yaw)
+            + (self.current_pose.position.y - hall_y) * math.sin(into_yaw)
+        )
+        return max(
+            0.0,
+            self.elevator_entry_cabin_side_margin_m - signed_into_distance,
+        )
+
     def _advance_crossing(self, now):
         entering = self.floor_change_crossing_direction > 0.0
         failure_code = "ENTER_FAILED" if entering else "EXIT_FAILED"
@@ -4647,19 +4674,30 @@ class ExplorationPlanner:
             self._stop_elevator_motion()
             self._floor_change_fail(failure_code, "elevator crossing timed out")
             return
+        if not entering and self._robot_is_on_hall_side():
+            self._stop_elevator_motion()
+            self.floor_change_stable_since = rospy.Time(0)
+            self._set_floor_change_phase(
+                "WAIT_STABLE", "reached_target_hall_side"
+            )
+            return
+        if entering and self._robot_is_inside_cabin():
+            self._stop_elevator_motion()
+            self._set_floor_change_phase(
+                "CLOSE_CURRENT_START", "fully_inside_elevator_cabin"
+            )
+            return
         start_x, start_y = self.floor_change_crossing_start
         progress = math.hypot(
             self.current_pose.position.x - start_x,
             self.current_pose.position.y - start_y,
         )
         if progress >= self.floor_change_crossing_target_m:
-            self._stop_elevator_motion()
-            if entering:
-                self._set_floor_change_phase("CLOSE_CURRENT_START")
-            else:
+            if not entering:
+                self._stop_elevator_motion()
                 self.floor_change_stable_since = rospy.Time(0)
                 self._set_floor_change_phase("WAIT_STABLE", "wait_navigation_epoch")
-            return
+                return
         scan_fresh = (
             self.last_scan_time != rospy.Time(0)
             and (now - self.last_scan_time).to_sec() <= self.input_timeout
@@ -4672,6 +4710,8 @@ class ExplorationPlanner:
         finite = window[np.isfinite(window)]
         clearance = float(np.min(finite)) if finite.size else float("inf")
         remaining = max(0.0, self.floor_change_crossing_target_m - progress)
+        if entering:
+            remaining = max(remaining, self._entry_distance_remaining())
         swept_obstacle = swept_footprint_obstacle(
             self.latest_scan.ranges,
             self.latest_scan.angle_min,
@@ -4697,7 +4737,10 @@ class ExplorationPlanner:
                     "obstacle intersects elevator swept footprint",
                 )
             elif entering:
-                self._set_floor_change_phase("CLOSE_CURRENT_START")
+                self._floor_change_fail(
+                    failure_code,
+                    "obstacle detected before full elevator cabin entry",
+                )
             else:
                 self.floor_change_stable_since = rospy.Time(0)
                 self._set_floor_change_phase("WAIT_STABLE", "wait_navigation_epoch")
@@ -4793,10 +4836,18 @@ class ExplorationPlanner:
                 return False, "MAP_NOT_STABLE", "ordinary navigation goal survived transit"
             if not self._stamp_is_fresh(
                     self.last_map_time, now, self.input_timeout):
-                return False, "MAP_NOT_STABLE", "active map is stale"
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[exploration] waiting for fresh active map after floor "
+                    "switch",
+                )
             if not self._stamp_is_fresh(
                     self.last_nav_health_time, now, self.input_timeout):
-                return False, "MAP_NOT_STABLE", "navigation health is stale"
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[exploration] waiting for fresh navigation health after "
+                    "floor switch",
+                )
             return True, "", ""
 
         if self.waiting_for_result or self.nav_has_active_goal:

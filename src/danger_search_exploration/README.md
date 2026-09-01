@@ -49,13 +49,18 @@ TO_HALL -> OPEN_CURRENT -> VERIFY_HALL -> ENTER -> CLOSE_CURRENT
 - 厅导航超时按 `make_plan` 路径长度计算，上限 180 秒。
 - `CallElevator`/`SetDoorState` 是强类型同步服务，每阶段超时 40 秒；调用在工作线程执行，
   取消、超时或新 action generation 会忽略迟到响应。
-- 进入和退出轿厢各限 40 秒，默认门槛穿越为 `1.00 m @ 0.40 m/s`，使用局部激光避障，速度只发布到
-  `/danger_search/elevator_cmd_vel`；control 以短租约仲裁。
+- 进入和退出轿厢各限 40 秒，默认门槛穿越最小距离为 `0.85 m @ 0.40 m/s`，使用局部激光避障，
+  速度只发布到 `/danger_search/elevator_cmd_vel`；control 以短租约仲裁。进梯完成还要求机器人
+  中心沿厅门 `into_yaw` 进入门内至少 `elevator_entry_cabin_side_margin_m=0.43 m`；累计位移
+  达标但机身未完全进入时继续前进，提前遇障则返回 `ENTER_FAILED` 并保持门开启。
 - 楼层切换后先用已确认厅门平面检查机器人中心位置；若已在目标厅侧至少 `0.05 m`，直接
-  进入地图稳定门禁，不再要求 Unitree 执行其当前策略无法可靠完成的反向穿越。
+  进入地图稳定门禁；离梯运动过程中也持续检查该条件，一旦到达厅侧就停止，不再要求达到
+  固定总位移。
 - `/localization/switch_floor` 成功后要求 epoch 增加，并等待至少两个目标层
   新地图版本、active-map 原子身份、定位健康以及 navigation 完成当前 epoch
-  的 costmap reset，再进行 15 秒稳定保持。探索不直接调用清图服务。
+  的 costmap reset，再进行 15 秒稳定保持。active map 或 navigation health 在刚切层时短暂
+  stale 只会继续等待并节流告警，最终仍由总换层 deadline 返回 `MAP_NOT_STABLE`。探索不直接
+  调用清图服务。
 - `TO_HALL` 接受同一 floor/epoch 内已提交且新鲜的 active-map 快照；其正版本可以
   暂时落后最新 `MappingStatus.map_version`，但不能为零、超前或来自其他 floor/epoch。
   这与普通探索使用同一个 `map_context_is_committed` 合同，避免异步话题到达顺序造成误停。
@@ -130,14 +135,18 @@ catkin_test_results --all build/test_results/danger_search_exploration
 - 修复固定厅隔离测试中“机器人已位于 nominal approach 附近却被未知栅格拒绝”的问题：
   仅当 `fixed_elevator_hall_enabled=true` 且距离不超过 `plan_tolerance` 时跳过厅前
   `make_plan`，直接进入开门验证；正式候选不使用该旁路。
-- seed 42 的最佳真实门服务链已达到 `OPEN_CURRENT -> VALIDATE_CLOSE -> ENTER ->
-  CALL_TARGET -> SWITCH_FLOOR -> EXIT`，得到 `current_floor=1,map_epoch=2` 和 0/1 层独立
-  地图；Unitree 不执行负向离梯速度，Action 以 `EXIT_FAILED` 结束。门槛缩短为
-  `1.00 m @ 0.40 m/s`，并加入“中心已在目标厅侧则直接 WAIT_STABLE”的几何门禁，但重复
-  实测仍可能在入梯后触发姿态安全，尚未形成可重复完整换层。
+- seed 42 固定厅隔离中，门槛参数为 `0.85 m @ 0.40 m/s`。修复 `WAIT_STABLE` 瞬时 stale
+  误失败后，`0 -> 1` Action 返回成功；另一运行完成到 2 层的真实呼梯/地图切换，并在加载
+  动态厅侧判定后成功 `2 -> 0`，达到 `map_epoch=3`。这些运行仍包含固定厅、truth 定位、
+  人工 Action 与厅前复位探针，不代表自主三层闭环。
+- `GUI=true` 完整重启复测确认旧累计位移条件会在机身未完全进入时关门；改为门平面净空后，
+  固定厅 `x=1.150 m` 条件下机器人中心到达 `x=1.670 m`、门内净空 `0.520 m` 才开始关门，
+  随后 `0 -> 1` Action 成功达到 `current_floor=1,map_epoch=2`。
 - mission 已把 exploration 的 `FAILED` 上卷为 `ERROR`，对应纯逻辑回归已覆盖。
-- 正式公开出生在输入 `6` 后姿态约为 `roll=11.5°、pitch=-19.4°`，且入口、普通导航和
-  门槛运动均未获得足够位移。该 `simenvnew` 控制条件阻塞解决前，不宣称正式 S3/P3 通过。
+- Unitree RL 姿态异常不必现，但低速、负向、门槛静止重启和原地转向的执行存在运行间差异。
+  fixed stand 状态文字也可能与实际趴地不一致，应在切换 RL 前检查 base 高度。CPU 推理存在
+  周期超时风险，但固定站立不经过 RL 模型，不能把站立失败归因于未使用 GPU。该 `simenvnew`
+  运动可重复性阻塞解决前，不宣称正式 S3/P3 通过。
 
 完整命令和证据见工作区根目录 `command_bringup_flow.md` 与
 `docs/gui_false_multifloor_test_2026-08-31.md`。
