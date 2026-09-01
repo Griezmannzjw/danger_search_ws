@@ -54,7 +54,10 @@ from danger_search_common.msg import (
     TransitFloorResult,
 )
 from danger_search_common.srv import SwitchFloor
-from danger_search_common.short_range_safety import swept_footprint_obstacle
+from danger_search_common.short_range_safety import (
+    swept_footprint_hit,
+    swept_footprint_obstacle,
+)
 
 try:
     from building_generator_interfaces.srv import (
@@ -74,6 +77,11 @@ BOUNDED_FLOOR_EXHAUSTION_REASONS = frozenset((
     "all_frontiers_unreachable_or_blacklisted",
     "frontier_already_in_observation_range",
 ))
+
+# Seed-42 simulation only: the classic building door animation lasts 25 s.
+# The fixed-hall fast path deliberately waits beyond that animation before
+# applying the direct body-forward elevator command.
+FIXED_ELEVATOR_DOOR_OPEN_WAIT_S = 26.0
 
 
 def classify_navigation_failure(state, status_text=""):
@@ -226,6 +234,94 @@ def scan_door_changed(open_ranges, closed_ranges, change_threshold_m=0.20,
     return float(np.count_nonzero(changed)) / float(changed.size) >= float(
         changed_fraction
     )
+
+
+def normalize_angle(angle):
+    """Return an angle in [-pi, pi)."""
+    return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def elevator_pose_errors(pose, hall, approach_distance):
+    """Return stand-off, lateral and heading errors in the door frame."""
+    hall_x, hall_y, into_yaw = (float(value) for value in hall)
+    direction_x = math.cos(into_yaw)
+    direction_y = math.sin(into_yaw)
+    expected_x = hall_x - float(approach_distance) * direction_x
+    expected_y = hall_y - float(approach_distance) * direction_y
+    delta_x = float(pose.position.x) - expected_x
+    delta_y = float(pose.position.y) - expected_y
+    pose_yaw = math.atan2(
+        2.0 * (pose.orientation.w * pose.orientation.z
+               + pose.orientation.x * pose.orientation.y),
+        1.0 - 2.0 * (pose.orientation.y ** 2 + pose.orientation.z ** 2),
+    )
+    return (
+        delta_x * direction_x + delta_y * direction_y,
+        -delta_x * direction_y + delta_y * direction_x,
+        normalize_angle(into_yaw - pose_yaw),
+    )
+
+
+def elevator_crossing_errors(pose, hall, start_xy, direction):
+    """Return signed progress, door-centred lateral error and yaw error."""
+    hall_x, hall_y, into_yaw = (float(value) for value in hall)
+    direction_x = math.cos(into_yaw)
+    direction_y = math.sin(into_yaw)
+    delta_x = float(pose.position.x) - float(start_xy[0])
+    delta_y = float(pose.position.y) - float(start_xy[1])
+    progress = float(direction) * (
+        delta_x * direction_x + delta_y * direction_y
+    )
+    lateral = (
+        -(float(pose.position.x) - hall_x) * direction_y
+        + (float(pose.position.y) - hall_y) * direction_x
+    )
+    pose_yaw = math.atan2(
+        2.0 * (pose.orientation.w * pose.orientation.z
+               + pose.orientation.x * pose.orientation.y),
+        1.0 - 2.0 * (pose.orientation.y ** 2 + pose.orientation.z ** 2),
+    )
+    return progress, lateral, normalize_angle(into_yaw - pose_yaw)
+
+
+def elevator_door_roi_counts(scan, scan_to_map, hall, width, depth):
+    """Count lidar returns in three equal door-plane regions."""
+    tx, ty, transform_yaw = (float(value) for value in scan_to_map)
+    hall_x, hall_y, into_yaw = (float(value) for value in hall)
+    width = float(width)
+    depth = float(depth)
+    if width <= 0.0 or depth <= 0.0:
+        raise ValueError("invalid elevator door ROI geometry")
+    ranges = np.asarray(scan.ranges, dtype=np.float64)
+    angles = float(scan.angle_min) + np.arange(ranges.size) * float(
+        scan.angle_increment
+    )
+    valid = (
+        np.isfinite(ranges)
+        & (ranges >= float(scan.range_min))
+        & (ranges <= float(scan.range_max))
+    )
+    if not np.any(valid):
+        return (0, 0, 0)
+    local_x = ranges[valid] * np.cos(angles[valid])
+    local_y = ranges[valid] * np.sin(angles[valid])
+    cosine = math.cos(transform_yaw)
+    sine = math.sin(transform_yaw)
+    map_x = tx + cosine * local_x - sine * local_y
+    map_y = ty + sine * local_x + cosine * local_y
+    relative_x = map_x - hall_x
+    relative_y = map_y - hall_y
+    normal = relative_x * math.cos(into_yaw) + relative_y * math.sin(into_yaw)
+    lateral = -relative_x * math.sin(into_yaw) + relative_y * math.cos(into_yaw)
+    inside = (np.abs(normal) <= depth) & (np.abs(lateral) <= width * 0.5)
+    counts = []
+    for lower, upper in ((-0.5, -1.0 / 6.0),
+                         (-1.0 / 6.0, 1.0 / 6.0),
+                         (1.0 / 6.0, 0.5)):
+        counts.append(int(np.count_nonzero(
+            inside & (lateral >= lower * width) & (lateral <= upper * width)
+        )))
+    return tuple(counts)
 
 
 @dataclass
@@ -780,6 +876,48 @@ class ExplorationPlanner:
         self.elevator_crossing_clearance_m = float(
             rospy.get_param("~elevator_crossing_clearance_m", 0.32)
         )
+        self.elevator_alignment_yaw_tolerance_rad = float(rospy.get_param(
+            "~elevator_alignment_yaw_tolerance_rad", 0.10
+        ))
+        self.elevator_alignment_lateral_tolerance_m = float(rospy.get_param(
+            "~elevator_alignment_lateral_tolerance_m", 0.20
+        ))
+        self.elevator_alignment_standoff_tolerance_m = float(rospy.get_param(
+            "~elevator_alignment_standoff_tolerance_m", 0.15
+        ))
+        self.elevator_alignment_stable_s = float(rospy.get_param(
+            "~elevator_alignment_stable_s", 0.5
+        ))
+        self.elevator_alignment_timeout_s = float(rospy.get_param(
+            "~elevator_alignment_timeout_s", 20.0
+        ))
+        self.elevator_alignment_kp = float(rospy.get_param(
+            "~elevator_alignment_kp", 1.5
+        ))
+        self.elevator_alignment_min_angular_rps = float(rospy.get_param(
+            "~elevator_alignment_min_angular_rps", 0.25
+        ))
+        self.elevator_alignment_max_angular_rps = float(rospy.get_param(
+            "~elevator_alignment_max_angular_rps", 0.60
+        ))
+        self.elevator_door_roi_depth_m = float(rospy.get_param(
+            "~elevator_door_roi_depth_m", 0.15
+        ))
+        self.elevator_door_open_required_scans = int(rospy.get_param(
+            "~elevator_door_open_required_scans", 5
+        ))
+        self.elevator_door_open_timeout_s = float(rospy.get_param(
+            "~elevator_door_open_timeout_s", 35.0
+        ))
+        self.elevator_crossing_heading_stop_rad = float(rospy.get_param(
+            "~elevator_crossing_heading_stop_rad", 0.12
+        ))
+        self.elevator_crossing_heading_abort_rad = float(rospy.get_param(
+            "~elevator_crossing_heading_abort_rad", 0.35
+        ))
+        self.elevator_crossing_lateral_limit_m = float(rospy.get_param(
+            "~elevator_crossing_lateral_limit_m", 0.12
+        ))
         self.elevator_footprint_min_x = float(
             rospy.get_param("~elevator_footprint_min_x", -0.35)
         )
@@ -852,6 +990,20 @@ class ExplorationPlanner:
                 and 0.0 < self.elevator_crossing_min_progress_m
                 <= self.elevator_crossing_distance_m
                 and self.elevator_crossing_clearance_m > 0.0
+                and 0.0 < self.elevator_alignment_yaw_tolerance_rad < math.pi
+                and self.elevator_alignment_lateral_tolerance_m > 0.0
+                and self.elevator_alignment_standoff_tolerance_m > 0.0
+                and self.elevator_alignment_stable_s >= 0.0
+                and self.elevator_alignment_timeout_s > 0.0
+                and self.elevator_alignment_kp > 0.0
+                and 0.0 < self.elevator_alignment_min_angular_rps
+                <= self.elevator_alignment_max_angular_rps
+                and self.elevator_door_roi_depth_m > 0.0
+                and self.elevator_door_open_required_scans >= 1
+                and self.elevator_door_open_timeout_s > 0.0
+                and 0.0 < self.elevator_crossing_heading_stop_rad
+                < self.elevator_crossing_heading_abort_rad < math.pi
+                and self.elevator_crossing_lateral_limit_m > 0.0
                 and self.elevator_footprint_min_x < self.elevator_footprint_max_x
                 and self.elevator_footprint_min_y < self.elevator_footprint_max_y
                 and self.elevator_footprint_margin_m >= 0.0
@@ -1022,6 +1174,12 @@ class ExplorationPlanner:
         self.floor_change_crossing_start = None
         self.floor_change_crossing_direction = 0.0
         self.floor_change_crossing_target_m = 0.0
+        self.floor_change_alignment_stable_since = rospy.Time(0)
+        self.floor_change_closed_door_roi_counts = None
+        self.floor_change_door_open_count = 0
+        self.floor_change_door_last_scan_stamp = rospy.Time(0)
+        self.floor_change_recovery_direction = 0.0
+        self.floor_change_diagnostics = {}
         self.floor_change_open_scan = None
         self.floor_change_open_scan_stamp = rospy.Time(0)
         self.floor_change_phase_started = rospy.Time(0)
@@ -1602,6 +1760,15 @@ class ExplorationPlanner:
             "completed_floors": sorted(self.completed_floors),
             "served_floors": sorted(self.served_floors),
             "floor_transition_active": self.floor_change_active,
+            "floor_transition_phase": str(getattr(
+                self, "floor_change_step", "") or ""
+            ),
+            "floor_transition_attempt": int(getattr(
+                self, "floor_change_retries", 0
+            )) + 1 if self.floor_change_active else 0,
+            "floor_transition_diagnostics": dict(getattr(
+                self, "floor_change_diagnostics", {}
+            )),
             "has_active_goal": bool(self.waiting_for_result or self.nav_has_active_goal),
             "blacklisted_cell_count": len(getattr(self, "trap_blacklist", {})),
             "observation_goal_count": len(getattr(self, "observation_goal_cells", [])),
@@ -3654,6 +3821,12 @@ class ExplorationPlanner:
         self.floor_change_expected_epoch = 0
         self.floor_change_stable_since = rospy.Time(0)
         self.floor_change_open_scan = None
+        self.floor_change_alignment_stable_since = rospy.Time(0)
+        self.floor_change_closed_door_roi_counts = None
+        self.floor_change_door_open_count = 0
+        self.floor_change_door_last_scan_stamp = rospy.Time(0)
+        self.floor_change_recovery_direction = 0.0
+        self.floor_change_diagnostics = {}
         self.floor_change_hall_candidate = None
         self._invalidate_service()
         self._stop_elevator_motion()
@@ -3794,6 +3967,202 @@ class ExplorationPlanner:
             return
         self._floor_change_fail(failure_code, message)
 
+    def _retry_current_hall_or_fail(self, failure_code, message):
+        """Retry the active hall without silently consuming another candidate."""
+        self._stop_elevator_motion()
+        self._invalidate_service()
+        if (self.floor_change_retries + 1 < self.elevator_max_retries
+                and self.floor_change_hall_candidate is not None):
+            self.floor_change_retries += 1
+            self.elevator_hall_index = max(0, self.elevator_hall_index - 1)
+            rospy.logwarn(
+                "[exploration] retry elevator hall attempt=%d/%d: %s",
+                self.floor_change_retries + 1, self.elevator_max_retries,
+                message,
+            )
+            self._set_floor_change_phase("TO_HALL", "retry_active_elevator_hall")
+            self._pick_elevator_hall_and_send()
+            return
+        self._floor_change_fail(failure_code, message)
+
+    def _retry_floor_change_phase_or_fail(self, phase, failure_code, message):
+        """Retry a sensor/service phase under the shared bounded retry budget."""
+        self._stop_elevator_motion()
+        self._invalidate_service()
+        if self.floor_change_retries + 1 < self.elevator_max_retries:
+            self.floor_change_retries += 1
+            self.floor_change_door_open_count = 0
+            self.floor_change_door_last_scan_stamp = rospy.Time(0)
+            rospy.logwarn(
+                "[exploration] retry elevator phase=%s attempt=%d/%d: %s",
+                phase, self.floor_change_retries + 1,
+                self.elevator_max_retries, message,
+            )
+            self._set_floor_change_phase(phase, "retry_" + phase.lower())
+            return
+        self._floor_change_fail(failure_code, message)
+
+    def _rotation_clearance_hit(self):
+        """Return the nearest lidar point swept by an in-place rotation."""
+        scan = self.latest_scan
+        ranges = np.asarray(scan.ranges, dtype=np.float64)
+        angles = float(scan.angle_min) + np.arange(ranges.size) * float(
+            scan.angle_increment
+        )
+        valid = (
+            np.isfinite(ranges)
+            & (ranges >= float(scan.range_min))
+            & (ranges <= float(scan.range_max))
+        )
+        if not np.any(valid):
+            return None
+        xs = ranges[valid] * np.cos(angles[valid])
+        ys = ranges[valid] * np.sin(angles[valid])
+        footprint_radius = math.hypot(
+            max(abs(self.elevator_footprint_min_x),
+                abs(self.elevator_footprint_max_x)),
+            max(abs(self.elevator_footprint_min_y),
+                abs(self.elevator_footprint_max_y)),
+        ) + self.elevator_footprint_margin_m
+        in_body = (
+            (xs >= self.elevator_footprint_min_x)
+            & (xs <= self.elevator_footprint_max_x)
+            & (ys >= self.elevator_footprint_min_y)
+            & (ys <= self.elevator_footprint_max_y)
+        )
+        unsafe = (np.hypot(xs, ys) <= footprint_radius) & ~in_body
+        indices = np.flatnonzero(unsafe)
+        if not indices.size:
+            return None
+        index = indices[np.argmin(np.hypot(xs[indices], ys[indices]))]
+        return (float(xs[index]), float(ys[index]))
+
+    def _advance_hall_alignment(self, now):
+        if now > self.floor_change_stage_deadline:
+            self._retry_current_hall_or_fail(
+                "UNREACHABLE_HALL", "elevator hall alignment timed out"
+            )
+            return
+        stand_off, lateral, yaw_error = elevator_pose_errors(
+            self.current_pose,
+            self.floor_change_hall_point,
+            self.elevator_hall_approach_m,
+        )
+        self.floor_change_diagnostics.update({
+            "alignment_standoff_error_m": round(stand_off, 4),
+            "alignment_lateral_error_m": round(lateral, 4),
+            "alignment_yaw_error_rad": round(yaw_error, 4),
+        })
+        if (abs(stand_off) > self.elevator_alignment_standoff_tolerance_m
+                or abs(lateral) > self.elevator_alignment_lateral_tolerance_m):
+            self._retry_current_hall_or_fail(
+                "UNREACHABLE_HALL",
+                "hall pose outside alignment tolerance: "
+                "standoff=%.3f lateral=%.3f" % (stand_off, lateral),
+            )
+            return
+        if abs(yaw_error) <= self.elevator_alignment_yaw_tolerance_rad:
+            self._stop_elevator_motion()
+            if self.floor_change_alignment_stable_since == rospy.Time(0):
+                self.floor_change_alignment_stable_since = now
+                return
+            if ((now - self.floor_change_alignment_stable_since).to_sec()
+                    >= self.elevator_alignment_stable_s):
+                self._set_floor_change_phase("OPEN_CURRENT_START")
+            return
+        self.floor_change_alignment_stable_since = rospy.Time(0)
+        hit = self._rotation_clearance_hit()
+        if hit is not None:
+            self.floor_change_diagnostics["alignment_rotation_hit"] = [
+                round(hit[0], 4), round(hit[1], 4)
+            ]
+            self._retry_current_hall_or_fail(
+                "UNREACHABLE_HALL", "obstacle intersects alignment rotation footprint"
+            )
+            return
+        angular = max(
+            self.elevator_alignment_min_angular_rps,
+            min(self.elevator_alignment_max_angular_rps,
+                abs(yaw_error) * self.elevator_alignment_kp),
+        )
+        command = Twist()
+        command.angular.z = math.copysign(angular, yaw_error)
+        self.elevator_cmd_pub.publish(command)
+
+    def _door_roi_counts(self):
+        transform = self._scan_to_map_planar_transform(self.latest_scan)
+        return elevator_door_roi_counts(
+            self.latest_scan,
+            transform,
+            self.floor_change_hall_point,
+            self.door_gap_min_width_m,
+            self.elevator_door_roi_depth_m,
+        )
+
+    def _begin_wait_door_full_open(self, now):
+        self.floor_change_door_open_count = 0
+        self.floor_change_door_last_scan_stamp = rospy.Time(0)
+        self._set_floor_change_phase("WAIT_DOOR_FULL_OPEN", "verify_door_fully_open")
+        self.floor_change_stage_deadline = now + rospy.Duration(
+            self.elevator_door_open_timeout_s
+        )
+
+    def _advance_wait_door_full_open(self, now):
+        if now > self.floor_change_stage_deadline:
+            self._retry_floor_change_phase_or_fail(
+                "REOPEN_CURRENT_START", "ENTER_FAILED",
+                "elevator door did not become fully open",
+            )
+            return
+        if self.last_scan_time <= self.floor_change_door_last_scan_stamp:
+            return
+        self.floor_change_door_last_scan_stamp = self.last_scan_time
+        counts = self._door_roi_counts()
+        closed_counts = self.floor_change_closed_door_roi_counts
+        closed_evidence = (
+            closed_counts is not None and all(value > 0 for value in closed_counts)
+        )
+        if not self.hall_validation_required:
+            closed_evidence = True
+        fully_open = closed_evidence and all(value == 0 for value in counts)
+        self.floor_change_diagnostics.update({
+            "door_closed_roi_counts": list(closed_counts or (0, 0, 0)),
+            "door_open_roi_counts": list(counts),
+            "door_open_consecutive_scans": int(
+                self.floor_change_door_open_count + (1 if fully_open else 0)
+            ),
+        })
+        self.floor_change_door_open_count = (
+            self.floor_change_door_open_count + 1 if fully_open else 0
+        )
+        if (self.floor_change_door_open_count
+                >= self.elevator_door_open_required_scans):
+            stand_off, lateral, yaw_error = elevator_pose_errors(
+                self.current_pose,
+                self.floor_change_hall_point,
+                self.elevator_hall_approach_m,
+            )
+            self.floor_change_diagnostics.update({
+                "alignment_standoff_error_m": round(stand_off, 4),
+                "alignment_lateral_error_m": round(lateral, 4),
+                "alignment_yaw_error_rad": round(yaw_error, 4),
+            })
+            if (abs(stand_off) > self.elevator_alignment_standoff_tolerance_m
+                    or abs(lateral)
+                    > self.elevator_alignment_lateral_tolerance_m
+                    or abs(yaw_error)
+                    > self.elevator_alignment_yaw_tolerance_rad):
+                self.floor_change_alignment_stable_since = rospy.Time(0)
+                self._set_floor_change_phase(
+                    "ALIGN_HALL", "realign_before_elevator_crossing"
+                )
+                self.floor_change_stage_deadline = now + rospy.Duration(
+                    self.elevator_alignment_timeout_s
+                )
+                return
+            self._remember_validated_hall()
+            self._start_crossing(+1.0)
+
     def _start_crossing(self, direction):
         if self.current_pose is None:
             code = "ENTER_FAILED" if direction > 0.0 else "EXIT_FAILED"
@@ -3811,6 +4180,123 @@ class ExplorationPlanner:
             self.elevator_crossing_timeout_s
         )
 
+    def _finish_crossing(self, entering):
+        self._stop_elevator_motion()
+        if entering:
+            self._set_floor_change_phase("CLOSE_CURRENT_START")
+        else:
+            self.floor_change_stable_since = rospy.Time(0)
+            self._set_floor_change_phase("WAIT_STABLE", "wait_navigation_epoch")
+
+    def _recover_or_fail_crossing(self, progress, failure_code, message):
+        """Retry at the threshold, or back out a partially completed crossing."""
+        self._stop_elevator_motion()
+        entering = self.floor_change_crossing_direction > 0.0
+        if progress >= self.elevator_crossing_min_progress_m:
+            self._finish_crossing(entering)
+            return
+        if progress <= 0.10:
+            retry_phase = "REOPEN_CURRENT_START" if entering else "EXIT"
+            if retry_phase == "EXIT":
+                if self.floor_change_retries + 1 < self.elevator_max_retries:
+                    self.floor_change_retries += 1
+                    self._start_crossing(-1.0)
+                else:
+                    self._floor_change_fail(failure_code, message)
+            else:
+                self._retry_floor_change_phase_or_fail(
+                    retry_phase, failure_code, message
+                )
+            return
+        if self.floor_change_retries + 1 >= self.elevator_max_retries:
+            self._floor_change_fail(failure_code, message)
+            return
+        self.floor_change_retries += 1
+        self.floor_change_recovery_direction = self.floor_change_crossing_direction
+        self._set_floor_change_phase(
+            "RECOVER_CROSSING", "back_out_of_elevator_threshold"
+        )
+        self.floor_change_stage_deadline = rospy.Time.now() + rospy.Duration(
+            self.elevator_crossing_timeout_s
+        )
+
+    def _advance_crossing_recovery(self, now):
+        original_direction = self.floor_change_recovery_direction
+        entering = original_direction > 0.0
+        failure_code = "ENTER_FAILED" if entering else "EXIT_FAILED"
+        if self.current_pose is None or now > self.floor_change_stage_deadline:
+            self._stop_elevator_motion()
+            self._floor_change_fail(failure_code, "elevator threshold recovery timed out")
+            return
+        progress, lateral, yaw_error = elevator_crossing_errors(
+            self.current_pose, self.floor_change_hall_point,
+            self.floor_change_crossing_start, original_direction,
+        )
+        self.floor_change_diagnostics.update({
+            "crossing_recovery_progress_m": round(progress, 4),
+            "crossing_lateral_error_m": round(lateral, 4),
+            "crossing_yaw_error_rad": round(yaw_error, 4),
+        })
+        if progress <= 0.05:
+            self._stop_elevator_motion()
+            if entering:
+                self._set_floor_change_phase(
+                    "REOPEN_CURRENT_START", "retry_after_threshold_recovery"
+                )
+            else:
+                self._start_crossing(-1.0)
+            return
+        if abs(yaw_error) > self.elevator_crossing_heading_abort_rad:
+            self._stop_elevator_motion()
+            self._floor_change_fail(
+                failure_code, "unsafe heading during elevator threshold recovery"
+            )
+            return
+        recovery_direction = -original_direction
+        hit = swept_footprint_hit(
+            self.latest_scan.ranges,
+            self.latest_scan.angle_min,
+            self.latest_scan.angle_increment,
+            self.latest_scan.range_min,
+            self.latest_scan.range_max,
+            recovery_direction,
+            max(0.0, progress),
+            (
+                self.elevator_footprint_min_x,
+                self.elevator_footprint_max_x,
+                self.elevator_footprint_min_y,
+                self.elevator_footprint_max_y,
+            ),
+            self.elevator_footprint_margin_m,
+        )
+        if hit is not None:
+            self._stop_elevator_motion()
+            self.floor_change_diagnostics["crossing_swept_hit"] = [
+                round(hit.x_m, 4), round(hit.y_m, 4)
+            ]
+            self._floor_change_fail(
+                failure_code, "recovery path intersects elevator swept footprint"
+            )
+            return
+        command = Twist()
+        if abs(yaw_error) <= self.elevator_crossing_heading_stop_rad:
+            command.linear.x = recovery_direction * self.elevator_crossing_speed_mps
+        else:
+            rotation_hit = self._rotation_clearance_hit()
+            if rotation_hit is not None:
+                self._stop_elevator_motion()
+                self._floor_change_fail(
+                    failure_code,
+                    "cannot safely align during elevator threshold recovery",
+                )
+                return
+            command.angular.z = max(
+                -self.elevator_alignment_max_angular_rps,
+                min(self.elevator_alignment_max_angular_rps,
+                    yaw_error * self.elevator_alignment_kp),
+            )
+        self.elevator_cmd_pub.publish(command)
+
     def _advance_crossing(self, now):
         entering = self.floor_change_crossing_direction > 0.0
         failure_code = "ENTER_FAILED" if entering else "EXIT_FAILED"
@@ -3818,18 +4304,19 @@ class ExplorationPlanner:
             self._stop_elevator_motion()
             self._floor_change_fail(failure_code, "elevator crossing timed out")
             return
-        start_x, start_y = self.floor_change_crossing_start
-        progress = math.hypot(
-            self.current_pose.position.x - start_x,
-            self.current_pose.position.y - start_y,
+        progress, lateral, yaw_error = elevator_crossing_errors(
+            self.current_pose,
+            self.floor_change_hall_point,
+            self.floor_change_crossing_start,
+            self.floor_change_crossing_direction,
         )
+        self.floor_change_diagnostics.update({
+            "crossing_progress_m": round(progress, 4),
+            "crossing_lateral_error_m": round(lateral, 4),
+            "crossing_yaw_error_rad": round(yaw_error, 4),
+        })
         if progress >= self.floor_change_crossing_target_m:
-            self._stop_elevator_motion()
-            if entering:
-                self._set_floor_change_phase("CLOSE_CURRENT_START")
-            else:
-                self.floor_change_stable_since = rospy.Time(0)
-                self._set_floor_change_phase("WAIT_STABLE", "wait_navigation_epoch")
+            self._finish_crossing(entering)
             return
         scan_fresh = (
             self.last_scan_time != rospy.Time(0)
@@ -3843,7 +4330,7 @@ class ExplorationPlanner:
         finite = window[np.isfinite(window)]
         clearance = float(np.min(finite)) if finite.size else float("inf")
         remaining = max(0.0, self.floor_change_crossing_target_m - progress)
-        swept_obstacle = swept_footprint_obstacle(
+        swept_hit = swept_footprint_hit(
             self.latest_scan.ranges,
             self.latest_scan.angle_min,
             self.latest_scan.angle_increment,
@@ -3859,25 +4346,55 @@ class ExplorationPlanner:
             ),
             self.elevator_footprint_margin_m,
         )
+        fixed_direct_entry = (
+            entering and bool(getattr(self, "fixed_elevator_hall_enabled", False))
+        )
+        if (not fixed_direct_entry
+                and abs(lateral) > self.elevator_crossing_lateral_limit_m):
+            self._recover_or_fail_crossing(
+                progress, failure_code,
+                "elevator crossing lateral error exceeds limit: %.3f" % lateral,
+            )
+            return
+        if (not fixed_direct_entry
+                and abs(yaw_error) > self.elevator_crossing_heading_abort_rad):
+            self._recover_or_fail_crossing(
+                progress, failure_code,
+                "elevator crossing heading error exceeds abort limit: %.3f"
+                % yaw_error,
+            )
+            return
         if (clearance <= self.elevator_crossing_clearance_m
-                or swept_obstacle is not None):
-            self._stop_elevator_motion()
-            if progress < self.elevator_crossing_min_progress_m:
-                self._floor_change_fail(
-                    failure_code,
-                    "obstacle intersects elevator swept footprint",
-                )
-            elif entering:
-                self._set_floor_change_phase("CLOSE_CURRENT_START")
-            else:
-                self.floor_change_stable_since = rospy.Time(0)
-                self._set_floor_change_phase("WAIT_STABLE", "wait_navigation_epoch")
+                or swept_hit is not None):
+            if swept_hit is not None:
+                self.floor_change_diagnostics["crossing_swept_hit"] = [
+                    round(swept_hit.x_m, 4), round(swept_hit.y_m, 4)
+                ]
+            self._recover_or_fail_crossing(
+                progress, failure_code,
+                "obstacle intersects elevator swept footprint",
+            )
             return
         command = Twist()
-        command.linear.x = (
-            self.floor_change_crossing_direction
-            * self.elevator_crossing_speed_mps
-        )
+        if (fixed_direct_entry
+                or abs(yaw_error) <= self.elevator_crossing_heading_stop_rad):
+            command.linear.x = (
+                self.floor_change_crossing_direction
+                * self.elevator_crossing_speed_mps
+            )
+        else:
+            rotation_hit = self._rotation_clearance_hit()
+            if rotation_hit is not None:
+                self._recover_or_fail_crossing(
+                    progress, failure_code,
+                    "cannot safely correct heading during elevator crossing",
+                )
+                return
+            command.angular.z = max(
+                -self.elevator_alignment_max_angular_rps,
+                min(self.elevator_alignment_max_angular_rps,
+                    yaw_error * self.elevator_alignment_kp),
+            )
         self.elevator_cmd_pub.publish(command)
 
     def _complete_exploration(self, reason):
@@ -3975,10 +4492,13 @@ class ExplorationPlanner:
             return False, code, "ordinary move_base goal is active during transit"
 
         scan_required_steps = {
+            "ALIGN_HALL",
             "OPEN_CURRENT_START", "OPEN_CURRENT_WAIT", "CAPTURE_OPEN_SCAN",
             "VALIDATE_CLOSE_START", "VALIDATE_CLOSE_WAIT",
             "CAPTURE_CLOSED_SCAN", "REOPEN_CURRENT_START",
-            "REOPEN_CURRENT_WAIT", "ENTER", "EXIT",
+            "REOPEN_CURRENT_WAIT", "FIXED_DOOR_OPEN_WAIT",
+            "WAIT_DOOR_FULL_OPEN", "ENTER", "EXIT",
+            "RECOVER_CROSSING",
         }
         if step in scan_required_steps and (
                 self.latest_scan is None or not self._stamp_is_fresh(
@@ -4028,7 +4548,20 @@ class ExplorationPlanner:
             if self.nav_has_active_goal:
                 return
             self.elevator_hall_found = self.floor_change_hall_point
-            self._set_floor_change_phase("OPEN_CURRENT_START")
+            if bool(getattr(self, "fixed_elevator_hall_enabled", False)):
+                self._set_floor_change_phase(
+                    "OPEN_CURRENT_START", "fixed_hall_open_before_direct_entry"
+                )
+                return
+            self.floor_change_alignment_stable_since = rospy.Time(0)
+            self._set_floor_change_phase("ALIGN_HALL", "align_with_elevator_door")
+            self.floor_change_stage_deadline = now + rospy.Duration(
+                self.elevator_alignment_timeout_s
+            )
+            return
+
+        if step == "ALIGN_HALL":
+            self._advance_hall_alignment(now)
             return
 
         if step == "OPEN_CURRENT_START":
@@ -4047,16 +4580,31 @@ class ExplorationPlanner:
                     else "SERVICE_UNAVAILABLE"
                 )
                 detail = getattr(response, "message", str(response or outcome))
-                self._floor_change_fail(code, "open current door: " + detail)
+                self._retry_floor_change_phase_or_fail(
+                    "OPEN_CURRENT_START", code, "open current door: " + detail
+                )
                 return
             self.initial_hall_discovery_door_held_closed = False
-            if (self.hall_validation_required
-                    and not bool(getattr(
-                        self.floor_change_hall_candidate, "validated", False
-                    ))):
+            if bool(getattr(self, "fixed_elevator_hall_enabled", False)):
+                self._set_floor_change_phase(
+                    "FIXED_DOOR_OPEN_WAIT", "wait_fixed_door_animation"
+                )
+                self.floor_change_stage_deadline = now + rospy.Duration(
+                    FIXED_ELEVATOR_DOOR_OPEN_WAIT_S
+                )
+                return
+            if self.hall_validation_required:
                 self._set_floor_change_phase("CAPTURE_OPEN_SCAN")
             else:
-                self._start_crossing(+1.0)
+                self.floor_change_closed_door_roi_counts = None
+                self._begin_wait_door_full_open(now)
+            return
+
+        if step == "FIXED_DOOR_OPEN_WAIT":
+            if now < self.floor_change_stage_deadline:
+                return
+            self._remember_validated_hall()
+            self._start_crossing(+1.0)
             return
 
         if step == "CAPTURE_OPEN_SCAN":
@@ -4066,12 +4614,16 @@ class ExplorationPlanner:
                     or self.latest_scan is None):
                 if (now - self.floor_change_phase_started).to_sec() > max(
                         2.0, self.elevator_scan_settle_s + 1.0):
-                    self._retry_hall_or_fail("NO_HALL", "no fresh open-door scan")
+                    self._retry_current_hall_or_fail(
+                        "NO_HALL", "no fresh open-door scan"
+                    )
                 return
             self.floor_change_open_scan = self._scan_window(self.latest_scan)
             self.floor_change_open_scan_stamp = self.last_scan_time
             if self.floor_change_open_scan.size < 5:
-                self._retry_hall_or_fail("NO_HALL", "open-door scan window is empty")
+                self._retry_current_hall_or_fail(
+                    "NO_HALL", "open-door scan window is empty"
+                )
                 return
             self._set_floor_change_phase("VALIDATE_CLOSE_START")
             return
@@ -4091,7 +4643,7 @@ class ExplorationPlanner:
                     "SERVICE_REJECTED" if outcome == "rejected"
                     else "SERVICE_UNAVAILABLE"
                 )
-                self._floor_change_fail(
+                self._retry_current_hall_or_fail(
                     code, "close door for hall validation: "
                     + getattr(response, "message", str(response or outcome))
                 )
@@ -4105,7 +4657,7 @@ class ExplorationPlanner:
             if self.last_scan_time <= self.floor_change_open_scan_stamp:
                 if (now - self.floor_change_phase_started).to_sec() > max(
                         2.0, self.elevator_scan_settle_s + 1.0):
-                    self._floor_change_fail(
+                    self._retry_current_hall_or_fail(
                         "SERVICE_UNAVAILABLE", "no fresh closed-door scan"
                     )
                 return
@@ -4116,6 +4668,14 @@ class ExplorationPlanner:
                 self.elevator_door_change_threshold_m,
                 self.elevator_door_changed_fraction,
             )
+            try:
+                self.floor_change_closed_door_roi_counts = self._door_roi_counts()
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                    tf2_ros.ExtrapolationException, ValueError) as exc:
+                self._retry_current_hall_or_fail(
+                    "NO_HALL", "cannot project closed-door scan: %s" % exc
+                )
+                return
             self._set_floor_change_phase("REOPEN_CURRENT_START")
             return
 
@@ -4134,23 +4694,44 @@ class ExplorationPlanner:
                     "SERVICE_REJECTED" if outcome == "rejected"
                     else "SERVICE_UNAVAILABLE"
                 )
-                self._floor_change_fail(
-                    code, "reopen validated hall door: "
+                self._retry_floor_change_phase_or_fail(
+                    "REOPEN_CURRENT_START", code, "reopen validated hall door: "
                     + getattr(response, "message", str(response or outcome))
                 )
                 return
             if not self._hall_validation_passed:
                 self._discard_active_hall_binding()
-                self._retry_hall_or_fail(
+                self._retry_current_hall_or_fail(
                     "NO_HALL", "door motion did not change the local scan"
                 )
                 return
-            self._remember_validated_hall()
-            self._start_crossing(+1.0)
+            if (self.floor_change_closed_door_roi_counts is None
+                    or not all(value > 0 for value in
+                               self.floor_change_closed_door_roi_counts)):
+                self._discard_active_hall_binding()
+                self._retry_current_hall_or_fail(
+                    "NO_HALL", "closed door was not observed in all three ROIs"
+                )
+                return
+            self._begin_wait_door_full_open(now)
+            return
+
+        if step == "WAIT_DOOR_FULL_OPEN":
+            try:
+                self._advance_wait_door_full_open(now)
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                    tf2_ros.ExtrapolationException, ValueError) as exc:
+                rospy.logwarn_throttle(
+                    2.0, "[exploration] waiting for door ROI transform: %s", exc
+                )
             return
 
         if step in ("ENTER", "EXIT"):
             self._advance_crossing(now)
+            return
+
+        if step == "RECOVER_CROSSING":
+            self._advance_crossing_recovery(now)
             return
 
         if step == "CLOSE_CURRENT_START":
@@ -4378,7 +4959,9 @@ class ExplorationPlanner:
             if not self.floor_change_active:
                 return
             if self.floor_change_step in {
-                    "ENTER", "CLOSE_CURRENT_START", "CLOSE_CURRENT_WAIT",
+                    "ALIGN_HALL", "FIXED_DOOR_OPEN_WAIT",
+                    "WAIT_DOOR_FULL_OPEN", "ENTER",
+                    "RECOVER_CROSSING", "CLOSE_CURRENT_START", "CLOSE_CURRENT_WAIT",
                     "CALL_TARGET_START", "CALL_TARGET_WAIT",
                     "SWITCH_FLOOR_START", "SWITCH_FLOOR_WAIT", "EXIT"}:
                 self._publish_mapping_pause()
@@ -4415,15 +4998,19 @@ class ExplorationPlanner:
         rate = rospy.Rate(10.0)
         progress_by_phase = {
             "TO_HALL": 0.10,
+            "ALIGN_HALL": 0.16,
             "OPEN_CURRENT_START": 0.20,
             "OPEN_CURRENT_WAIT": 0.22,
+            "FIXED_DOOR_OPEN_WAIT": 0.35,
             "CAPTURE_OPEN_SCAN": 0.25,
             "VALIDATE_CLOSE_START": 0.27,
             "VALIDATE_CLOSE_WAIT": 0.29,
             "CAPTURE_CLOSED_SCAN": 0.31,
             "REOPEN_CURRENT_START": 0.33,
             "REOPEN_CURRENT_WAIT": 0.35,
+            "WAIT_DOOR_FULL_OPEN": 0.39,
             "ENTER": 0.45,
+            "RECOVER_CROSSING": 0.44,
             "CLOSE_CURRENT_START": 0.50,
             "CLOSE_CURRENT_WAIT": 0.52,
             "CALL_TARGET_START": 0.55,

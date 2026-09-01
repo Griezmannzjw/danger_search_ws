@@ -223,6 +223,14 @@ class PublicTopologyTest(unittest.TestCase):
         self.assertEqual(config["elevator_crossing_timeout_s"], 20.0)
         self.assertEqual(config["floor_map_stable_time_s"], 15.0)
         self.assertEqual(config["elevator_crossing_speed_mps"], 0.40)
+        self.assertEqual(config["elevator_alignment_yaw_tolerance_rad"], 0.10)
+        self.assertEqual(config["elevator_alignment_lateral_tolerance_m"], 0.20)
+        self.assertEqual(config["elevator_door_open_required_scans"], 5)
+        self.assertGreaterEqual(config["elevator_door_open_timeout_s"], 25.0)
+        self.assertLess(
+            config["elevator_crossing_heading_stop_rad"],
+            config["elevator_crossing_heading_abort_rad"],
+        )
         self.assertEqual(config["shaft_max_area_m2"], 12.0)
         self.assertEqual(config["door_gap_min_width_m"], 0.9)
         self.assertEqual(config["door_gap_max_width_m"], 1.8)
@@ -460,6 +468,72 @@ class SweptFootprintTest(unittest.TestCase):
         self.assertIsNotNone(self.obstacle(-0.8, 0.0, direction=-1.0))
 
 
+class ElevatorClosedLoopGeometryTest(unittest.TestCase):
+    @staticmethod
+    def pose(x, y, yaw):
+        return SimpleNamespace(
+            position=SimpleNamespace(x=x, y=y),
+            orientation=SimpleNamespace(
+                x=0.0, y=0.0, z=math.sin(yaw / 2.0),
+                w=math.cos(yaw / 2.0),
+            ),
+        )
+
+    @staticmethod
+    def scan_with_points(points):
+        count = 721
+        angle_min = -math.pi
+        increment = 2.0 * math.pi / float(count - 1)
+        ranges = np.full(count, float("inf"), dtype=np.float64)
+        for x, y in points:
+            angle = math.atan2(y, x)
+            index = int(round((angle - angle_min) / increment))
+            ranges[index] = math.hypot(x, y)
+        return SimpleNamespace(
+            ranges=ranges,
+            angle_min=angle_min,
+            angle_increment=increment,
+            range_min=0.05,
+            range_max=10.0,
+        )
+
+    def test_hall_alignment_reports_position_and_yaw_errors(self):
+        errors = MODULE.elevator_pose_errors(
+            self.pose(0.2, 0.08, math.radians(60.0)),
+            (1.0, 0.0, 0.0),
+            0.8,
+        )
+        self.assertAlmostEqual(errors[0], 0.0, places=6)
+        self.assertAlmostEqual(errors[1], 0.08, places=6)
+        self.assertAlmostEqual(errors[2], -math.pi / 3.0, places=6)
+
+    def test_crossing_progress_is_signed_projection_not_euclidean_distance(self):
+        progress, lateral, _yaw = MODULE.elevator_crossing_errors(
+            self.pose(0.3, 0.4, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 0.0),
+            1.0,
+        )
+        self.assertAlmostEqual(progress, 0.3, places=6)
+        self.assertAlmostEqual(lateral, 0.4, places=6)
+
+    def test_three_door_rois_distinguish_closed_partial_and_open(self):
+        hall = (1.0, 0.0, 0.0)
+        closed = self.scan_with_points(((1.0, -0.30), (1.0, 0.0), (1.0, 0.30)))
+        partial = self.scan_with_points(((1.0, 0.0),))
+        opened = self.scan_with_points(())
+        arguments = ((0.0, 0.0, 0.0), hall, 0.9, 0.15)
+        self.assertEqual(
+            MODULE.elevator_door_roi_counts(closed, *arguments), (1, 1, 1)
+        )
+        self.assertEqual(
+            MODULE.elevator_door_roi_counts(partial, *arguments), (0, 1, 0)
+        )
+        self.assertEqual(
+            MODULE.elevator_door_roi_counts(opened, *arguments), (0, 0, 0)
+        )
+
+
 class TransitStateMachineTest(unittest.TestCase):
     class Future:
         def __init__(self, value=None, done=True):
@@ -569,7 +643,7 @@ class TransitStateMachineTest(unittest.TestCase):
         sent_x = planner._send_goal.call_args.args[0]
         self.assertGreater(sent_x, 3.0)
 
-    def test_motion_validated_binding_skips_runtime_close_reopen(self):
+    def test_motion_validated_binding_still_requires_runtime_door_gate(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
         planner.floor_change_deadline = MODULE.rospy.Time.from_sec(100.0)
         planner.floor_change_step = "OPEN_CURRENT_WAIT"
@@ -579,12 +653,182 @@ class TransitStateMachineTest(unittest.TestCase):
             confidence=1.0, validated=True,
         )
         planner._service_outcome = Mock(return_value=("success", object()))
+        planner._set_floor_change_phase = Mock()
+
+        planner._advance_floor_change(MODULE.rospy.Time.from_sec(1.0))
+
+        planner._set_floor_change_phase.assert_called_once_with("CAPTURE_OPEN_SCAN")
+
+    def test_fixed_hall_open_success_waits_then_starts_direct_crossing(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_deadline = MODULE.rospy.Time.from_sec(100.0)
+        planner.floor_change_step = "OPEN_CURRENT_WAIT"
+        planner.fixed_elevator_hall_enabled = True
+        planner.initial_hall_discovery_door_held_closed = True
+        planner._service_outcome = Mock(return_value=("success", object()))
+        planner._set_floor_change_phase = Mock()
+
+        now = MODULE.rospy.Time.from_sec(1.0)
+        planner._advance_floor_change(now)
+
+        planner._set_floor_change_phase.assert_called_once_with(
+            "FIXED_DOOR_OPEN_WAIT", "wait_fixed_door_animation"
+        )
+        self.assertAlmostEqual(
+            (planner.floor_change_stage_deadline - now).to_sec(), 26.0
+        )
+
+        planner.floor_change_step = "FIXED_DOOR_OPEN_WAIT"
+        planner._remember_validated_hall = Mock()
+        planner._start_crossing = Mock()
+        planner._advance_floor_change(MODULE.rospy.Time.from_sec(27.1))
+        planner._remember_validated_hall.assert_called_once_with()
+        planner._start_crossing.assert_called_once_with(+1.0)
+
+<<<<<<< Updated upstream
+=======
+    def test_fixed_entry_publishes_direct_forward_despite_pose_error(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_crossing_direction = 1.0
+        planner.floor_change_crossing_start = (0.0, 0.5)
+        planner.floor_change_crossing_target_m = 1.4
+        planner.floor_change_hall_point = (0.8, 0.0, 0.0)
+        planner.current_pose = ElevatorClosedLoopGeometryTest.pose(
+            0.0, 0.5, math.radians(45.0)
+        )
+        planner.floor_change_stage_deadline = MODULE.rospy.Time.from_sec(10.0)
+        planner.floor_change_diagnostics = {}
+        planner.last_scan_time = MODULE.rospy.Time.from_sec(0.9)
+        planner.input_timeout = 2.0
+        planner.latest_scan = ElevatorClosedLoopGeometryTest.scan_with_points(())
+        planner.latest_scan.ranges = planner.latest_scan.ranges.tolist()
+        planner.elevator_crossing_clearance_m = 0.32
+        planner.elevator_crossing_min_progress_m = 0.8
+        planner.elevator_crossing_lateral_limit_m = 0.2
+        planner.elevator_crossing_heading_abort_rad = 0.35
+        planner.elevator_crossing_heading_stop_rad = 0.12
+        planner.elevator_crossing_speed_mps = 0.40
+        planner.elevator_footprint_min_x = -0.35
+        planner.elevator_footprint_max_x = 0.30
+        planner.elevator_footprint_min_y = -0.15
+        planner.elevator_footprint_max_y = 0.15
+        planner.elevator_footprint_margin_m = 0.08
+        planner.fixed_elevator_hall_enabled = True
+        planner.elevator_cmd_pub = Mock()
+        planner._recover_or_fail_crossing = Mock()
+
+        planner._advance_crossing(MODULE.rospy.Time.from_sec(1.0))
+
+        command = planner.elevator_cmd_pub.publish.call_args.args[0]
+        self.assertEqual(command.linear.x, 0.40)
+        self.assertEqual(command.angular.z, 0.0)
+        planner._recover_or_fail_crossing.assert_not_called()
+
+    def test_fixed_candidate_failed_door_validation_never_enters(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_deadline = MODULE.rospy.Time.from_sec(100.0)
+        planner.floor_change_step = "REOPEN_CURRENT_WAIT"
+        planner.floor_change_hall_candidate = MODULE.ElevatorHallCandidate(
+            -2.40, -1.65, -math.pi / 2.0,
+            score=1.0, source="fixed_test", confidence=1.0,
+            validated=False,
+        )
+        planner._hall_validation_passed = False
+        planner._service_outcome = Mock(return_value=("success", object()))
+        planner._discard_active_hall_binding = Mock()
+        planner._retry_current_hall_or_fail = Mock()
         planner._start_crossing = Mock()
 
         planner._advance_floor_change(MODULE.rospy.Time.from_sec(1.0))
 
+        planner._start_crossing.assert_not_called()
+        planner._retry_current_hall_or_fail.assert_called_once_with(
+            "NO_HALL", "door motion did not change the local scan"
+        )
+
+    def test_validated_fixed_candidate_keeps_diagnostic_source(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_hall_point = (-2.40, -1.65, -math.pi / 2.0)
+        planner.floor_change_hall_candidate = MODULE.ElevatorHallCandidate(
+            -2.40, -1.65, -math.pi / 2.0,
+            score=1.0, source="fixed_test", confidence=1.0,
+            validated=False,
+        )
+        planner.floor_change_start_floor = 0
+        planner.floor_change_start_epoch = 1
+        planner._save_hall_binding = Mock()
+
+        planner._remember_validated_hall()
+
+        candidate = planner._save_hall_binding.call_args.args[0]
+        self.assertTrue(candidate.validated)
+        self.assertEqual(candidate.source, "fixed_test")
+
+    def test_alignment_rotates_without_publishing_forward_motion(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.current_pose = ElevatorClosedLoopGeometryTest.pose(
+            0.2, 0.0, math.radians(60.0)
+        )
+        planner.floor_change_hall_point = (1.0, 0.0, 0.0)
+        planner.elevator_hall_approach_m = 0.8
+        planner.floor_change_stage_deadline = MODULE.rospy.Time.from_sec(10.0)
+        planner.elevator_alignment_standoff_tolerance_m = 0.15
+        planner.elevator_alignment_lateral_tolerance_m = 0.12
+        planner.elevator_alignment_yaw_tolerance_rad = 0.10
+        planner.elevator_alignment_stable_s = 0.5
+        planner.elevator_alignment_min_angular_rps = 0.25
+        planner.elevator_alignment_max_angular_rps = 0.60
+        planner.elevator_alignment_kp = 1.5
+        planner.elevator_footprint_min_x = -0.35
+        planner.elevator_footprint_max_x = 0.30
+        planner.elevator_footprint_min_y = -0.15
+        planner.elevator_footprint_max_y = 0.15
+        planner.elevator_footprint_margin_m = 0.08
+        planner.latest_scan = ElevatorClosedLoopGeometryTest.scan_with_points(())
+        planner.floor_change_alignment_stable_since = MODULE.rospy.Time(0)
+        planner.floor_change_diagnostics = {}
+        planner.elevator_cmd_pub = Mock()
+        planner._retry_current_hall_or_fail = Mock()
+
+        planner._advance_hall_alignment(MODULE.rospy.Time.from_sec(1.0))
+
+        command = planner.elevator_cmd_pub.publish.call_args.args[0]
+        self.assertEqual(command.linear.x, 0.0)
+        self.assertLess(command.angular.z, 0.0)
+        planner._retry_current_hall_or_fail.assert_not_called()
+
+    def test_full_open_gate_requires_five_distinct_scans_and_closed_evidence(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_stage_deadline = MODULE.rospy.Time.from_sec(20.0)
+        planner.floor_change_door_last_scan_stamp = MODULE.rospy.Time(0)
+        planner.floor_change_door_open_count = 0
+        planner.floor_change_closed_door_roi_counts = (1, 2, 1)
+        planner.floor_change_diagnostics = {}
+        planner.hall_validation_required = True
+        planner.elevator_door_open_required_scans = 5
+        planner.current_pose = ElevatorClosedLoopGeometryTest.pose(0.2, 0.0, 0.0)
+        planner.floor_change_hall_point = (1.0, 0.0, 0.0)
+        planner.elevator_hall_approach_m = 0.8
+        planner.elevator_alignment_standoff_tolerance_m = 0.15
+        planner.elevator_alignment_lateral_tolerance_m = 0.12
+        planner.elevator_alignment_yaw_tolerance_rad = 0.10
+        planner._door_roi_counts = Mock(return_value=(0, 0, 0))
+        planner._remember_validated_hall = Mock()
+        planner._start_crossing = Mock()
+        planner._retry_floor_change_phase_or_fail = Mock()
+
+        for index in range(1, 6):
+            planner.last_scan_time = MODULE.rospy.Time.from_sec(float(index))
+            planner._advance_wait_door_full_open(
+                MODULE.rospy.Time.from_sec(float(index))
+            )
+            if index < 5:
+                planner._start_crossing.assert_not_called()
+
+        planner._remember_validated_hall.assert_called_once_with()
         planner._start_crossing.assert_called_once_with(+1.0)
 
+>>>>>>> Stashed changes
     def test_wait_stable_requires_epoch_two_versions_and_full_hold(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
         planner.floor_change_deadline = MODULE.rospy.Time.from_sec(1000.0)

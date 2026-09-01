@@ -102,6 +102,29 @@ roslaunch danger_search_bringup simulation_truth.launch \
   simenv_root:=/home/ruilinli/SimEnv
 ```
 
+<<<<<<< Updated upstream
+=======
+只验证 Seed 42 已知电梯坐标下的进梯和换层链路时，改用：
+
+```bash
+roslaunch danger_search_bringup simulation_truth.launch \
+  autostart:=false \
+  entry_enabled:=false \
+  simenv_root:=/home/ruilinli/SimEnv \
+  fixed_elevator_hall_enabled:=true \
+  fixed_elevator_hall_x:=-2.40 \
+  fixed_elevator_hall_y:=-1.65 \
+  fixed_elevator_hall_into_yaw:=-1.5707963
+```
+
+该开关仅允许用于 `simulation_truth`，固定门中心为 map 坐标
+`(-2.40, -1.65)`、朝轿厢方向 `yaw=-1.5707963`。固定坐标测试路径到达门前后
+直接请求开门，固定等待 `26 s`，再通过 `/danger_search/elevator_cmd_vel` 以
+`0.40 m/s` 直行进入；它不执行门前精确对准和三分区开—关—开验证，但仍保留
+激光 footprint、安全停车、穿门进度、呼梯和换层地图合同。在线电梯发现路径不变。
+正式 competition 模式若误开该参数，探索节点必须拒绝启动。
+
+>>>>>>> Stashed changes
 该命令会同时启动：
 
 - Gazebo 真值 localization 适配器。
