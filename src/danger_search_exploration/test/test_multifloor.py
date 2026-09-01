@@ -685,8 +685,6 @@ class TransitStateMachineTest(unittest.TestCase):
         planner._remember_validated_hall.assert_called_once_with()
         planner._start_crossing.assert_called_once_with(+1.0)
 
-<<<<<<< Updated upstream
-=======
     def test_fixed_entry_publishes_direct_forward_despite_pose_error(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
         planner.floor_change_crossing_direction = 1.0
@@ -828,7 +826,6 @@ class TransitStateMachineTest(unittest.TestCase):
         planner._remember_validated_hall.assert_called_once_with()
         planner._start_crossing.assert_called_once_with(+1.0)
 
->>>>>>> Stashed changes
     def test_wait_stable_requires_epoch_two_versions_and_full_hold(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
         planner.floor_change_deadline = MODULE.rospy.Time.from_sec(1000.0)
