@@ -13,6 +13,10 @@
   <arg name="localization_backend" default="gicp" />
   <arg name="use_hector_correction" default="false" />
   <arg name="gazebo_base_link" default="a1_gazebo::base" />
+  <arg name="fixed_elevator_hall_enabled" default="false" />
+  <arg name="fixed_elevator_hall_x" default="-2.40" />
+  <arg name="fixed_elevator_hall_y" default="-1.65" />
+  <arg name="fixed_elevator_hall_into_yaw" default="-1.5707963" />
 
   <!-- These stay disabled for both profiles. simulation_truth receives only LinkStates. -->
   <env name="ENABLE_REFEREE_ODOM" value="0" />
@@ -65,6 +69,10 @@
     <param name="localization_backend" value="$(arg localization_backend)" />
     <param name="scene_info_file" value="$(arg scene_info_file)" />
     <param name="entrance_boundary_guard_enabled" value="$(arg entry_enabled)" />
+    <param name="fixed_elevator_hall_enabled" value="$(arg fixed_elevator_hall_enabled)" />
+    <param name="fixed_elevator_hall_x" value="$(arg fixed_elevator_hall_x)" />
+    <param name="fixed_elevator_hall_y" value="$(arg fixed_elevator_hall_y)" />
+    <param name="fixed_elevator_hall_into_yaw" value="$(arg fixed_elevator_hall_into_yaw)" />
   </node>
 
   <node name="control" pkg="danger_search_control" type="cmd_mux.py" output="screen">

@@ -236,6 +236,34 @@ class PublicTopologyTest(unittest.TestCase):
         self.assertEqual(config["door_gap_max_width_m"], 1.8)
         self.assertEqual(config["active_map_topic"], "/mapping/active_map")
         self.assertGreater(config["elevator_footprint_margin_m"], 0.0)
+        self.assertEqual(config["elevator_inside_min_depth_m"], 0.40)
+        self.assertEqual(config["elevator_inside_max_depth_m"], 1.75)
+        self.assertEqual(config["elevator_inside_lateral_limit_m"], 0.35)
+
+    def test_fixed_hall_override_is_simulation_truth_only(self):
+        enabled, hall = MODULE.validate_fixed_elevator_hall_mode(
+            True, False, "simulation_truth", -2.40, -1.65, -math.pi / 2.0
+        )
+        self.assertTrue(enabled)
+        self.assertEqual(hall[:2], (-2.40, -1.65))
+        with self.assertRaises(ValueError):
+            MODULE.validate_fixed_elevator_hall_mode(
+                True, True, "competition", -2.40, -1.65, -math.pi / 2.0
+            )
+
+    def test_fixed_hall_override_skips_initial_door_discovery(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.multifloor_enabled = True
+        planner.initial_hall_discovery_enabled = True
+        planner.fixed_elevator_hall_enabled = True
+        planner.elevator_door_initial_open = {0: True}
+        planner.current_floor = 0
+        planner._elevator_door_id = Mock(return_value="elevator_floor_0")
+
+        planner._begin_initial_hall_discovery()
+
+        self.assertFalse(planner.initial_hall_discovery_active)
+        self.assertEqual(planner.initial_hall_discovery_step, "FIXED_OVERRIDE")
 
 
 class DoorScanValidationTest(unittest.TestCase):
@@ -386,7 +414,8 @@ class ElevatorHallCacheTest(unittest.TestCase):
         planner.accepted_map_load_identity = load
         planner.elevator_hall_approach_m = 0.8
         planner.current_pose = SimpleNamespace(
-            position=SimpleNamespace(x=0.0, y=0.0)
+            position=SimpleNamespace(x=0.0, y=0.0),
+            orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
         )
         planner._world_to_map = Mock(return_value=(20, 30))
         planner._is_free = Mock(return_value=True)
@@ -517,6 +546,50 @@ class ElevatorClosedLoopGeometryTest(unittest.TestCase):
         self.assertAlmostEqual(progress, 0.3, places=6)
         self.assertAlmostEqual(lateral, 0.4, places=6)
 
+    def test_cabin_membership_requires_safe_center_and_full_footprint(self):
+        arguments = (
+            (0.0, 0.0, 0.0), 0.40, 1.75, 0.35,
+            (-0.35, 0.30, -0.15, 0.15), 0.08,
+        )
+        inside, metrics = MODULE.elevator_cabin_membership(
+            self.pose(0.90, 0.0, 0.0), *arguments
+        )
+        self.assertTrue(inside)
+        self.assertGreater(metrics["inside_footprint_min_depth_m"], 0.0)
+
+        threshold_only, metrics = MODULE.elevator_cabin_membership(
+            self.pose(0.40, 0.0, 0.0), *arguments
+        )
+        self.assertFalse(threshold_only)
+        self.assertLess(metrics["inside_footprint_min_depth_m"], 0.0)
+
+        too_lateral, _metrics = MODULE.elevator_cabin_membership(
+            self.pose(0.90, 0.36, 0.0), *arguments
+        )
+        self.assertFalse(too_lateral)
+
+        too_deep, _metrics = MODULE.elevator_cabin_membership(
+            self.pose(1.76, 0.0, 0.0), *arguments
+        )
+        self.assertFalse(too_deep)
+
+    def test_seed42_door_frame_rejects_threshold_pose_and_accepts_cabin_pose(self):
+        arguments = (
+            (-2.40, -1.65, -math.pi / 2.0), 0.40, 1.75, 0.35,
+            (-0.35, 0.30, -0.15, 0.15), 0.08,
+        )
+        threshold_pose, metrics = MODULE.elevator_cabin_membership(
+            self.pose(-2.533, -1.755, math.radians(95.0)), *arguments
+        )
+        self.assertFalse(threshold_pose)
+        self.assertAlmostEqual(metrics["inside_depth_m"], 0.105, places=3)
+
+        cabin_pose, metrics = MODULE.elevator_cabin_membership(
+            self.pose(-2.40, -2.55, -math.pi / 2.0), *arguments
+        )
+        self.assertTrue(cabin_pose)
+        self.assertAlmostEqual(metrics["inside_depth_m"], 0.90, places=3)
+
     def test_three_door_rois_distinguish_closed_partial_and_open(self):
         hall = (1.0, 0.0, 0.0)
         closed = self.scan_with_points(((1.0, -0.30), (1.0, 0.0), (1.0, 0.30)))
@@ -588,6 +661,53 @@ class TransitStateMachineTest(unittest.TestCase):
         self.assertEqual(planner._service_generation, 5)
         self.assertEqual(old.result_calls, 0)
 
+    @staticmethod
+    def inside_elevator_planner(candidate):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.current_pose = ElevatorClosedLoopGeometryTest.pose(0.90, 0.0, 0.0)
+        planner.elevator_halls = [candidate]
+        planner.elevator_hall_index = 0
+        planner.elevator_car_target_m = 1.6
+        planner.elevator_inside_min_depth_m = 0.40
+        planner.elevator_inside_max_depth_m = 1.75
+        planner.elevator_inside_lateral_limit_m = 0.35
+        planner.elevator_footprint_min_x = -0.35
+        planner.elevator_footprint_max_x = 0.30
+        planner.elevator_footprint_min_y = -0.15
+        planner.elevator_footprint_max_y = 0.15
+        planner.elevator_footprint_margin_m = 0.08
+        planner.floor_change_diagnostics = {}
+        planner._floor_change_goal_succeeded = None
+        planner._set_floor_change_phase = Mock()
+        return planner
+
+    def test_fixed_hall_inside_skips_navigation_and_entry(self):
+        candidate = MODULE.ElevatorHallCandidate(
+            0.0, 0.0, 0.0, score=1.0, source="fixed_test"
+        )
+        planner = self.inside_elevator_planner(candidate)
+        planner.fixed_elevator_hall_enabled = True
+
+        self.assertTrue(planner._resume_floor_change_if_inside_elevator())
+
+        self.assertEqual(planner.floor_change_hall_point, (0.0, 0.0, 0.0))
+        self.assertTrue(
+            planner.floor_change_diagnostics["already_inside_elevator"]
+        )
+        planner._set_floor_change_phase.assert_called_once_with(
+            "CLOSE_CURRENT_START", "robot_already_inside_elevator"
+        )
+
+    def test_unvalidated_geometry_candidate_cannot_skip_entry(self):
+        candidate = MODULE.ElevatorHallCandidate(
+            0.0, 0.0, 0.0, score=1.0, source="geometry", validated=False
+        )
+        planner = self.inside_elevator_planner(candidate)
+        planner.fixed_elevator_hall_enabled = False
+
+        self.assertFalse(planner._resume_floor_change_if_inside_elevator())
+        planner._set_floor_change_phase.assert_not_called()
+
     def test_hall_candidate_index_advances_exactly_once(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
         planner.current_pose = SimpleNamespace(
@@ -613,6 +733,43 @@ class TransitStateMachineTest(unittest.TestCase):
             self.assertTrue(planner._pick_elevator_hall_and_send())
         self.assertEqual(planner.elevator_hall_index, 1)
         planner._send_goal.assert_called_once()
+
+    def test_fixed_hall_dispatches_without_frontier_path_precheck(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=1.67, y=3.92),
+            orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+        )
+        planner.elevator_halls = [MODULE.ElevatorHallCandidate(
+            -2.40, -1.65, -math.pi / 2.0,
+            score=1.0, source="fixed_test", confidence=1.0,
+        )]
+        planner.elevator_hall_index = 0
+        planner.elevator_hall_min_score = 0.75
+        planner.elevator_hall_approach_m = 0.8
+        planner.elevator_hall_navigation_max_s = 180.0
+        planner.elevator_hall_nominal_speed_mps = 0.25
+        planner.elevator_car_target_m = 1.4
+        planner.fixed_elevator_hall_enabled = True
+        planner._world_to_map = Mock(return_value=(54, 495))
+        planner._is_free = Mock(return_value=True)
+        planner._check_path = Mock(return_value="unreachable")
+        planner._send_goal = Mock(return_value=True)
+        planner._set_floor_change_phase = Mock()
+
+        with patch.object(
+                MODULE.rospy.Time, "now",
+                return_value=MODULE.rospy.Time.from_sec(1.0)):
+            self.assertTrue(planner._pick_elevator_hall_and_send())
+
+        planner._check_path.assert_not_called()
+        planner._send_goal.assert_called_once()
+        sent_x, sent_y, sent_yaw = planner._send_goal.call_args.args
+        self.assertAlmostEqual(sent_x, -2.55)
+        self.assertAlmostEqual(sent_y, -0.85)
+        # Fixed-mode TO_HALL only positions the robot; ALIGN_HALL handles
+        # the final elevator heading.
+        self.assertAlmostEqual(sent_yaw, 0.0)
 
     def test_higher_score_far_candidate_beats_lower_score_near_candidate(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
@@ -659,6 +816,28 @@ class TransitStateMachineTest(unittest.TestCase):
 
         planner._set_floor_change_phase.assert_called_once_with("CAPTURE_OPEN_SCAN")
 
+    def test_fixed_hall_navigation_success_aligns_before_opening(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_deadline = MODULE.rospy.Time.from_sec(100.0)
+        planner.floor_change_step = "TO_HALL"
+        planner.waiting_for_result = False
+        planner._floor_change_goal_succeeded = True
+        planner.nav_has_active_goal = False
+        planner.floor_change_hall_point = (-2.40, -1.65, -math.pi / 2.0)
+        planner.fixed_elevator_hall_enabled = True
+        planner.elevator_alignment_timeout_s = 12.0
+        planner._set_floor_change_phase = Mock()
+
+        now = MODULE.rospy.Time.from_sec(1.0)
+        planner._advance_floor_change(now)
+
+        planner._set_floor_change_phase.assert_called_once_with(
+            "ALIGN_HALL", "align_with_elevator_door"
+        )
+        self.assertAlmostEqual(
+            (planner.floor_change_stage_deadline - now).to_sec(), 12.0
+        )
+
     def test_fixed_hall_open_success_waits_then_starts_direct_crossing(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
         planner.floor_change_deadline = MODULE.rospy.Time.from_sec(100.0)
@@ -685,14 +864,14 @@ class TransitStateMachineTest(unittest.TestCase):
         planner._remember_validated_hall.assert_called_once_with()
         planner._start_crossing.assert_called_once_with(+1.0)
 
-    def test_fixed_entry_publishes_direct_forward_despite_pose_error(self):
+    def test_aligned_fixed_entry_publishes_forward_when_sweep_is_clear(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
         planner.floor_change_crossing_direction = 1.0
-        planner.floor_change_crossing_start = (0.0, 0.5)
+        planner.floor_change_crossing_start = (0.0, 0.0)
         planner.floor_change_crossing_target_m = 1.4
         planner.floor_change_hall_point = (0.8, 0.0, 0.0)
         planner.current_pose = ElevatorClosedLoopGeometryTest.pose(
-            0.0, 0.5, math.radians(45.0)
+            0.0, 0.0, 0.0
         )
         planner.floor_change_stage_deadline = MODULE.rospy.Time.from_sec(10.0)
         planner.floor_change_diagnostics = {}
@@ -721,6 +900,97 @@ class TransitStateMachineTest(unittest.TestCase):
         self.assertEqual(command.linear.x, 0.40)
         self.assertEqual(command.angular.z, 0.0)
         planner._recover_or_fail_crossing.assert_not_called()
+
+    def test_entry_keeps_forward_until_rear_footprint_clears_door(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_crossing_direction = 1.0
+        planner.floor_change_crossing_start = (0.0, 0.0)
+        planner.floor_change_crossing_target_m = 0.4
+        planner.floor_change_hall_point = (0.8, 0.0, 0.0)
+        planner.current_pose = ElevatorClosedLoopGeometryTest.pose(0.5, 0.0, 0.0)
+        planner.floor_change_stage_deadline = MODULE.rospy.Time.from_sec(10.0)
+        planner.floor_change_diagnostics = {}
+        planner.last_scan_time = MODULE.rospy.Time.from_sec(0.9)
+        planner.input_timeout = 2.0
+        planner.latest_scan = ElevatorClosedLoopGeometryTest.scan_with_points(())
+        planner.latest_scan.ranges = planner.latest_scan.ranges.tolist()
+        planner.elevator_crossing_clearance_m = 0.32
+        planner.elevator_crossing_min_progress_m = 0.8
+        planner.elevator_crossing_lateral_limit_m = 0.2
+        planner.elevator_crossing_heading_abort_rad = 0.35
+        planner.elevator_crossing_heading_stop_rad = 0.12
+        planner.elevator_crossing_speed_mps = 0.40
+        planner.elevator_inside_min_depth_m = 0.40
+        planner.elevator_inside_max_depth_m = 1.75
+        planner.elevator_inside_lateral_limit_m = 0.35
+        planner.elevator_footprint_min_x = -0.35
+        planner.elevator_footprint_max_x = 0.30
+        planner.elevator_footprint_min_y = -0.15
+        planner.elevator_footprint_max_y = 0.15
+        planner.elevator_footprint_margin_m = 0.08
+        planner.elevator_cmd_pub = Mock()
+        planner._finish_crossing = Mock()
+        planner._recover_or_fail_crossing = Mock()
+
+        planner._advance_crossing(MODULE.rospy.Time.from_sec(1.0))
+
+        command = planner.elevator_cmd_pub.publish.call_args.args[0]
+        self.assertEqual(command.linear.x, 0.40)
+        planner._finish_crossing.assert_not_called()
+        self.assertFalse(planner.floor_change_diagnostics["inside_elevator"])
+
+    def test_fixed_entry_rejects_large_heading_error(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_crossing_direction = 1.0
+        planner.floor_change_crossing_start = (0.0, 0.0)
+        planner.floor_change_crossing_target_m = 1.4
+        planner.floor_change_hall_point = (0.8, 0.0, 0.0)
+        planner.current_pose = ElevatorClosedLoopGeometryTest.pose(
+            0.0, 0.0, math.radians(45.0)
+        )
+        planner.floor_change_stage_deadline = MODULE.rospy.Time.from_sec(10.0)
+        planner.floor_change_diagnostics = {}
+        planner.last_scan_time = MODULE.rospy.Time.from_sec(0.9)
+        planner.input_timeout = 2.0
+        planner.latest_scan = ElevatorClosedLoopGeometryTest.scan_with_points(())
+        planner.latest_scan.ranges = planner.latest_scan.ranges.tolist()
+        planner.elevator_crossing_clearance_m = 0.32
+        planner.elevator_crossing_min_progress_m = 0.8
+        planner.elevator_crossing_lateral_limit_m = 0.2
+        planner.elevator_crossing_heading_abort_rad = 0.35
+        planner.elevator_crossing_heading_stop_rad = 0.12
+        planner.elevator_crossing_speed_mps = 0.40
+        planner.elevator_footprint_min_x = -0.35
+        planner.elevator_footprint_max_x = 0.30
+        planner.elevator_footprint_min_y = -0.15
+        planner.elevator_footprint_max_y = 0.15
+        planner.elevator_footprint_margin_m = 0.08
+        planner.fixed_elevator_hall_enabled = True
+        planner.elevator_cmd_pub = Mock()
+        planner._recover_or_fail_crossing = Mock()
+
+        planner._advance_crossing(MODULE.rospy.Time.from_sec(1.0))
+
+        planner.elevator_cmd_pub.publish.assert_not_called()
+        planner._recover_or_fail_crossing.assert_called_once()
+
+    def test_fixed_reopen_success_returns_to_animation_wait(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_deadline = MODULE.rospy.Time.from_sec(100.0)
+        planner.floor_change_step = "REOPEN_CURRENT_WAIT"
+        planner.fixed_elevator_hall_enabled = True
+        planner._service_outcome = Mock(return_value=("success", object()))
+        planner._set_floor_change_phase = Mock()
+
+        now = MODULE.rospy.Time.from_sec(1.0)
+        planner._advance_floor_change(now)
+
+        planner._set_floor_change_phase.assert_called_once_with(
+            "FIXED_DOOR_OPEN_WAIT", "wait_fixed_door_animation"
+        )
+        self.assertAlmostEqual(
+            (planner.floor_change_stage_deadline - now).to_sec(), 26.0
+        )
 
     def test_fixed_candidate_failed_door_validation_never_enters(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)

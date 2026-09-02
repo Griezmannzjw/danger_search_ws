@@ -151,6 +151,11 @@ elevator_footprint_max_x: 0.30
 elevator_footprint_min_y: -0.15
 elevator_footprint_max_y: 0.15
 elevator_footprint_margin_m: 0.08
+# 换层开始时，如果机器人中心已在这个门坐标系安全区内，且带 margin 的
+# footprint 已完全越过门平面，则跳过 TO_HALL/ENTER，直接关门呼梯。
+elevator_inside_min_depth_m: 0.40
+elevator_inside_max_depth_m: 1.75
+elevator_inside_lateral_limit_m: 0.35
 floor_map_stable_time_s: 15.0
 floor_min_new_map_versions: 2
 floor_height_m: 2.6

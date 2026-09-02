@@ -66,6 +66,15 @@ class CompetitionLaunchTest(unittest.TestCase):
         )
         self.assertEqual(arguments["gazebo_base_link"], "a1_gazebo::base")
 
+        truth_arguments = launch_arguments(self.truth)
+        formal_arguments = launch_arguments(self.formal)
+        for name in (
+                "fixed_elevator_hall_enabled", "fixed_elevator_hall_x",
+                "fixed_elevator_hall_y", "fixed_elevator_hall_into_yaw"):
+            self.assertIn(name, truth_arguments)
+            self.assertNotIn(name, formal_arguments)
+            self.assertEqual(arguments[name], "$(arg %s)" % name)
+
     def test_system_owns_all_nodes_and_forwards_runtime_contract(self):
         nodes = [node.attrib.get("name") for node in self.system.findall("node")]
         self.assertEqual(
@@ -118,6 +127,10 @@ class CompetitionLaunchTest(unittest.TestCase):
             exploration_parameters["entrance_boundary_guard_enabled"],
             "$(arg entry_enabled)",
         )
+        for name in (
+                "fixed_elevator_hall_enabled", "fixed_elevator_hall_x",
+                "fixed_elevator_hall_y", "fixed_elevator_hall_into_yaw"):
+            self.assertEqual(exploration_parameters[name], "$(arg %s)" % name)
 
     def test_system_preflight_is_required_and_disables_other_truth_sources(self):
         preflight = next(

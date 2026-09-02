@@ -7,6 +7,10 @@
   <arg name="autostart" default="false" />
   <arg name="entry_enabled" default="true" />
   <arg name="open_main_entrance" default="true" />
+  <arg name="fixed_elevator_hall_enabled" default="false" />
+  <arg name="fixed_elevator_hall_x" default="-2.40" />
+  <arg name="fixed_elevator_hall_y" default="-1.65" />
+  <arg name="fixed_elevator_hall_into_yaw" default="-1.5707963" />
 
   <include file="$(find danger_search_bringup)/launch/system.launch">
     <arg name="simenv_root" value="$(arg simenv_root)" />
@@ -21,6 +25,10 @@
     <arg name="multifloor_enabled" value="true" />
     <arg name="localization_backend" value="gazebo_truth" />
     <arg name="use_hector_correction" value="false" />
+    <arg name="fixed_elevator_hall_enabled" value="$(arg fixed_elevator_hall_enabled)" />
+    <arg name="fixed_elevator_hall_x" value="$(arg fixed_elevator_hall_x)" />
+    <arg name="fixed_elevator_hall_y" value="$(arg fixed_elevator_hall_y)" />
+    <arg name="fixed_elevator_hall_into_yaw" value="$(arg fixed_elevator_hall_into_yaw)" />
     <!-- Keep the only permitted truth input bound to the robot base.  This
          wrapper is an isolation boundary, not a generic LinkStates adapter. -->
     <arg name="gazebo_base_link" value="a1_gazebo::base" />

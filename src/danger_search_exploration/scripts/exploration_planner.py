@@ -84,6 +84,21 @@ BOUNDED_FLOOR_EXHAUSTION_REASONS = frozenset((
 FIXED_ELEVATOR_DOOR_OPEN_WAIT_S = 26.0
 
 
+def validate_fixed_elevator_hall_mode(
+        enabled, competition_mode, run_profile, x, y, into_yaw):
+    """Validate the explicit simulation-only elevator hall override."""
+    enabled = bool(enabled)
+    values = tuple(float(value) for value in (x, y, into_yaw))
+    if enabled and (
+            bool(competition_mode) or str(run_profile) != "simulation_truth"):
+        raise ValueError(
+            "fixed elevator hall is restricted to the simulation_truth profile"
+        )
+    if enabled and not all(math.isfinite(value) for value in values):
+        raise ValueError("fixed elevator hall coordinates must be finite")
+    return enabled, values
+
+
 def classify_navigation_failure(state, status_text=""):
     """Classify an Action terminal state without stale health telemetry."""
     normalized = str(status_text or "").lower()
@@ -282,6 +297,77 @@ def elevator_crossing_errors(pose, hall, start_xy, direction):
         1.0 - 2.0 * (pose.orientation.y ** 2 + pose.orientation.z ** 2),
     )
     return progress, lateral, normalize_angle(into_yaw - pose_yaw)
+
+
+def elevator_cabin_membership(
+        pose, hall, min_depth, max_depth, lateral_limit,
+        footprint_bounds, footprint_margin=0.0):
+    """Check whether the robot is completely past an elevator door plane.
+
+    ``min_depth``, ``max_depth`` and ``lateral_limit`` define a conservative
+    centre-pose safe zone in the door frame.  The padded footprint is also
+    transformed at the current yaw; every corner must be on the cabin side of
+    the door plane.  This prevents a centre pose just beyond the threshold
+    from being treated as a fully boarded robot.
+    """
+    hall_x, hall_y, into_yaw = (float(value) for value in hall)
+    min_depth = float(min_depth)
+    max_depth = float(max_depth)
+    lateral_limit = float(lateral_limit)
+    min_x, max_x, min_y, max_y = (float(value) for value in footprint_bounds)
+    margin = float(footprint_margin)
+    if not (
+            0.0 <= min_depth < max_depth
+            and lateral_limit > 0.0
+            and min_x < max_x
+            and min_y < max_y
+            and margin >= 0.0):
+        raise ValueError("invalid elevator cabin membership geometry")
+
+    direction_x = math.cos(into_yaw)
+    direction_y = math.sin(into_yaw)
+    relative_x = float(pose.position.x) - hall_x
+    relative_y = float(pose.position.y) - hall_y
+    center_depth = relative_x * direction_x + relative_y * direction_y
+    center_lateral = -relative_x * direction_y + relative_y * direction_x
+    pose_yaw = math.atan2(
+        2.0 * (pose.orientation.w * pose.orientation.z
+               + pose.orientation.x * pose.orientation.y),
+        1.0 - 2.0 * (pose.orientation.y ** 2 + pose.orientation.z ** 2),
+    )
+    cosine = math.cos(pose_yaw)
+    sine = math.sin(pose_yaw)
+    padded_corners = (
+        (min_x - margin, min_y - margin),
+        (min_x - margin, max_y + margin),
+        (max_x + margin, min_y - margin),
+        (max_x + margin, max_y + margin),
+    )
+    corner_depths = []
+    corner_laterals = []
+    for local_x, local_y in padded_corners:
+        map_x = float(pose.position.x) + cosine * local_x - sine * local_y
+        map_y = float(pose.position.y) + sine * local_x + cosine * local_y
+        corner_x = map_x - hall_x
+        corner_y = map_y - hall_y
+        corner_depths.append(corner_x * direction_x + corner_y * direction_y)
+        corner_laterals.append(-corner_x * direction_y + corner_y * direction_x)
+
+    footprint_min_depth = min(corner_depths)
+    footprint_max_depth = max(corner_depths)
+    footprint_max_abs_lateral = max(abs(value) for value in corner_laterals)
+    already_inside = (
+        min_depth <= center_depth <= max_depth
+        and abs(center_lateral) <= lateral_limit
+        and footprint_min_depth >= 0.0
+    )
+    return already_inside, {
+        "inside_depth_m": center_depth,
+        "inside_lateral_m": center_lateral,
+        "inside_footprint_min_depth_m": footprint_min_depth,
+        "inside_footprint_max_depth_m": footprint_max_depth,
+        "inside_footprint_max_abs_lateral_m": footprint_max_abs_lateral,
+    }
 
 
 def elevator_door_roi_counts(scan, scan_to_map, hall, width, depth):
@@ -669,6 +755,9 @@ class ExplorationPlanner:
         self.competition_mode = bool(rospy.get_param(
             "~competition_mode", rospy.get_param("/competition_mode", True)
         ))
+        self.run_profile = str(rospy.get_param(
+            "~run_profile", rospy.get_param("/run_profile", "formal")
+        ))
         self.localization_backend = str(rospy.get_param(
             "~localization_backend",
             rospy.get_param("/localization_backend", "gicp"),
@@ -933,6 +1022,15 @@ class ExplorationPlanner:
         self.elevator_footprint_margin_m = float(
             rospy.get_param("~elevator_footprint_margin_m", 0.08)
         )
+        self.elevator_inside_min_depth_m = float(rospy.get_param(
+            "~elevator_inside_min_depth_m", 0.40
+        ))
+        self.elevator_inside_max_depth_m = float(rospy.get_param(
+            "~elevator_inside_max_depth_m", 1.75
+        ))
+        self.elevator_inside_lateral_limit_m = float(rospy.get_param(
+            "~elevator_inside_lateral_limit_m", 0.35
+        ))
         self.elevator_hall_navigation_max_s = float(
             rospy.get_param("~elevator_hall_navigation_max_s", 180.0)
         )
@@ -970,6 +1068,27 @@ class ExplorationPlanner:
         self.initial_hall_discovery_timeout_s = float(rospy.get_param(
             "~initial_hall_discovery_timeout_s", 60.0
         ))
+        fixed_hall_enabled = bool(rospy.get_param(
+            "~fixed_elevator_hall_enabled", False
+        ))
+        fixed_hall_values = (
+            rospy.get_param("~fixed_elevator_hall_x", -2.40),
+            rospy.get_param("~fixed_elevator_hall_y", -1.65),
+            rospy.get_param("~fixed_elevator_hall_into_yaw", -math.pi / 2.0),
+        )
+        try:
+            (self.fixed_elevator_hall_enabled,
+             validated_fixed_hall) = validate_fixed_elevator_hall_mode(
+                fixed_hall_enabled,
+                self.competition_mode,
+                self.run_profile,
+                *fixed_hall_values,
+            )
+        except ValueError as exc:
+            raise rospy.ROSInitException(str(exc))
+        (self.fixed_elevator_hall_x,
+         self.fixed_elevator_hall_y,
+         self.fixed_elevator_hall_into_yaw) = validated_fixed_hall
         if not (
                 self.shaft_min_area_m2 > 0.0
                 and self.shaft_max_area_m2 >= self.shaft_min_area_m2
@@ -1007,6 +1126,9 @@ class ExplorationPlanner:
                 and self.elevator_footprint_min_x < self.elevator_footprint_max_x
                 and self.elevator_footprint_min_y < self.elevator_footprint_max_y
                 and self.elevator_footprint_margin_m >= 0.0
+                and 0.0 <= self.elevator_inside_min_depth_m
+                < self.elevator_inside_max_depth_m
+                and self.elevator_inside_lateral_limit_m > 0.0
                 and self.elevator_hall_navigation_max_s > 0.0
                 and self.elevator_hall_nominal_speed_mps > 0.0
                 and self.elevator_scan_settle_s >= 0.0
@@ -1181,6 +1303,7 @@ class ExplorationPlanner:
         self.floor_change_recovery_direction = 0.0
         self.floor_change_diagnostics = {}
         self.floor_change_open_scan = None
+        self._hall_validation_passed = False
         self.floor_change_open_scan_stamp = rospy.Time(0)
         self.floor_change_phase_started = rospy.Time(0)
         self.floor_change_error_code = ""
@@ -3076,13 +3199,19 @@ class ExplorationPlanner:
         enabled = (
             bool(getattr(self, "multifloor_enabled", False))
             and bool(getattr(self, "initial_hall_discovery_enabled", False))
+            and not bool(getattr(self, "fixed_elevator_hall_enabled", False))
             and bool(getattr(self, "elevator_door_initial_open", {}).get(
                 int(self.current_floor), False
             ))
             and bool(self._elevator_door_id(self.current_floor))
         )
         self.initial_hall_discovery_active = bool(enabled)
-        self.initial_hall_discovery_step = "WAIT_READY" if enabled else "DISABLED"
+        if enabled:
+            self.initial_hall_discovery_step = "WAIT_READY"
+        elif bool(getattr(self, "fixed_elevator_hall_enabled", False)):
+            self.initial_hall_discovery_step = "FIXED_OVERRIDE"
+        else:
+            self.initial_hall_discovery_step = "DISABLED"
         self.initial_hall_discovery_started = (
             rospy.Time.now() if enabled else rospy.Time(0)
         )
@@ -3664,6 +3793,108 @@ class ExplorationPlanner:
                 candidates.append(candidate)
         return candidates
 
+    def _fixed_elevator_hall_candidate(self):
+        """Return the explicit simulation-only hall without validating it."""
+        if not bool(getattr(self, "fixed_elevator_hall_enabled", False)):
+            return None
+        return ElevatorHallCandidate(
+            x=float(self.fixed_elevator_hall_x),
+            y=float(self.fixed_elevator_hall_y),
+            into_yaw=float(self.fixed_elevator_hall_into_yaw),
+            score=1.0,
+            source="fixed_test",
+            confidence=1.0,
+            validated=False,
+        )
+
+    def _hall_candidates_for_floor_change(self, now):
+        """Select the fixed test hall or the normal discovered candidates."""
+        fixed_hall = self._fixed_elevator_hall_candidate()
+        if fixed_hall is not None:
+            return [fixed_hall]
+
+        cached_hall = self._cached_hall_candidate()
+        self._observe_elevator_halls(now)
+        halls = self._confirmed_elevator_halls(now)
+        if cached_hall is not None and not any(
+                math.hypot(cached_hall[0] - hall[0], cached_hall[1] - hall[1])
+                < 0.35 for hall in halls):
+            halls.insert(0, cached_hall)
+        return halls
+
+    def _elevator_cabin_membership(self, hall):
+        return elevator_cabin_membership(
+            self.current_pose,
+            hall,
+            getattr(self, "elevator_inside_min_depth_m", 0.40),
+            getattr(self, "elevator_inside_max_depth_m", 1.75),
+            getattr(self, "elevator_inside_lateral_limit_m", 0.35),
+            (
+                getattr(self, "elevator_footprint_min_x", -0.35),
+                getattr(self, "elevator_footprint_max_x", 0.30),
+                getattr(self, "elevator_footprint_min_y", -0.15),
+                getattr(self, "elevator_footprint_max_y", 0.15),
+            ),
+            getattr(self, "elevator_footprint_margin_m", 0.08),
+        )
+
+    @staticmethod
+    def _candidate_allows_inside_skip(candidate, fixed_mode=False):
+        """Only trusted door poses may cause navigation and entry to be skipped."""
+        source = str(getattr(candidate, "source", ""))
+        return bool(
+            fixed_mode
+            or getattr(candidate, "validated", False)
+            or source in ("door_motion", "runtime_door_motion")
+        )
+
+    def _resume_floor_change_if_inside_elevator(self):
+        """Start the ride directly when the padded robot is already boarded."""
+        for index, raw_candidate in enumerate(self.elevator_halls):
+            candidate = raw_candidate if isinstance(
+                raw_candidate, ElevatorHallCandidate
+            ) else ElevatorHallCandidate(
+                *raw_candidate, score=1.0, confidence=1.0
+            )
+            if not self._candidate_allows_inside_skip(
+                    candidate,
+                    bool(getattr(self, "fixed_elevator_hall_enabled", False))):
+                continue
+            inside, metrics = self._elevator_cabin_membership(candidate.hall())
+            self.floor_change_diagnostics.update({
+                key: round(float(value), 4) for key, value in metrics.items()
+            })
+            self.floor_change_diagnostics.update({
+                "already_inside_elevator": bool(inside),
+                "inside_hall_source": str(candidate.source),
+            })
+            if not inside:
+                continue
+
+            hx, hy, into_yaw = candidate.hall()
+            self.floor_change_hall_point = (hx, hy, into_yaw)
+            self.floor_change_hall_candidate = candidate
+            self.floor_change_car_point = (
+                hx + self.elevator_car_target_m * math.cos(into_yaw),
+                hy + self.elevator_car_target_m * math.sin(into_yaw),
+            )
+            self.elevator_hall_found = self.floor_change_hall_point
+            self.elevator_hall_index = index + 1
+            self._floor_change_goal_succeeded = None
+            rospy.loginfo(
+                "[exploration] robot already inside elevator; skip TO_HALL/ENTER "
+                "depth=%.3f lateral=%.3f footprint_min_depth=%.3f source=%s",
+                metrics["inside_depth_m"],
+                metrics["inside_lateral_m"],
+                metrics["inside_footprint_min_depth_m"],
+                candidate.source,
+            )
+            self._set_floor_change_phase(
+                "CLOSE_CURRENT_START", "robot_already_inside_elevator"
+            )
+            return True
+        return False
+
     def _cached_hall_candidate(self):
         """Return a still-valid hall binding for this floor/elevator pair."""
         key = (int(self.current_floor), str(self.active_elevator_id))
@@ -3685,22 +3916,26 @@ class ExplorationPlanner:
             self.elevator_hall_bindings.pop(key, None)
             return None
         hx, hy, into_yaw = hall
-        approach_distance = float(getattr(self, "elevator_hall_approach_m", 0.8))
-        approach_x = hx - approach_distance * math.cos(into_yaw)
-        approach_y = hy - approach_distance * math.sin(into_yaw)
-        map_x, map_y = self._world_to_map(approach_x, approach_y)
-        if not self._is_free(map_x, map_y):
-            self.elevator_hall_bindings.pop(key, None)
-            return None
-        path_state = self._check_path(
-            self.current_pose.position.x,
-            self.current_pose.position.y,
-            approach_x,
-            approach_y,
-        )
-        if path_state != "reachable":
-            self.elevator_hall_bindings.pop(key, None)
-            return None
+        inside, _metrics = self._elevator_cabin_membership(hall)
+        if not inside:
+            approach_distance = float(getattr(
+                self, "elevator_hall_approach_m", 0.8
+            ))
+            approach_x = hx - approach_distance * math.cos(into_yaw)
+            approach_y = hy - approach_distance * math.sin(into_yaw)
+            map_x, map_y = self._world_to_map(approach_x, approach_y)
+            if not self._is_free(map_x, map_y):
+                self.elevator_hall_bindings.pop(key, None)
+                return None
+            path_state = self._check_path(
+                self.current_pose.position.x,
+                self.current_pose.position.y,
+                approach_x,
+                approach_y,
+            )
+            if path_state != "reachable":
+                self.elevator_hall_bindings.pop(key, None)
+                return None
         return ElevatorHallCandidate(
             x=float(hx),
             y=float(hy),
@@ -3732,7 +3967,7 @@ class ExplorationPlanner:
             candidate.validated = True
             candidate.confidence = 1.0
             candidate.score = 1.0
-            if candidate.source != "door_motion":
+            if candidate.source not in ("door_motion", "fixed_test"):
                 candidate.source = "runtime_door_motion"
         self._save_hall_binding(
             candidate,
@@ -3821,6 +4056,7 @@ class ExplorationPlanner:
         self.floor_change_expected_epoch = 0
         self.floor_change_stable_since = rospy.Time(0)
         self.floor_change_open_scan = None
+        self._hall_validation_passed = False
         self.floor_change_alignment_stable_since = rospy.Time(0)
         self.floor_change_closed_door_roi_counts = None
         self.floor_change_door_open_count = 0
@@ -3841,13 +4077,7 @@ class ExplorationPlanner:
         self.navigation_goal_sent_at = rospy.Time(0)
         self._floor_change_goal_succeeded = None
 
-        cached_hall = self._cached_hall_candidate()
-        self._observe_elevator_halls(now)
-        self.elevator_halls = self._confirmed_elevator_halls(now)
-        if cached_hall is not None and not any(
-                math.hypot(cached_hall[0] - hall[0], cached_hall[1] - hall[1])
-                < 0.35 for hall in self.elevator_halls):
-            self.elevator_halls.insert(0, cached_hall)
+        self.elevator_halls = self._hall_candidates_for_floor_change(now)
         if not self.elevator_halls:
             self._floor_change_fail("NO_HALL", "no elevator hall candidate")
             return False
@@ -3859,6 +4089,8 @@ class ExplorationPlanner:
             math.hypot(hall[0] - cx, hall[1] - cy),
         ))
         self.elevator_hall_index = 0
+        if self._resume_floor_change_if_inside_elevator():
+            return True
         self._set_floor_change_phase("TO_HALL", "select_elevator_hall")
         return self._pick_elevator_hall_and_send()
 
@@ -3889,12 +4121,27 @@ class ExplorationPlanner:
                 map_x, map_y = self._world_to_map(approach_x, approach_y)
                 if not self._is_free(map_x, map_y):
                     continue
-                if self._check_path(cx, cy, approach_x, approach_y) != "reachable":
-                    continue
-                metrics = self.last_checked_path_metrics or {}
-                candidate.path_length = float(metrics.get(
-                    "path_length", math.hypot(approach_x - cx, approach_y - cy)
-                ))
+                fixed_test_hall = (
+                    bool(getattr(self, "fixed_elevator_hall_enabled", False))
+                    and candidate.source == "fixed_test"
+                )
+                if fixed_test_hall:
+                    # The simulation-only override is already trusted geometry.
+                    # Let move_base own planning/recovery instead of allowing a
+                    # single preflight plan or the frontier trap blacklist to
+                    # permanently discard the only elevator candidate.
+                    candidate.path_length = math.hypot(
+                        approach_x - cx, approach_y - cy
+                    )
+                else:
+                    if self._check_path(
+                            cx, cy, approach_x, approach_y) != "reachable":
+                        continue
+                    metrics = self.last_checked_path_metrics or {}
+                    candidate.path_length = float(metrics.get(
+                        "path_length",
+                        math.hypot(approach_x - cx, approach_y - cy),
+                    ))
                 ranked.append(candidate)
             ranked.sort(key=lambda candidate: (
                 0 if candidate.validated else 1,
@@ -3910,6 +4157,12 @@ class ExplorationPlanner:
             self.elevator_hall_index += 1
             approach_x = hx - self.elevator_hall_approach_m * math.cos(into_yaw)
             approach_y = hy - self.elevator_hall_approach_m * math.sin(into_yaw)
+            if (bool(getattr(self, "fixed_elevator_hall_enabled", False))
+                    and candidate.source == "fixed_test"):
+                # Keep the goal just inside the planner's reachable side of
+                # the door-frame inflation; ALIGN_HALL will correct the
+                # remaining small lateral offset before opening the door.
+                approach_x -= 0.15
             path_length = float(getattr(candidate, "path_length", float("inf")))
             if not math.isfinite(path_length):
                 path_length = math.hypot(approach_x - cx, approach_y - cy)
@@ -3925,7 +4178,18 @@ class ExplorationPlanner:
                 hy + self.elevator_car_target_m * math.sin(into_yaw),
             )
             self._floor_change_goal_succeeded = None
-            if self._send_goal(approach_x, approach_y, into_yaw):
+            # In the fixed simulation hall, let move_base solve only the
+            # stand-off position.  Requiring the final elevator heading here
+            # makes DWA try to rotate in the narrow doorway (where it cannot
+            # produce a valid trajectory); ALIGN_HALL performs that rotation
+            # explicitly after the position goal succeeds.
+            goal_yaw = into_yaw
+            if (bool(getattr(self, "fixed_elevator_hall_enabled", False))
+                    and candidate.source == "fixed_test"):
+                orientation = getattr(self.current_pose, "orientation", None)
+                if orientation is not None:
+                    goal_yaw = self._yaw_from_quaternion(orientation)
+            if self._send_goal(approach_x, approach_y, goal_yaw):
                 self.floor_change_hall_deadline = (
                     rospy.Time.now() + rospy.Duration(navigation_timeout)
                 )
@@ -4315,7 +4579,34 @@ class ExplorationPlanner:
             "crossing_lateral_error_m": round(lateral, 4),
             "crossing_yaw_error_rad": round(yaw_error, 4),
         })
-        if progress >= self.floor_change_crossing_target_m:
+        cabin_inside = True
+        if entering:
+            _cabin_safe, cabin_metrics = self._elevator_cabin_membership(
+                self.floor_change_hall_point
+            )
+            # For crossing completion the important condition is that the
+            # padded rear edge has cleared the door plane.  Do not require the
+            # centre to remain below the diagnostic max-depth bound: a small
+            # overshoot is still safely inside the cabin.
+            cabin_inside = (
+                cabin_metrics["inside_depth_m"]
+                >= float(getattr(self, "elevator_inside_min_depth_m", 0.40))
+                and abs(cabin_metrics["inside_lateral_m"])
+                <= float(getattr(
+                    self, "elevator_inside_lateral_limit_m", 0.35
+                ))
+                and cabin_metrics["inside_footprint_min_depth_m"] >= 0.0
+            )
+            self.floor_change_diagnostics.update({
+                "inside_elevator": bool(cabin_inside),
+                "inside_depth_m": round(
+                    cabin_metrics["inside_depth_m"], 4
+                ),
+                "inside_footprint_min_depth_m": round(
+                    cabin_metrics["inside_footprint_min_depth_m"], 4
+                ),
+            })
+        if progress >= self.floor_change_crossing_target_m and cabin_inside:
             self._finish_crossing(entering)
             return
         scan_fresh = (
@@ -4346,18 +4637,13 @@ class ExplorationPlanner:
             ),
             self.elevator_footprint_margin_m,
         )
-        fixed_direct_entry = (
-            entering and bool(getattr(self, "fixed_elevator_hall_enabled", False))
-        )
-        if (not fixed_direct_entry
-                and abs(lateral) > self.elevator_crossing_lateral_limit_m):
+        if abs(lateral) > self.elevator_crossing_lateral_limit_m:
             self._recover_or_fail_crossing(
                 progress, failure_code,
                 "elevator crossing lateral error exceeds limit: %.3f" % lateral,
             )
             return
-        if (not fixed_direct_entry
-                and abs(yaw_error) > self.elevator_crossing_heading_abort_rad):
+        if abs(yaw_error) > self.elevator_crossing_heading_abort_rad:
             self._recover_or_fail_crossing(
                 progress, failure_code,
                 "elevator crossing heading error exceeds abort limit: %.3f"
@@ -4376,8 +4662,7 @@ class ExplorationPlanner:
             )
             return
         command = Twist()
-        if (fixed_direct_entry
-                or abs(yaw_error) <= self.elevator_crossing_heading_stop_rad):
+        if abs(yaw_error) <= self.elevator_crossing_heading_stop_rad:
             command.linear.x = (
                 self.floor_change_crossing_direction
                 * self.elevator_crossing_speed_mps
@@ -4548,11 +4833,6 @@ class ExplorationPlanner:
             if self.nav_has_active_goal:
                 return
             self.elevator_hall_found = self.floor_change_hall_point
-            if bool(getattr(self, "fixed_elevator_hall_enabled", False)):
-                self._set_floor_change_phase(
-                    "OPEN_CURRENT_START", "fixed_hall_open_before_direct_entry"
-                )
-                return
             self.floor_change_alignment_stable_since = rospy.Time(0)
             self._set_floor_change_phase("ALIGN_HALL", "align_with_elevator_door")
             self.floor_change_stage_deadline = now + rospy.Duration(
@@ -4697,6 +4977,14 @@ class ExplorationPlanner:
                 self._retry_floor_change_phase_or_fail(
                     "REOPEN_CURRENT_START", code, "reopen validated hall door: "
                     + getattr(response, "message", str(response or outcome))
+                )
+                return
+            if bool(getattr(self, "fixed_elevator_hall_enabled", False)):
+                self._set_floor_change_phase(
+                    "FIXED_DOOR_OPEN_WAIT", "wait_fixed_door_animation"
+                )
+                self.floor_change_stage_deadline = now + rospy.Duration(
+                    FIXED_ELEVATOR_DOOR_OPEN_WAIT_S
                 )
                 return
             if not self._hall_validation_passed:

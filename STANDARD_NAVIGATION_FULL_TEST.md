@@ -114,13 +114,32 @@ roslaunch danger_search_bringup simulation_truth.launch \
   fixed_elevator_hall_y:=-1.65 \
   fixed_elevator_hall_into_yaw:=-1.5707963
 ```
+cd /home/ruilinli/danger_search_ws
+source /opt/ros/noetic/setup.bash
+source devel/setup.bash
+source /home/ruilinli/SimEnv/devel/setup.bash --extend
 
+roslaunch danger_search_bringup simulation_truth.launch \
+  autostart:=false \
+  entry_enabled:=false \
+  simenv_root:=/home/ruilinli/SimEnv \
+  fixed_elevator_hall_enabled:=true \
+  fixed_elevator_hall_x:=-2.40 \
+  fixed_elevator_hall_y:=-1.65 \
+  fixed_elevator_hall_into_yaw:=-1.5707963
 该开关仅允许用于 `simulation_truth`，固定门中心为 map 坐标
 `(-2.40, -1.65)`、朝轿厢方向 `yaw=-1.5707963`。固定坐标测试路径到达门前后
 直接请求开门，固定等待 `26 s`，再通过 `/danger_search/elevator_cmd_vel` 以
 `0.40 m/s` 直行进入；它不执行门前精确对准和三分区开—关—开验证，但仍保留
 激光 footprint、安全停车、穿门进度、呼梯和换层地图合同。在线电梯发现路径不变。
 正式 competition 模式若误开该参数，探索节点必须拒绝启动。
+
+如果楼层探索结束时机器人已经误入轿厢，换层入口会先在门坐标系中检查机器人
+位置。只有中心进深位于 `[0.40, 1.75] m`、横向偏差不超过 `0.35 m`，并且带安全
+边距的完整 footprint 已越过门平面时，才跳过 `TO_HALL/ENTER`，直接执行
+`CLOSE_CURRENT_START`。诊断字段 `inside_depth_m`、`inside_lateral_m`、
+`inside_footprint_min_depth_m` 和 `already_inside_elevator` 可在
+`/exploration/status` 中查看。
 
 该命令会同时启动：
 
