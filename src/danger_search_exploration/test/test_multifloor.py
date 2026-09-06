@@ -924,15 +924,139 @@ class TransitStateMachineTest(unittest.TestCase):
         planner._check_path = Mock(return_value="reachable")
         planner.last_checked_path_metrics = {"path_length": 0.3}
         planner._send_goal = Mock(return_value=True)
+        planner._set_floor_change_phase = Mock()
+        planner._stop_elevator_motion = Mock()
+        planner.elevator_cmd_pub = Mock()
         planner.floor_change_diagnostics = {}
 
         planner._advance_floor_change(MODULE.rospy.Time.from_sec(1.0))
 
-        planner._send_goal.assert_called_once()
-        sent_x, sent_y, _sent_yaw = planner._send_goal.call_args.args
-        self.assertAlmostEqual(sent_x, -2.40)
-        self.assertAlmostEqual(sent_y, -0.30)
+        planner._send_goal.assert_not_called()
+        planner._set_floor_change_phase.assert_called_once_with(
+            "TO_HALL_FRONT_APPROACH", "low_speed_door_front_approach"
+        )
         self.assertEqual(planner.floor_change_hall_waypoint_stage, 0)
+        self.assertEqual(
+            planner.floor_change_diagnostics["hall_waypoint_stage"],
+            "FRONT_APPROACH",
+        )
+
+    @staticmethod
+    def fixed_front_approach_planner(pose_y=-0.05):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_step = "TO_HALL_FRONT_APPROACH"
+        planner.floor_change_stage_deadline = MODULE.rospy.Time.from_sec(20.0)
+        planner.floor_change_hall_point = (-2.40, -1.65, -math.pi / 2.0)
+        planner.floor_change_front_approach_start = (-2.40, 0.05)
+        planner.floor_change_front_approach_last_progress = 0.0
+        planner.floor_change_front_approach_last_changed = (
+            MODULE.rospy.Time.from_sec(0.0)
+        )
+        planner.floor_change_front_approach_stable_since = MODULE.rospy.Time(0)
+        planner.current_pose = ElevatorClosedLoopGeometryTest.pose(
+            -2.40, pose_y, -math.pi / 2.0
+        )
+        planner.latest_scan = ElevatorClosedLoopGeometryTest.scan_with_points(())
+        planner.latest_scan.ranges = planner.latest_scan.ranges.tolist()
+        planner.last_scan_time = MODULE.rospy.Time.from_sec(0.9)
+        planner.input_timeout = 2.0
+        planner.floor_change_diagnostics = {}
+        planner.elevator_crossing_lateral_limit_m = 0.12
+        planner.elevator_crossing_heading_abort_rad = 0.35
+        planner.elevator_crossing_heading_stop_rad = 0.12
+        planner.elevator_crossing_clearance_m = 0.32
+        planner.elevator_footprint_min_x = -0.35
+        planner.elevator_footprint_max_x = 0.30
+        planner.elevator_footprint_min_y = -0.15
+        planner.elevator_footprint_max_y = 0.15
+        planner.elevator_footprint_margin_m = 0.08
+        planner.elevator_alignment_kp = 1.5
+        planner.elevator_alignment_min_angular_rps = 0.25
+        planner.elevator_alignment_max_angular_rps = 0.60
+        planner.fixed_elevator_front_approach_speed_mps = 0.12
+        planner.fixed_elevator_front_approach_target_progress_m = 0.30
+        planner.fixed_elevator_front_approach_settle_s = 0.75
+        planner.fixed_elevator_front_approach_stall_timeout_s = 3.0
+        planner.fixed_elevator_front_approach_timeout_s = 20.0
+        planner.elevator_alignment_timeout_s = 20.0
+        planner.floor_change_retries = 0
+        planner.elevator_max_retries = 3
+        planner.elevator_cmd_pub = Mock()
+        planner._stop_elevator_motion = Mock()
+        planner._set_floor_change_phase = Mock()
+        planner._rotation_clearance_hit = Mock(return_value=None)
+        return planner
+
+    def test_fixed_front_approach_publishes_low_speed_forward_command(self):
+        planner = self.fixed_front_approach_planner(pose_y=-0.05)
+
+        planner._advance_fixed_hall_front_approach(
+            MODULE.rospy.Time.from_sec(1.0)
+        )
+
+        command = planner.elevator_cmd_pub.publish.call_args.args[0]
+        self.assertAlmostEqual(command.linear.x, 0.12)
+        self.assertEqual(command.angular.z, 0.0)
+        self.assertTrue(
+            planner.floor_change_diagnostics["front_approach_command_active"]
+        )
+
+    def test_fixed_front_approach_stops_and_aligns_after_settle(self):
+        planner = self.fixed_front_approach_planner(pose_y=-0.25)
+
+        planner._advance_fixed_hall_front_approach(
+            MODULE.rospy.Time.from_sec(1.0)
+        )
+        planner._advance_fixed_hall_front_approach(
+            MODULE.rospy.Time.from_sec(1.8)
+        )
+
+        planner._stop_elevator_motion.assert_called()
+        planner._set_floor_change_phase.assert_called_once_with(
+            "ALIGN_HALL", "front_approach_complete"
+        )
+        self.assertEqual(
+            planner.floor_change_diagnostics["front_approach_completion_source"],
+            "PROGRESS_SETTLED",
+        )
+
+    def test_fixed_front_approach_stale_scan_is_safety_blocked(self):
+        planner = self.fixed_front_approach_planner(pose_y=-0.05)
+        planner.last_scan_time = MODULE.rospy.Time.from_sec(0.0)
+
+        planner._advance_fixed_hall_front_approach(
+            MODULE.rospy.Time.from_sec(1.0)
+        )
+
+        self.assertEqual(
+            planner.floor_change_diagnostics["to_hall_diagnostic"],
+            "TO_HALL_FRONT_APPROACH_SAFETY_BLOCKED",
+        )
+        self.assertTrue(
+            planner.floor_change_diagnostics["front_approach_safety_blocked"]
+        )
+        planner._stop_elevator_motion.assert_called()
+
+    def test_late_move_base_callback_does_not_leave_front_approach(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.session_id = 7
+        planner.goal_id = 11
+        planner.state_lock = MODULE.threading.RLock()
+        planner.floor_change_active = True
+        planner.exploring = False
+        planner.floor_change_step = "TO_HALL_FRONT_APPROACH"
+        planner.waiting_for_result = False
+        planner._floor_change_goal_succeeded = None
+
+        with patch.object(
+                MODULE.rospy.Time, "now",
+                return_value=MODULE.rospy.Time.from_sec(1.0)):
+            planner.goal_done_cb(
+                7, 11, MODULE.actionlib.GoalStatus.SUCCEEDED, None
+            )
+
+        self.assertFalse(planner.waiting_for_result)
+        self.assertIsNone(planner._floor_change_goal_succeeded)
 
     def test_fixed_hall_open_success_waits_then_starts_direct_crossing(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)

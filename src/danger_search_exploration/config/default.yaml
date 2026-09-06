@@ -124,10 +124,14 @@ elevator_hall_approach_m: 0.8
 fixed_elevator_pre_align_m: 1.35
 fixed_elevator_pre_align_fallback_step_m: 0.35
 fixed_elevator_pre_align_fallback_count: 2
-# Used only after the fixed-hall front waypoint is physically settled.
-fixed_elevator_hall_xy_goal_tolerance_m: 0.15
-fixed_elevator_hall_pose_settle_s: 0.75
-fixed_elevator_hall_settle_speed_mps: 0.05
+# The final fixed-hall approach is driven by the elevator command channel so
+# DWA does not have to sample a 0.35 m goal inside the doorway inflation zone.
+fixed_elevator_front_approach_speed_mps: 0.12
+fixed_elevator_front_approach_distance_m: 0.35
+fixed_elevator_front_approach_target_progress_m: 0.30
+fixed_elevator_front_approach_timeout_s: 20.0
+fixed_elevator_front_approach_settle_s: 0.75
+fixed_elevator_front_approach_stall_timeout_s: 3.0
 elevator_car_target_m: 1.6      # 进轿厢后停靠位置（门缝向井道内推进距离）
 
 # 电梯操作
