@@ -785,7 +785,7 @@ class TransitStateMachineTest(unittest.TestCase):
         self.assertEqual(planner.elevator_hall_index, 1)
         planner._send_goal.assert_called_once()
 
-    def test_fixed_hall_dispatches_without_frontier_path_precheck(self):
+    def test_fixed_hall_dispatches_from_open_outer_waypoint(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
         planner.current_pose = SimpleNamespace(
             position=SimpleNamespace(x=1.67, y=3.92),
@@ -798,26 +798,31 @@ class TransitStateMachineTest(unittest.TestCase):
         planner.elevator_hall_index = 0
         planner.elevator_hall_min_score = 0.75
         planner.elevator_hall_approach_m = 0.8
+        planner.fixed_elevator_pre_align_m = 1.35
+        planner.fixed_elevator_pre_align_fallback_step_m = 0.35
+        planner.fixed_elevator_pre_align_fallback_count = 2
         planner.elevator_hall_navigation_max_s = 180.0
         planner.elevator_hall_nominal_speed_mps = 0.25
         planner.elevator_car_target_m = 1.4
         planner.fixed_elevator_hall_enabled = True
         planner._world_to_map = Mock(return_value=(54, 495))
         planner._is_free = Mock(return_value=True)
-        planner._check_path = Mock(return_value="unreachable")
+        planner._check_path = Mock(return_value="reachable")
+        planner.last_checked_path_metrics = {"path_length": 3.2}
         planner._send_goal = Mock(return_value=True)
         planner._set_floor_change_phase = Mock()
+        planner.floor_change_diagnostics = {}
 
         with patch.object(
                 MODULE.rospy.Time, "now",
                 return_value=MODULE.rospy.Time.from_sec(1.0)):
             self.assertTrue(planner._pick_elevator_hall_and_send())
 
-        planner._check_path.assert_not_called()
+        planner._check_path.assert_called()
         planner._send_goal.assert_called_once()
         sent_x, sent_y, sent_yaw = planner._send_goal.call_args.args
-        self.assertAlmostEqual(sent_x, -2.55)
-        self.assertAlmostEqual(sent_y, -0.85)
+        self.assertAlmostEqual(sent_x, -2.40)
+        self.assertAlmostEqual(sent_y, -0.30)
         # Fixed-mode TO_HALL only positions the robot; ALIGN_HALL handles
         # the final elevator heading.
         self.assertAlmostEqual(sent_yaw, 0.0)

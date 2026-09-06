@@ -963,6 +963,9 @@ class ExplorationPlanner:
             "~cmd_mux_reason_topic", "/danger_search/cmd_mux_reason"
         )
         self.scan_topic = rospy.get_param("~scan_topic", "/localization/scan")
+        self.local_costmap_topic = rospy.get_param(
+            "~local_costmap_topic", "/move_base/local_costmap/costmap"
+        )
         self.elevator_id = rospy.get_param("~elevator_id", "elevator_main")
         self.elevator_door_prefix = rospy.get_param(
             "~elevator_door_prefix", "elevator_floor"
@@ -991,6 +994,15 @@ class ExplorationPlanner:
         self.elevator_hall_approach_m = float(
             rospy.get_param("~elevator_hall_approach_m", 0.8)
         )
+        self.fixed_elevator_pre_align_m = float(rospy.get_param(
+            "~fixed_elevator_pre_align_m", 1.35
+        ))
+        self.fixed_elevator_pre_align_fallback_step_m = float(
+            rospy.get_param("~fixed_elevator_pre_align_fallback_step_m", 0.35)
+        )
+        self.fixed_elevator_pre_align_fallback_count = int(rospy.get_param(
+            "~fixed_elevator_pre_align_fallback_count", 2
+        ))
         self.elevator_car_target_m = float(
             rospy.get_param("~elevator_car_target_m", 1.6)
         )
@@ -1157,6 +1169,9 @@ class ExplorationPlanner:
                 and self.elevator_hall_min_versions >= 1
                 and self.elevator_hall_min_duration_s >= 0.0
                 and self.elevator_hall_approach_m > 0.0
+                and self.fixed_elevator_pre_align_m > 0.0
+                and self.fixed_elevator_pre_align_fallback_step_m > 0.0
+                and self.fixed_elevator_pre_align_fallback_count >= 0
                 and self.elevator_service_timeout_s > 0.0
                 and self.elevator_max_retries >= 1
                 and self.floor_change_timeout_s > 0.0
@@ -1333,6 +1348,7 @@ class ExplorationPlanner:
         self.floor_change_start_map_revision = 0
         self.floor_change_hall_point = None
         self.floor_change_hall_candidate = None
+        self.floor_change_approach_m = self.elevator_hall_approach_m
         self.floor_change_car_point = None
         self.floor_change_stable_since = rospy.Time(0)
         self._floor_change_goal_succeeded = False
@@ -1393,6 +1409,8 @@ class ExplorationPlanner:
         self._service_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self.latest_scan = None
         self.last_scan_time = rospy.Time(0)
+        self.latest_local_costmap = None
+        self.last_local_costmap_time = rospy.Time(0)
         self.initial_hall_discovery_active = False
         self.initial_hall_discovery_step = "IDLE"
         self.initial_hall_discovery_started = rospy.Time(0)
@@ -1449,6 +1467,10 @@ class ExplorationPlanner:
         )
         self.scan_sub = rospy.Subscriber(
             self.scan_topic, LaserScan, self._scan_callback, queue_size=2
+        )
+        self.local_costmap_sub = rospy.Subscriber(
+            self.local_costmap_topic, OccupancyGrid,
+            self._local_costmap_callback, queue_size=1,
         )
         self.safety_stop_sub = rospy.Subscriber(
             self.safety_stop_topic, Bool, self._safety_stop_callback, queue_size=2
@@ -1750,6 +1772,16 @@ class ExplorationPlanner:
     def _scan_callback(self, message):
         self.latest_scan = message
         self.last_scan_time = rospy.Time.now()
+
+    def _local_costmap_callback(self, message):
+        if (not message.header.frame_id or message.info.resolution <= 0.0
+                or message.info.width <= 0 or message.info.height <= 0):
+            return
+        expected_size = int(message.info.width) * int(message.info.height)
+        if len(message.data) != expected_size:
+            return
+        self.latest_local_costmap = message
+        self.last_local_costmap_time = rospy.Time.now()
 
     def _safety_stop_callback(self, message):
         self.safety_stop_active = bool(message.data)
@@ -2053,6 +2085,61 @@ class ExplorationPlanner:
         )
         return any(abs(float(value)) > 1e-3 for value in values)
 
+    def _to_hall_waypoint_outside_local_costmap(self, now):
+        """Check whether the active TO_HALL waypoint is outside local costmap.
+
+        This is diagnostic-only.  It never changes the goal or bypasses the
+        costmap/footprint checks in move_base.  A transform failure simply
+        leaves the classification unchanged because it is not evidence that
+        the local window is too small.
+        """
+        if str(getattr(self, "floor_change_step", "")) != "TO_HALL":
+            return False
+        diagnostics = getattr(self, "floor_change_diagnostics", {})
+        waypoint = diagnostics.get("approach_waypoint")
+        costmap = getattr(self, "latest_local_costmap", None)
+        if not waypoint or costmap is None:
+            return False
+        stamp = getattr(self, "last_local_costmap_time", rospy.Time(0))
+        if stamp == rospy.Time(0) or (now - stamp).to_sec() > 2.0:
+            return False
+        try:
+            target_x, target_y = float(waypoint[0]), float(waypoint[1])
+            frame = str(costmap.header.frame_id)
+            if frame != self.map_frame:
+                transform = self.tf_buffer.lookup_transform(
+                    frame, self.map_frame, rospy.Time(0),
+                    rospy.Duration(0.05),
+                )
+                translation = transform.transform.translation
+                yaw = self._yaw_from_quaternion(transform.transform.rotation)
+                target_x, target_y = (
+                    math.cos(yaw) * target_x - math.sin(yaw) * target_y,
+                    math.sin(yaw) * target_x + math.cos(yaw) * target_y,
+                )
+                target_x += float(translation.x)
+                target_y += float(translation.y)
+            origin = costmap.info.origin
+            origin_yaw = self._yaw_from_quaternion(origin.orientation)
+            dx = target_x - float(origin.position.x)
+            dy = target_y - float(origin.position.y)
+            local_x = math.cos(origin_yaw) * dx + math.sin(origin_yaw) * dy
+            local_y = -math.sin(origin_yaw) * dx + math.cos(origin_yaw) * dy
+            inside = (
+                0.0 <= local_x < float(costmap.info.width) * float(costmap.info.resolution)
+                and 0.0 <= local_y < float(costmap.info.height) * float(costmap.info.resolution)
+            )
+            diagnostics["local_costmap_waypoint_inside"] = bool(inside)
+            diagnostics["local_costmap_frame"] = frame
+            if not inside:
+                diagnostics["to_hall_diagnostic"] = (
+                    "TO_HALL_LOCAL_COSTMAP_LIMITED"
+                )
+            return not inside
+        except (tf2_ros.TransformException, AttributeError, ValueError,
+                TypeError, ZeroDivisionError):
+            return False
+
     def _refresh_elevator_diagnostic(self, now):
         """Add command-chain and failure classification telemetry only.
 
@@ -2062,6 +2149,7 @@ class ExplorationPlanner:
         if not getattr(self, "floor_change_active", False):
             return
         phase = str(getattr(self, "floor_change_step", "") or "")
+        local_costmap_limited = self._to_hall_waypoint_outside_local_costmap(now)
         elevator_active = self._command_is_active(
             getattr(self, "last_elevator_command", None),
             getattr(self, "last_elevator_command_time", rospy.Time(0)), now,
@@ -2162,6 +2250,7 @@ class ExplorationPlanner:
             "elevator_command_active": elevator_active,
             "sent_command_active": sent_active,
             "output_command_active": output_active,
+            "local_costmap_limited": bool(local_costmap_limited),
             "cmd_mux_reason": str(getattr(self, "last_cmd_mux_reason", "")),
             "cmd_mux_reason_age_s": (
                 None if getattr(self, "last_cmd_mux_reason_time", rospy.Time(0)) == rospy.Time(0)
@@ -2900,6 +2989,17 @@ class ExplorationPlanner:
                 self._floor_change_goal_succeeded_set(
                     state == actionlib.GoalStatus.SUCCEEDED
                 )
+                if (state != actionlib.GoalStatus.SUCCEEDED
+                        and self.floor_change_step == "TO_HALL"):
+                    # Navfn has already accepted the waypoint at this point;
+                    # a failed move_base action is therefore an execution/local
+                    # planner failure, not a door or ENTER failure.
+                    if self.floor_change_diagnostics.get(
+                            "to_hall_diagnostic", "NONE") != (
+                            "TO_HALL_LOCAL_COSTMAP_LIMITED"):
+                        self.floor_change_diagnostics[
+                            "to_hall_diagnostic"
+                        ] = "TO_HALL_DWA_BLOCKED"
                 self.current_goal = None
                 return
             if state == actionlib.GoalStatus.SUCCEEDED:
@@ -4426,11 +4526,13 @@ class ExplorationPlanner:
             "service_last_kind": "",
             "service_last_outcome": "",
             "service_last_message": "",
+            "to_hall_diagnostic": "NONE",
         }
         self.floor_change_progress_last_m = 0.0
         self.floor_change_progress_last_changed = rospy.Time(0)
         self.floor_change_diagnostic_last_log = ""
         self.floor_change_hall_candidate = None
+        self.floor_change_approach_m = self.elevator_hall_approach_m
         self._invalidate_service()
         self._stop_elevator_motion()
 
@@ -4461,11 +4563,66 @@ class ExplorationPlanner:
         self._set_floor_change_phase("TO_HALL", "select_elevator_hall")
         return self._pick_elevator_hall_and_send()
 
+    @staticmethod
+    def _is_fixed_hall_candidate(candidate):
+        return str(getattr(candidate, "source", "")) == "fixed_test"
+
+    def _hall_approach_distances(self, candidate):
+        """Return bounded outer waypoints, nearest safe point first."""
+        if (bool(getattr(self, "fixed_elevator_hall_enabled", False))
+                and self._is_fixed_hall_candidate(candidate)):
+            base = max(
+                float(getattr(self, "fixed_elevator_pre_align_m", 1.35)),
+                float(getattr(self, "elevator_hall_approach_m", 0.8)),
+            )
+            step = max(
+                0.10,
+                float(getattr(
+                    self, "fixed_elevator_pre_align_fallback_step_m", 0.35
+                )),
+            )
+            count = max(
+                0,
+                int(getattr(
+                    self, "fixed_elevator_pre_align_fallback_count", 2
+                )),
+            )
+            return [base + step * index for index in range(count + 1)]
+        return [float(getattr(self, "elevator_hall_approach_m", 0.8))]
+
+    @staticmethod
+    def _hall_approach_point(candidate, distance):
+        return (
+            float(candidate.x) - float(distance) * math.cos(float(candidate.into_yaw)),
+            float(candidate.y) - float(distance) * math.sin(float(candidate.into_yaw)),
+        )
+
+    def _record_to_hall_plan_diagnostic(self, **values):
+        diagnostics = getattr(self, "floor_change_diagnostics", None)
+        if diagnostics is None:
+            diagnostics = {}
+            self.floor_change_diagnostics = diagnostics
+        diagnostics.update(values)
+
+    def _floor_change_approach_distance(self):
+        """Return the active stand-off distance used by hall alignment.
+
+        Fixed simulation halls deliberately use a farther outer waypoint.  The
+        later ALIGN_HALL and door-open gates must measure against that same
+        waypoint, otherwise a successful TO_HALL goal would immediately be
+        rejected as being too far from the nominal 0.8 m stand-off.
+        """
+        return float(getattr(
+            self, "floor_change_approach_m",
+            getattr(self, "elevator_hall_approach_m", 0.8),
+        ))
+
     def _pick_elevator_hall_and_send(self):
-        """Plan to the 0.8 m hall stand-off; consume each candidate once."""
+        """Plan to a validated hall waypoint; consume each candidate once."""
         cx = self.current_pose.position.x
         cy = self.current_pose.position.y
         had_candidate = self.elevator_hall_index < len(self.elevator_halls)
+        saw_plan_unavailable = False
         if self.elevator_hall_index == 0:
             ranked = []
             for raw_candidate in self.elevator_halls:
@@ -4479,36 +4636,48 @@ class ExplorationPlanner:
                             self, "elevator_hall_min_score", 0.75
                         ))):
                     continue
-                approach_x = candidate.x - self.elevator_hall_approach_m * math.cos(
-                    candidate.into_yaw
-                )
-                approach_y = candidate.y - self.elevator_hall_approach_m * math.sin(
-                    candidate.into_yaw
-                )
-                map_x, map_y = self._world_to_map(approach_x, approach_y)
-                if not self._is_free(map_x, map_y):
-                    continue
-                fixed_test_hall = (
-                    bool(getattr(self, "fixed_elevator_hall_enabled", False))
-                    and candidate.source == "fixed_test"
-                )
-                if fixed_test_hall:
-                    # The simulation-only override is already trusted geometry.
-                    # Let move_base own planning/recovery instead of allowing a
-                    # single preflight plan or the frontier trap blacklist to
-                    # permanently discard the only elevator candidate.
-                    candidate.path_length = math.hypot(
-                        approach_x - cx, approach_y - cy
+                selected_distance = None
+                selected_metrics = None
+                failure_reason = ""
+                for distance in self._hall_approach_distances(candidate):
+                    approach_x, approach_y = self._hall_approach_point(
+                        candidate, distance
                     )
-                else:
-                    if self._check_path(
-                            cx, cy, approach_x, approach_y) != "reachable":
+                    map_x, map_y = self._world_to_map(approach_x, approach_y)
+                    if not self._is_free(map_x, map_y):
+                        failure_reason = "waypoint_occupied_or_unknown"
                         continue
-                    metrics = self.last_checked_path_metrics or {}
-                    candidate.path_length = float(metrics.get(
-                        "path_length",
-                        math.hypot(approach_x - cx, approach_y - cy),
-                    ))
+                    path_state = self._check_path(cx, cy, approach_x, approach_y)
+                    if path_state == "reachable":
+                        selected_distance = distance
+                        selected_metrics = dict(self.last_checked_path_metrics or {})
+                        break
+                    failure_reason = "make_plan_%s" % path_state
+                    if path_state == "unavailable":
+                        saw_plan_unavailable = True
+                if selected_distance is None:
+                    self._record_to_hall_plan_diagnostic(
+                        hall_goal=[round(float(candidate.x), 4),
+                                   round(float(candidate.y), 4),
+                                   round(float(candidate.into_yaw), 4)],
+                        approach_waypoint=None,
+                        plan_available=False,
+                        plan_length_m=None,
+                        plan_failure_reason=failure_reason or "no_waypoint",
+                        to_hall_diagnostic=(
+                            "TO_HALL_PLAN_UNAVAILABLE"
+                            if saw_plan_unavailable
+                            else "TO_HALL_GOAL_NOT_REACHED"
+                        ),
+                    )
+                    continue
+                approach_x, approach_y = self._hall_approach_point(
+                    candidate, selected_distance
+                )
+                candidate.approach_distance_m = float(selected_distance)
+                candidate.path_length = float(selected_metrics.get(
+                    "path_length", math.hypot(approach_x - cx, approach_y - cy)
+                ))
                 ranked.append(candidate)
             ranked.sort(key=lambda candidate: (
                 0 if candidate.validated else 1,
@@ -4522,14 +4691,12 @@ class ExplorationPlanner:
             candidate = self.elevator_halls[self.elevator_hall_index]
             hx, hy, into_yaw = candidate
             self.elevator_hall_index += 1
-            approach_x = hx - self.elevator_hall_approach_m * math.cos(into_yaw)
-            approach_y = hy - self.elevator_hall_approach_m * math.sin(into_yaw)
-            if (bool(getattr(self, "fixed_elevator_hall_enabled", False))
-                    and candidate.source == "fixed_test"):
-                # Keep the goal just inside the planner's reachable side of
-                # the door-frame inflation; ALIGN_HALL will correct the
-                # remaining small lateral offset before opening the door.
-                approach_x -= 0.15
+            approach_distance = float(getattr(
+                candidate, "approach_distance_m", self.elevator_hall_approach_m
+            ))
+            approach_x, approach_y = self._hall_approach_point(
+                candidate, approach_distance
+            )
             path_length = float(getattr(candidate, "path_length", float("inf")))
             if not math.isfinite(path_length):
                 path_length = math.hypot(approach_x - cx, approach_y - cy)
@@ -4540,6 +4707,7 @@ class ExplorationPlanner:
             )
             self.floor_change_hall_point = (hx, hy, into_yaw)
             self.floor_change_hall_candidate = candidate
+            self.floor_change_approach_m = approach_distance
             self.floor_change_car_point = (
                 hx + self.elevator_car_target_m * math.cos(into_yaw),
                 hy + self.elevator_car_target_m * math.sin(into_yaw),
@@ -4556,7 +4724,20 @@ class ExplorationPlanner:
                 orientation = getattr(self.current_pose, "orientation", None)
                 if orientation is not None:
                     goal_yaw = self._yaw_from_quaternion(orientation)
-            if self._send_goal(approach_x, approach_y, goal_yaw):
+            self._record_to_hall_plan_diagnostic(
+                hall_goal=[round(float(hx), 4), round(float(hy), 4),
+                           round(float(into_yaw), 4)],
+                approach_waypoint=[round(float(approach_x), 4),
+                                   round(float(approach_y), 4)],
+                approach_distance_m=round(approach_distance, 4),
+                plan_available=True,
+                plan_length_m=round(path_length, 4),
+                plan_failure_reason="",
+                to_hall_diagnostic="NONE",
+            )
+            if self._send_goal(
+                    approach_x, approach_y, goal_yaw,
+                    planned_path_length=path_length):
                 self.floor_change_hall_deadline = (
                     rospy.Time.now() + rospy.Duration(navigation_timeout)
                 )
@@ -4564,7 +4745,10 @@ class ExplorationPlanner:
                     "TO_HALL", "navigate_to_elevator_hall"
                 )
                 return True
-        code = "UNREACHABLE_HALL" if had_candidate else "NO_HALL"
+        if saw_plan_unavailable:
+            code = "TO_HALL_PLAN_UNAVAILABLE"
+        else:
+            code = "UNREACHABLE_HALL" if had_candidate else "NO_HALL"
         self._floor_change_fail(code, "all elevator hall candidates are unreachable")
         return False
 
@@ -4670,6 +4854,9 @@ class ExplorationPlanner:
 
     def _advance_hall_alignment(self, now):
         if now > self.floor_change_stage_deadline:
+            self.floor_change_diagnostics[
+                "to_hall_diagnostic"
+            ] = "ALIGNMENT_BLOCKED"
             self._retry_current_hall_or_fail(
                 "UNREACHABLE_HALL", "elevator hall alignment timed out"
             )
@@ -4677,7 +4864,7 @@ class ExplorationPlanner:
         stand_off, lateral, yaw_error = elevator_pose_errors(
             self.current_pose,
             self.floor_change_hall_point,
-            self.elevator_hall_approach_m,
+            self._floor_change_approach_distance(),
         )
         self.floor_change_diagnostics.update({
             "alignment_standoff_error_m": round(stand_off, 4),
@@ -4686,6 +4873,9 @@ class ExplorationPlanner:
         })
         if (abs(stand_off) > self.elevator_alignment_standoff_tolerance_m
                 or abs(lateral) > self.elevator_alignment_lateral_tolerance_m):
+            self.floor_change_diagnostics[
+                "to_hall_diagnostic"
+            ] = "ALIGNMENT_BLOCKED"
             self._retry_current_hall_or_fail(
                 "UNREACHABLE_HALL",
                 "hall pose outside alignment tolerance: "
@@ -4707,6 +4897,9 @@ class ExplorationPlanner:
             self.floor_change_diagnostics["alignment_rotation_hit"] = [
                 round(hit[0], 4), round(hit[1], 4)
             ]
+            self.floor_change_diagnostics[
+                "to_hall_diagnostic"
+            ] = "ALIGNMENT_BLOCKED"
             self._retry_current_hall_or_fail(
                 "UNREACHABLE_HALL", "obstacle intersects alignment rotation footprint"
             )
@@ -4772,7 +4965,7 @@ class ExplorationPlanner:
             stand_off, lateral, yaw_error = elevator_pose_errors(
                 self.current_pose,
                 self.floor_change_hall_point,
-                self.elevator_hall_approach_m,
+                self._floor_change_approach_distance(),
             )
             self.floor_change_diagnostics.update({
                 "alignment_standoff_error_m": round(stand_off, 4),
@@ -5189,6 +5382,10 @@ class ExplorationPlanner:
                 self._finalize_floor_change_failure(zero_confirmed)
             return
         if now > self.floor_change_deadline:
+            if self.floor_change_step == "TO_HALL":
+                self.floor_change_diagnostics[
+                    "to_hall_diagnostic"
+                ] = "TO_HALL_GOAL_NOT_REACHED"
             code = (
                 "UNREACHABLE_HALL"
                 if self.floor_change_step == "TO_HALL"
@@ -5207,6 +5404,9 @@ class ExplorationPlanner:
                     self.move_base_client.cancel_goal()
                     self.waiting_for_result = False
                     self.current_goal = None
+                    self.floor_change_diagnostics[
+                        "to_hall_diagnostic"
+                    ] = "TO_HALL_GOAL_NOT_REACHED"
                     self._retry_hall_or_fail(
                         "UNREACHABLE_HALL", "hall navigation timed out"
                     )
@@ -5652,6 +5852,10 @@ class ExplorationPlanner:
                 now = rospy.Time.now()
                 healthy, failure_code, detail = self._transit_phase_health(now)
                 if not healthy:
+                    if self.floor_change_step == "ALIGN_HALL":
+                        self.floor_change_diagnostics[
+                            "to_hall_diagnostic"
+                        ] = "ALIGNMENT_BLOCKED"
                     self._floor_change_fail(failure_code, detail)
                     return
                 self._advance_floor_change(now)

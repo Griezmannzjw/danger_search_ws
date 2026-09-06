@@ -119,6 +119,11 @@ elevator_hall_min_versions: 3
 elevator_hall_min_duration_s: 2.0
 # 靠近电梯厅/轿厢的安全距离
 elevator_hall_approach_m: 0.8
+# Simulation-only outer waypoint. It keeps the first move_base goal in the
+# open area before ALIGN_HALL performs the final heading check.
+fixed_elevator_pre_align_m: 1.35
+fixed_elevator_pre_align_fallback_step_m: 0.35
+fixed_elevator_pre_align_fallback_count: 2
 elevator_car_target_m: 1.6      # 进轿厢后停靠位置（门缝向井道内推进距离）
 
 # 电梯操作
