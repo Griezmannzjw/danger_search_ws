@@ -209,6 +209,11 @@ def _monitor_test_node():
     node.safety_pub = FakePublisher()
     node.reason_pub = FakePublisher()
     node.fallen_pub = FakePublisher()
+    node.imu_diagnostic_pub = FakePublisher()
+    node._imu_received = 0
+    node._imu_last_header_stamp = None
+    node._imu_last_arrival = None
+    node._imu_interval_s = None
     node.timer = FakeTimer()
     node._shutdown_started = False
     return node
@@ -270,6 +275,8 @@ class PostureSafetyMonitorShutdownTest(unittest.TestCase):
         self.assertTrue(node._publish())
         self.assertEqual(len(FakeRospy.logs), 1)
         self.assertIn("reason=imu_stale", FakeRospy.logs[0][1])
+        self.assertEqual(len(node.imu_diagnostic_pub.messages), 2)
+        self.assertIn("received=0", node.imu_diagnostic_pub.messages[-1].data)
 
         node.state.latched = False
         node.state.reason = "stable_recovery"

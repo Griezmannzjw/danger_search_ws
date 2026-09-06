@@ -12,6 +12,7 @@ import rosgraph
 import rosservice
 import rospy
 import tf2_ros
+from sensor_msgs.msg import Imu
 from std_msgs.msg import Bool, String
 
 from building_generator_interfaces.srv import CallElevator, SetDoorState
@@ -368,6 +369,17 @@ class CompetitionPreflight:
         if (not math.isfinite(self.truth_link_max_age_s)
                 or self.truth_link_max_age_s <= 0.0):
             raise rospy.ROSInitException("~truth_link_max_age_s must be positive")
+        self.imu_topic = str(rospy.get_param("~imu_topic", "/trunk_imu"))
+        self.imu_max_age_s = float(rospy.get_param("~imu_max_age_s", 1.0))
+        if (not self.imu_topic.startswith("/") or
+                not math.isfinite(self.imu_max_age_s) or
+                self.imu_max_age_s <= 0.0):
+            raise rospy.ROSInitException("invalid IMU preflight parameters")
+        self._imu_received_at = None
+        self._imu_valid = False
+        self._imu_subscriber = rospy.Subscriber(
+            self.imu_topic, Imu, self._imu_callback, queue_size=5,
+        )
         self._truth_raw_pose_received_at = None
         self._truth_raw_pose_subscriber = None
         if self.run_profile == RUN_PROFILE_SIMULATION_TRUTH:
@@ -391,6 +403,12 @@ class CompetitionPreflight:
 
     def _truth_raw_pose_callback(self, _message):
         self._truth_raw_pose_received_at = time.monotonic()
+
+    def _imu_callback(self, message):
+        q = message.orientation
+        values = (q.x, q.y, q.z, q.w)
+        self._imu_valid = all(math.isfinite(float(value)) for value in values)
+        self._imu_received_at = time.monotonic()
 
     def _static_checks(self):
         errors = validate_runtime_contract(
@@ -496,6 +514,12 @@ class CompetitionPreflight:
                         topic, actual_type or "unavailable", expected_type
                     )
                 )
+        if self._imu_received_at is None:
+            errors.append("%s has no received IMU sample" % self.imu_topic)
+        elif time.monotonic() - self._imu_received_at > self.imu_max_age_s:
+            errors.append("%s IMU sample is stale" % self.imu_topic)
+        elif not self._imu_valid:
+            errors.append("%s IMU sample is invalid" % self.imu_topic)
         if self.run_profile == RUN_PROFILE_SIMULATION_TRUTH:
             actual_type = topic_types.get(TRUTH_LINK_STATES_TOPIC)
             if actual_type != TRUTH_LINK_STATES_TYPE:

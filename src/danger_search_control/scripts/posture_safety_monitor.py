@@ -43,6 +43,14 @@ class PostureSafetyMonitor:
             rospy.get_param("~posture_reason_topic", "/danger_search/posture_safety_reason"),
             String, queue_size=2, latch=True,
         )
+        self.imu_diagnostic_pub = rospy.Publisher(
+            rospy.get_param("~imu_diagnostic_topic", "/danger_search/imu_diagnostic"),
+            String, queue_size=2, latch=True,
+        )
+        self._imu_received = 0
+        self._imu_last_header_stamp = None
+        self._imu_last_arrival = None
+        self._imu_interval_s = None
         self.fallen_pub = rospy.Publisher(
             rospy.get_param("~posture_fallen_topic", "/danger_search/posture_fallen"),
             Bool, queue_size=2, latch=True,
@@ -66,10 +74,18 @@ class PostureSafetyMonitor:
         if self._is_stopping():
             return
         q = message.orientation
+        arrival = rospy.Time.now().to_sec()
+        header = getattr(message, "header", None)
+        header_stamp = getattr(getattr(header, "stamp", None), "to_sec", lambda: None)()
         with self.lock:
             if self._is_stopping():
                 return
-            self.state.observe(rospy.Time.now().to_sec(), (q.x, q.y, q.z, q.w))
+            if self._imu_last_arrival is not None:
+                self._imu_interval_s = max(0.0, arrival - self._imu_last_arrival)
+            self._imu_last_arrival = arrival
+            self._imu_last_header_stamp = header_stamp
+            self._imu_received += 1
+            self.state.observe(arrival, (q.x, q.y, q.z, q.w))
         self._publish()
 
     def _timer_callback(self, _event):
@@ -106,6 +122,18 @@ class PostureSafetyMonitor:
             state_changed = log_key != getattr(
                 self, "_last_logged_state", None
             )
+            diagnostic = (
+                "received=%d reason=%s last_arrival=%.3f header_stamp=%s "
+                "interval_s=%s valid=%s" % (
+                    self._imu_received, str(reason),
+                    float(self._imu_last_arrival or 0.0),
+                    "none" if self._imu_last_header_stamp is None else
+                    "%.3f" % float(self._imu_last_header_stamp),
+                    "none" if self._imu_interval_s is None else
+                    "%.6f" % float(self._imu_interval_s),
+                    str(bool(getattr(self.state, "last_sample_valid", False))),
+                )
+            )
         if self._is_stopping():
             return False
         if state_changed:
@@ -133,6 +161,7 @@ class PostureSafetyMonitor:
             self.safety_pub.publish(Bool(data=active))
             self.fallen_pub.publish(Bool(data=fallen))
             self.reason_pub.publish(String(data=reason))
+            self.imu_diagnostic_pub.publish(String(data=diagnostic))
         except rospy.ROSException:
             if self._is_stopping():
                 return False

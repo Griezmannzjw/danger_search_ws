@@ -8,6 +8,8 @@
 
 自动恢复要求倾角不超过 15°并连续稳定 2 秒。显式服务 `/danger_search/reset_posture_safety` 也只在 IMU 新鲜且当前姿态安全时解除，原因发布到 `/danger_search/posture_safety_reason`。Mission 在 ENTERING、EXPLORING、RETURNING 任一阶段收到急停后取消导航和换层、停止探索，并原子写入 `mission_status=ERROR`，原因是 `posture_safety_stop`。
 
+`/danger_search/imu_diagnostic` 提供 IMU 接收计数、到达间隔、header 时间戳、样本合法性和当前安全原因，仅用于定位传感器链路问题，不参与安全判定。
+
 ## 数据流
 
 ```text

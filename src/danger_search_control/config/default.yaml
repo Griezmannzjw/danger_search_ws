@@ -13,6 +13,7 @@ posture_fallen_topic: /danger_search/posture_fallen
 posture_reason_topic: /danger_search/posture_safety_reason
 posture_reset_service: /danger_search/reset_posture_safety
 imu_topic: /trunk_imu
+imu_diagnostic_topic: /danger_search/imu_diagnostic
 
 # 安全参数
 enable_safety: true

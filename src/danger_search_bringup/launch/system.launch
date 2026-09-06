@@ -86,6 +86,8 @@
 
   <node name="posture_safety_monitor" pkg="danger_search_control" type="posture_safety_monitor.py" output="screen">
     <rosparam command="load" file="$(find danger_search_control)/config/default.yaml" />
+    <param name="imu_topic" value="/trunk_imu" />
+    <param name="imu_diagnostic_topic" value="/danger_search/imu_diagnostic" />
   </node>
 
   <node name="mission" pkg="danger_search_mission" type="mission_manager.py" output="screen">
@@ -116,6 +118,8 @@
     <param name="result_file" value="$(arg result_file)" />
     <param name="gazebo_base_link" value="$(arg gazebo_base_link)" />
     <param name="truth_link_max_age_s" value="1.0" />
+    <param name="imu_topic" value="/trunk_imu" />
+    <param name="imu_max_age_s" value="1.0" />
     <param name="timeout_s" value="45.0" />
   </node>
 </launch>
