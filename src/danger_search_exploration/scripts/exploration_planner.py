@@ -38,8 +38,8 @@ from geometry_msgs.msg import (
     PoseWithCovarianceStamped,
     Twist,
 )
-from nav_msgs.msg import GridCells, OccupancyGrid
-from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import GridCells, OccupancyGrid, Odometry
+from sensor_msgs.msg import JointState, LaserScan
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from std_srvs.srv import Trigger, TriggerResponse
 from std_msgs.msg import Bool, Header, Int32, String
@@ -58,6 +58,11 @@ from danger_search_common.short_range_safety import (
     swept_footprint_hit,
     swept_footprint_obstacle,
 )
+
+try:
+    from gazebo_msgs.msg import ContactsState
+except ImportError:  # Minimal unit-test environments may omit gazebo_msgs.
+    ContactsState = None
 
 try:
     from building_generator_interfaces.srv import (
@@ -118,6 +123,39 @@ def classify_navigation_failure(state, status_text=""):
         if any(marker in normalized for marker in planning_markers):
             return "UNREACHABLE"
         return "CONTROL_FAILED"
+    return "NONE"
+
+
+def classify_elevator_transit_diagnostic(
+        phase, safety_stop=False, door_open_confirmed=True,
+        elevator_command_active=False, sent_command_active=False,
+        output_command_active=False, geometry_blocked=False,
+        robot_progressing=True, command_age_s=None):
+    """Classify the first actionable cause observed during elevator transit.
+
+    This is diagnostic only.  It never changes the safety decision or the
+    crossing state machine.  The command chain is intentionally checked after
+    the safety latch and door gate so a deliberate stop is not misreported as
+    a mux or RL failure.
+    """
+    phase = str(phase or "")
+    if bool(safety_stop):
+        return "SAFETY_BLOCKED"
+    if phase in ("OPEN_CURRENT_WAIT", "FIXED_DOOR_OPEN_WAIT",
+                 "WAIT_DOOR_FULL_OPEN", "CAPTURE_OPEN_SCAN",
+                 "VALIDATE_CLOSE_START", "VALIDATE_CLOSE_WAIT") and not bool(
+                     door_open_confirmed):
+        return "DOOR_NOT_OPEN"
+    if phase in ("ALIGN_HALL", "ENTER", "RECOVER_CROSSING"):
+        if bool(elevator_command_active) and not bool(sent_command_active):
+            return "ELEVATOR_CMD_NOT_RELAYED"
+        if bool(sent_command_active) and not bool(output_command_active):
+            return "ELEVATOR_CMD_NOT_RELAYED"
+        if bool(geometry_blocked):
+            return "CROSSING_GEOMETRY_BLOCKED"
+        if (bool(output_command_active) and not bool(robot_progressing)
+                and (command_age_s is None or float(command_age_s) >= 1.0)):
+            return "RL_NOT_MOVING"
     return "NONE"
 
 
@@ -899,11 +937,30 @@ class ExplorationPlanner:
         self.elevator_cmd_topic = rospy.get_param(
             "~elevator_cmd_topic", "/danger_search/elevator_cmd_vel"
         )
+        self.output_cmd_topic = rospy.get_param(
+            "~output_cmd_topic", "/cmd_vel"
+        )
+        # In simulation_truth this is the adapter's Gazebo-truth odometry
+        # stream.  It is diagnostics only and never becomes a motion source.
+        self.execution_odom_topic = rospy.get_param(
+            "~execution_odom_topic", "/localization/odom"
+        )
+        self.elevator_contact_topic = str(rospy.get_param(
+            "~elevator_contact_topic",
+            "/FR_foot_contact" if self.localization_backend == "gazebo_truth" else "",
+        )).strip()
+        self.controller_state_topic = str(rospy.get_param(
+            "~controller_state_topic",
+            "/a1_gazebo/joint_states" if self.localization_backend == "gazebo_truth" else "",
+        )).strip()
         self.safety_stop_topic = rospy.get_param(
             "~safety_stop_topic", "/danger_search/safety_stop"
         )
         self.sent_cmd_topic = rospy.get_param(
             "~sent_cmd_topic", "/danger_search/cmd_vel_sent"
+        )
+        self.cmd_mux_reason_topic = rospy.get_param(
+            "~cmd_mux_reason_topic", "/danger_search/cmd_mux_reason"
         )
         self.scan_topic = rospy.get_param("~scan_topic", "/localization/scan")
         self.elevator_id = rospy.get_param("~elevator_id", "elevator_main")
@@ -1302,6 +1359,24 @@ class ExplorationPlanner:
         self.floor_change_door_last_scan_stamp = rospy.Time(0)
         self.floor_change_recovery_direction = 0.0
         self.floor_change_diagnostics = {}
+        self.last_elevator_command = Twist()
+        self.last_elevator_command_time = rospy.Time(0)
+        self.last_output_command = Twist()
+        self.last_output_command_time = rospy.Time(0)
+        self.last_cmd_mux_reason = ""
+        self.last_cmd_mux_reason_time = rospy.Time(0)
+        self.last_execution_odom = None
+        self.last_execution_odom_time = rospy.Time(0)
+        self.last_contact_count = None
+        self.last_contact_time = rospy.Time(0)
+        self.last_controller_joint_count = None
+        self.last_controller_state_time = rospy.Time(0)
+        self.floor_change_execution_start = None
+        self.floor_change_execution_last_m = 0.0
+        self.floor_change_execution_last_changed = rospy.Time(0)
+        self.floor_change_progress_last_m = 0.0
+        self.floor_change_progress_last_changed = rospy.Time(0)
+        self.floor_change_diagnostic_last_log = ""
         self.floor_change_open_scan = None
         self._hall_validation_passed = False
         self.floor_change_open_scan_stamp = rospy.Time(0)
@@ -1381,6 +1456,37 @@ class ExplorationPlanner:
         self.sent_cmd_sub = rospy.Subscriber(
             self.sent_cmd_topic, Twist, self._sent_cmd_callback, queue_size=10
         )
+        self.elevator_cmd_sub = rospy.Subscriber(
+            self.elevator_cmd_topic, Twist, self._elevator_cmd_callback,
+            queue_size=10,
+        )
+        self.output_cmd_sub = rospy.Subscriber(
+            self.output_cmd_topic, Twist, self._output_cmd_callback,
+            queue_size=10,
+        )
+        self.cmd_mux_reason_sub = rospy.Subscriber(
+            self.cmd_mux_reason_topic, String, self._cmd_mux_reason_callback,
+            queue_size=10,
+        )
+        self.execution_odom_sub = None
+        if self.localization_backend == "gazebo_truth":
+            self.execution_odom_sub = rospy.Subscriber(
+                self.execution_odom_topic, Odometry,
+                self._execution_odom_callback, queue_size=5,
+            )
+        self.contact_sub = None
+        if self.localization_backend == "gazebo_truth" and ContactsState is not None \
+                and self.elevator_contact_topic:
+            self.contact_sub = rospy.Subscriber(
+                self.elevator_contact_topic, ContactsState,
+                self._contact_callback, queue_size=5,
+            )
+        self.controller_state_sub = None
+        if self.localization_backend == "gazebo_truth" and self.controller_state_topic:
+            self.controller_state_sub = rospy.Subscriber(
+                self.controller_state_topic, JointState,
+                self._controller_state_callback, queue_size=5,
+            )
         if self.multifloor_enabled:
             self.current_floor_sub = rospy.Subscriber(
                 self.current_floor_topic, Int32, self._current_floor_callback, queue_size=2
@@ -1654,6 +1760,31 @@ class ExplorationPlanner:
         self.last_sent_command = message
         self.last_sent_command_time = rospy.Time.now()
 
+    def _elevator_cmd_callback(self, message):
+        self.last_elevator_command = message
+        self.last_elevator_command_time = rospy.Time.now()
+
+    def _output_cmd_callback(self, message):
+        self.last_output_command = message
+        self.last_output_command_time = rospy.Time.now()
+
+    def _cmd_mux_reason_callback(self, message):
+        self.last_cmd_mux_reason = str(getattr(message, "data", ""))
+        self.last_cmd_mux_reason_time = rospy.Time.now()
+
+    def _execution_odom_callback(self, message):
+        """Record truth-backed displacement without influencing control."""
+        self.last_execution_odom = message
+        self.last_execution_odom_time = rospy.Time.now()
+
+    def _contact_callback(self, message):
+        self.last_contact_count = len(getattr(message, "states", ()))
+        self.last_contact_time = rospy.Time.now()
+
+    def _controller_state_callback(self, message):
+        self.last_controller_joint_count = len(getattr(message, "name", ()))
+        self.last_controller_state_time = rospy.Time.now()
+
     def nav_health_callback(self, msg):
         incoming_context = (
             int(getattr(msg, "current_floor", self.current_floor)),
@@ -1854,6 +1985,7 @@ class ExplorationPlanner:
         return float(np.count_nonzero(observed_box)) / float(observed_box.size)
 
     def _publish_status(self):
+        self._refresh_elevator_diagnostic(rospy.Time.now())
         coverage = self._known_grid_ratio()
         binding = getattr(self, "elevator_hall_bindings", {}).get((
             int(self.current_floor), str(getattr(self, "active_elevator_id", ""))
@@ -1908,6 +2040,190 @@ class ExplorationPlanner:
             )),
         }
         self.status_pub.publish(String(data=json.dumps(payload, sort_keys=True)))
+
+    @staticmethod
+    def _command_is_active(command, stamp, now, freshness_s=0.75):
+        if command is None or stamp == rospy.Time(0):
+            return False
+        if (now - stamp).to_sec() > float(freshness_s):
+            return False
+        values = (
+            command.linear.x, command.linear.y, command.linear.z,
+            command.angular.x, command.angular.y, command.angular.z,
+        )
+        return any(abs(float(value)) > 1e-3 for value in values)
+
+    def _refresh_elevator_diagnostic(self, now):
+        """Add command-chain and failure classification telemetry only.
+
+        This method is deliberately side-effect free with respect to motion:
+        it only updates the status dictionary and throttled diagnostic logs.
+        """
+        if not getattr(self, "floor_change_active", False):
+            return
+        phase = str(getattr(self, "floor_change_step", "") or "")
+        elevator_active = self._command_is_active(
+            getattr(self, "last_elevator_command", None),
+            getattr(self, "last_elevator_command_time", rospy.Time(0)), now,
+        )
+        sent_active = self._command_is_active(
+            getattr(self, "last_sent_command", None),
+            getattr(self, "last_sent_command_time", rospy.Time(0)), now,
+        )
+        output_active = self._command_is_active(
+            getattr(self, "last_output_command", None),
+            getattr(self, "last_output_command_time", rospy.Time(0)), now,
+        )
+        door_open_confirmed = bool(self.floor_change_diagnostics.get(
+            "door_open_confirmed", False
+        ))
+        geometry_blocked = bool(
+            self.floor_change_diagnostics.get("crossing_swept_hit")
+            or self.floor_change_diagnostics.get("alignment_rotation_hit")
+            or self.floor_change_diagnostics.get("crossing_clearance_blocked")
+        )
+        progress = self.floor_change_diagnostics.get("crossing_progress_m")
+        if progress is not None:
+            progress = float(progress)
+            if (progress - self.floor_change_progress_last_m) > 0.01:
+                self.floor_change_progress_last_changed = now
+            self.floor_change_progress_last_m = progress
+        progress_age = None
+        if self.floor_change_progress_last_changed != rospy.Time(0):
+            progress_age = max(
+                0.0,
+                (now - self.floor_change_progress_last_changed).to_sec(),
+            )
+        execution_displacement = None
+        execution_progress_age = None
+        execution_odom = getattr(self, "last_execution_odom", None)
+        execution_start = getattr(self, "floor_change_execution_start", None)
+        if execution_odom is not None and execution_start is not None:
+            current_position = execution_odom.pose.pose.position
+            dx = float(current_position.x) - float(execution_start[0])
+            dy = float(current_position.y) - float(execution_start[1])
+            execution_displacement = math.hypot(dx, dy)
+            if ((execution_displacement - self.floor_change_execution_last_m)
+                    > 0.01):
+                self.floor_change_execution_last_changed = now
+            self.floor_change_execution_last_m = execution_displacement
+            if self.floor_change_execution_last_changed != rospy.Time(0):
+                execution_progress_age = max(
+                    0.0,
+                    (now - self.floor_change_execution_last_changed).to_sec(),
+                )
+        command_age = None
+        if self.last_output_command_time != rospy.Time(0):
+            command_age = max(
+                0.0, (now - self.last_output_command_time).to_sec()
+            )
+        contact_age = None
+        if getattr(self, "last_contact_time", rospy.Time(0)) != rospy.Time(0):
+            contact_age = max(0.0, (now - self.last_contact_time).to_sec())
+        controller_age = None
+        if getattr(self, "last_controller_state_time", rospy.Time(0)) != rospy.Time(0):
+            controller_age = max(
+                0.0, (now - self.last_controller_state_time).to_sec()
+            )
+        if self.elevator_contact_topic:
+            if contact_age is None or contact_age > self.input_timeout:
+                contact_status = "stale_or_unavailable"
+            elif int(getattr(self, "last_contact_count", 0) or 0) > 0:
+                contact_status = "contact_detected"
+            else:
+                contact_status = "no_contact"
+        else:
+            contact_status = "not_configured"
+        if self.controller_state_topic:
+            controller_status = (
+                "fresh" if controller_age is not None
+                and controller_age <= self.input_timeout
+                else "stale_or_unavailable"
+            )
+        else:
+            controller_status = "not_configured"
+        classification = classify_elevator_transit_diagnostic(
+            phase,
+            safety_stop=bool(getattr(self, "safety_stop_active", False)),
+            door_open_confirmed=door_open_confirmed,
+            elevator_command_active=elevator_active,
+            sent_command_active=sent_active,
+            output_command_active=output_active,
+            geometry_blocked=geometry_blocked,
+            robot_progressing=(
+                (execution_progress_age is None or execution_progress_age < 1.0)
+                if execution_displacement is not None
+                else (progress_age is None or progress_age < 1.0)
+            ),
+            command_age_s=command_age,
+        )
+        self.floor_change_diagnostics.update({
+            "diagnostic_class": classification,
+            "elevator_command_active": elevator_active,
+            "sent_command_active": sent_active,
+            "output_command_active": output_active,
+            "cmd_mux_reason": str(getattr(self, "last_cmd_mux_reason", "")),
+            "cmd_mux_reason_age_s": (
+                None if getattr(self, "last_cmd_mux_reason_time", rospy.Time(0)) == rospy.Time(0)
+                else round(max(0.0, (now - self.last_cmd_mux_reason_time).to_sec()), 3)
+            ),
+            "elevator_command_age_s": (
+                None if self.last_elevator_command_time == rospy.Time(0)
+                else round(max(0.0, (now - self.last_elevator_command_time).to_sec()), 3)
+            ),
+            "sent_command_age_s": (
+                None if self.last_sent_command_time == rospy.Time(0)
+                else round(max(0.0, (now - self.last_sent_command_time).to_sec()), 3)
+            ),
+            "output_command_age_s": (
+                None if self.last_output_command_time == rospy.Time(0)
+                else round(max(0.0, (now - self.last_output_command_time).to_sec()), 3)
+            ),
+            "robot_progress_age_s": (
+                None if progress_age is None else round(progress_age, 3)
+            ),
+            "truth_odom_age_s": (
+                None if getattr(self, "last_execution_odom_time", rospy.Time(0)) == rospy.Time(0)
+                else round(max(0.0, (now - self.last_execution_odom_time).to_sec()), 3)
+            ),
+            "truth_displacement_m": (
+                None if execution_displacement is None
+                else round(execution_displacement, 4)
+            ),
+            "truth_progress_age_s": (
+                None if execution_progress_age is None
+                else round(execution_progress_age, 3)
+            ),
+            "execution_evidence": {
+                "truth_odom_topic": self.execution_odom_topic,
+                "truth_odom_available": execution_displacement is not None,
+                "contact_topic": self.elevator_contact_topic,
+                "contact_status": contact_status,
+                "contact_count": getattr(self, "last_contact_count", None),
+                "contact_age_s": (
+                    None if contact_age is None else round(contact_age, 3)
+                ),
+                "controller_state_topic": self.controller_state_topic,
+                "controller_state": controller_status,
+                "controller_joint_count": getattr(
+                    self, "last_controller_joint_count", None
+                ),
+                "controller_state_age_s": (
+                    None if controller_age is None else round(controller_age, 3)
+                ),
+            },
+            "door_open_confirmed": door_open_confirmed,
+            "safety_stop_active": bool(getattr(self, "safety_stop_active", False)),
+        })
+        if classification != self.floor_change_diagnostic_last_log:
+            self.floor_change_diagnostic_last_log = classification
+            if classification != "NONE":
+                rospy.logwarn(
+                    "[exploration] elevator transit diagnostic=%s phase=%s "
+                    "elevator_cmd=%s sent_cmd=%s output_cmd=%s progress_age=%s",
+                    classification, phase, elevator_active, sent_active,
+                    output_active, progress_age,
+                )
 
     def _inputs_health(self, now):
         if self.current_map is None:
@@ -3077,6 +3393,13 @@ class ExplorationPlanner:
         self._service_future_generation = self._service_generation
         self._service_kind = str(kind)
         self._service_future = self._service_executor.submit(callback)
+        if getattr(self, "floor_change_active", False):
+            getattr(self, "floor_change_diagnostics", {}).update({
+                "service_last_kind": str(kind),
+                "service_last_outcome": "pending",
+                "service_last_message": "",
+                "service_last_time": rospy.Time.now().to_sec(),
+            })
         self.floor_change_stage_deadline = rospy.Time.now() + rospy.Duration(
             self.elevator_service_timeout_s
         )
@@ -3092,6 +3415,13 @@ class ExplorationPlanner:
         if self._service_future is None or self._service_kind != expected_kind:
             return "missing", None
         if now > self.floor_change_stage_deadline:
+            if getattr(self, "floor_change_active", False):
+                getattr(self, "floor_change_diagnostics", {}).update({
+                    "service_last_kind": str(expected_kind),
+                    "service_last_outcome": "timeout",
+                    "service_last_message": "service deadline exceeded",
+                    "service_last_time": now.to_sec(),
+                })
             self._invalidate_service()
             return "timeout", None
         if not self._service_future.done():
@@ -3103,8 +3433,25 @@ class ExplorationPlanner:
         if generation != self._service_generation:
             return "stale", None
         try:
-            return "done", future.result()
+            response = future.result()
+            if getattr(self, "floor_change_active", False):
+                getattr(self, "floor_change_diagnostics", {}).update({
+                    "service_last_kind": str(expected_kind),
+                    "service_last_outcome": "success",
+                    "service_last_message": str(
+                        getattr(response, "message", "")
+                    ),
+                    "service_last_time": now.to_sec(),
+                })
+            return "done", response
         except Exception as exc:  # ROSException and ServiceException included.
+            if getattr(self, "floor_change_active", False):
+                getattr(self, "floor_change_diagnostics", {}).update({
+                    "service_last_kind": str(expected_kind),
+                    "service_last_outcome": "error",
+                    "service_last_message": str(exc),
+                    "service_last_time": now.to_sec(),
+                })
             return "error", exc
 
     def _publish_mapping_pause(self):
@@ -3989,8 +4336,19 @@ class ExplorationPlanner:
         }
 
     def _set_floor_change_phase(self, phase, reason=None):
+        previous = str(getattr(self, "floor_change_step", "") or "")
         self.floor_change_step = str(phase)
         self.floor_change_phase_started = rospy.Time.now()
+        self.floor_change_diagnostics.update({
+            "phase": str(phase),
+            "phase_reason": str(reason or phase.lower()),
+            "phase_previous": previous,
+            "phase_started_at": self.floor_change_phase_started.to_sec(),
+        })
+        rospy.loginfo(
+            "[exploration] elevator phase %s -> %s: %s",
+            previous or "NONE", phase, reason or phase.lower(),
+        )
         self._set_state("FLOOR_CHANGE", reason or phase.lower())
 
     def _begin_floor_change(self, target_floor, external=False,
@@ -4062,7 +4420,16 @@ class ExplorationPlanner:
         self.floor_change_door_open_count = 0
         self.floor_change_door_last_scan_stamp = rospy.Time(0)
         self.floor_change_recovery_direction = 0.0
-        self.floor_change_diagnostics = {}
+        self.floor_change_diagnostics = {
+            "diagnostic_class": "NONE",
+            "door_open_confirmed": False,
+            "service_last_kind": "",
+            "service_last_outcome": "",
+            "service_last_message": "",
+        }
+        self.floor_change_progress_last_m = 0.0
+        self.floor_change_progress_last_changed = rospy.Time(0)
+        self.floor_change_diagnostic_last_log = ""
         self.floor_change_hall_candidate = None
         self._invalidate_service()
         self._stop_elevator_motion()
@@ -4401,6 +4768,7 @@ class ExplorationPlanner:
         )
         if (self.floor_change_door_open_count
                 >= self.elevator_door_open_required_scans):
+            self.floor_change_diagnostics["door_open_confirmed"] = True
             stand_off, lateral, yaw_error = elevator_pose_errors(
                 self.current_pose,
                 self.floor_change_hall_point,
@@ -4438,6 +4806,23 @@ class ExplorationPlanner:
         )
         self.floor_change_crossing_direction = 1.0 if direction > 0.0 else -1.0
         self.floor_change_crossing_target_m = self.elevator_crossing_distance_m
+        self.floor_change_progress_last_m = 0.0
+        self.floor_change_progress_last_changed = rospy.Time.now()
+        # These fields describe the current crossing attempt, not a stale
+        # obstruction from a previous alignment/recovery retry.
+        self.floor_change_diagnostics.pop("crossing_swept_hit", None)
+        self.floor_change_diagnostics.pop("alignment_rotation_hit", None)
+        self.floor_change_diagnostics["crossing_clearance_blocked"] = False
+        execution_odom = getattr(self, "last_execution_odom", None)
+        if execution_odom is not None:
+            position = execution_odom.pose.pose.position
+            self.floor_change_execution_start = (
+                float(position.x), float(position.y)
+            )
+        else:
+            self.floor_change_execution_start = None
+        self.floor_change_execution_last_m = 0.0
+        self.floor_change_execution_last_changed = rospy.Time.now()
         phase = "ENTER" if direction > 0.0 else "EXIT"
         self._set_floor_change_phase(phase, phase.lower() + "_elevator")
         self.floor_change_stage_deadline = rospy.Time.now() + rospy.Duration(
@@ -4650,6 +5035,9 @@ class ExplorationPlanner:
                 % yaw_error,
             )
             return
+        self.floor_change_diagnostics["crossing_clearance_blocked"] = bool(
+            clearance <= self.elevator_crossing_clearance_m
+        )
         if (clearance <= self.elevator_crossing_clearance_m
                 or swept_hit is not None):
             if swept_hit is not None:
@@ -4883,6 +5271,13 @@ class ExplorationPlanner:
         if step == "FIXED_DOOR_OPEN_WAIT":
             if now < self.floor_change_stage_deadline:
                 return
+            # The fixed simulation door has a known animation wait.  Keep the
+            # evidence explicit so the short-link test can distinguish this
+            # gate from a later command or physical crossing failure.
+            diagnostics = getattr(self, "floor_change_diagnostics", None)
+            if diagnostics is not None:
+                diagnostics["door_open_confirmed"] = True
+                diagnostics["door_open_confirmation"] = "fixed_animation_wait"
             self._remember_validated_hall()
             self._start_crossing(+1.0)
             return
@@ -5260,6 +5655,7 @@ class ExplorationPlanner:
                     self._floor_change_fail(failure_code, detail)
                     return
                 self._advance_floor_change(now)
+                self._publish_status()
             except Exception as exc:
                 rospy.logerr("[exploration] transit state machine exception: %s", exc)
                 self._floor_change_fail(

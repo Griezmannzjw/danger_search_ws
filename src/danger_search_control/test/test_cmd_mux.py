@@ -36,15 +36,20 @@ def _install_message_stubs():
         sys.modules["geometry_msgs.msg"] = geometry_msg
 
     try:
-        from std_msgs.msg import Bool as _Bool
+        from std_msgs.msg import Bool as _Bool, String as _String
     except ImportError:
         class Bool:
             def __init__(self, data=False):
                 self.data = data
 
+        class String:
+            def __init__(self, data=""):
+                self.data = data
+
         std = types.ModuleType("std_msgs")
         std_msg = types.ModuleType("std_msgs.msg")
         std_msg.Bool = Bool
+        std_msg.String = String
         std.msg = std_msg
         sys.modules["std_msgs"] = std
         sys.modules["std_msgs.msg"] = std_msg

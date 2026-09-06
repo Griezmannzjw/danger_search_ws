@@ -69,6 +69,57 @@ def build_shaft_map(size_cells, shaft=(1.5, 4.0, 1.0, 4.0), door=(2.0, 3.0)):
     return grid
 
 
+class ElevatorDiagnosticClassificationTest(unittest.TestCase):
+    def test_safety_stop_has_priority_over_command_chain(self):
+        self.assertEqual(
+            MODULE.classify_elevator_transit_diagnostic(
+                "ENTER", safety_stop=True, elevator_command_active=True
+            ),
+            "SAFETY_BLOCKED",
+        )
+
+    def test_door_gate_is_reported_before_enter_command(self):
+        self.assertEqual(
+            MODULE.classify_elevator_transit_diagnostic(
+                "WAIT_DOOR_FULL_OPEN", door_open_confirmed=False
+            ),
+            "DOOR_NOT_OPEN",
+        )
+
+    def test_command_chain_reports_unrelayed_elevator_command(self):
+        self.assertEqual(
+            MODULE.classify_elevator_transit_diagnostic(
+                "ENTER", elevator_command_active=True,
+                sent_command_active=False,
+            ),
+            "ELEVATOR_CMD_NOT_RELAYED",
+        )
+
+    def test_geometry_and_rl_failures_are_distinguished(self):
+        self.assertEqual(
+            MODULE.classify_elevator_transit_diagnostic(
+                "ENTER", elevator_command_active=True,
+                sent_command_active=True, output_command_active=True,
+                geometry_blocked=True,
+            ),
+            "CROSSING_GEOMETRY_BLOCKED",
+        )
+        self.assertEqual(
+            MODULE.classify_elevator_transit_diagnostic(
+                "ENTER", elevator_command_active=True,
+                sent_command_active=True, output_command_active=True,
+                robot_progressing=False, command_age_s=1.5,
+            ),
+            "RL_NOT_MOVING",
+        )
+        self.assertEqual(
+            MODULE.classify_elevator_transit_diagnostic(
+                "ALIGN_HALL", geometry_blocked=True,
+            ),
+            "CROSSING_GEOMETRY_BLOCKED",
+        )
+
+
 class ElevatorDetectionTest(unittest.TestCase):
     def test_shaft_with_west_door_is_detected(self):
         planner = make_planner(build_shaft_map(400))

@@ -6,7 +6,7 @@ import threading
 
 import rospy
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 
 DEFAULT_PARAMS = {
@@ -316,6 +316,9 @@ class CmdMux:
         self.sent_cmd_topic = rospy.get_param(
             "~sent_cmd_topic", "/danger_search/cmd_vel_sent"
         )
+        self.reason_topic = rospy.get_param(
+            "~reason_topic", "/danger_search/cmd_mux_reason"
+        )
         self.safety_stop_topic = rospy.get_param(
             "~safety_stop_topic", "/danger_search/safety_stop"
         )
@@ -325,6 +328,7 @@ class CmdMux:
             ("entry_cmd_topic", self.entry_cmd_topic),
             ("output_cmd_topic", self.output_cmd_topic),
             ("sent_cmd_topic", self.sent_cmd_topic),
+            ("reason_topic", self.reason_topic),
             ("safety_stop_topic", self.safety_stop_topic),
         ):
             if not isinstance(topic, str) or not topic.strip():
@@ -426,6 +430,7 @@ class CmdMux:
         # control 仍是唯一的最终 /cmd_vel 发布者；回显与其发布完全相同的消息。
         self.cmd_pub = rospy.Publisher(self.output_cmd_topic, Twist, queue_size=10)
         self.sent_cmd_pub = rospy.Publisher(self.sent_cmd_topic, Twist, queue_size=10)
+        self.reason_pub = rospy.Publisher(self.reason_topic, String, queue_size=10)
 
         self.nav_sub = rospy.Subscriber(
             self.nav_cmd_topic, Twist, self.nav_cmd_callback
@@ -484,6 +489,19 @@ class CmdMux:
         try:
             self.cmd_pub.publish(output)
             self.sent_cmd_pub.publish(output)
+        except rospy.ROSException:
+            if self._is_stopping_locked():
+                return False
+            raise
+        return True
+
+    def _publish_reason_locked(self, reason):
+        """Expose the exact CmdMuxCore decision for transit diagnostics."""
+        publisher = getattr(self, "reason_pub", None)
+        if publisher is None or self._is_stopping_locked():
+            return False
+        try:
+            publisher.publish(String(data=str(reason)))
         except rospy.ROSException:
             if self._is_stopping_locked():
                 return False
@@ -663,6 +681,7 @@ class CmdMux:
             output = self._message_from_velocity(values)
             self.last_output = output
             self._publish_locked(output)
+            self._publish_reason_locked(reason)
 
             if reason == "invalid":
                 rospy.logwarn_throttle(

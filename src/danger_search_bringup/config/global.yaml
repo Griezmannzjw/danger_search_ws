@@ -28,6 +28,7 @@ output_cmd_topic: /cmd_vel
 nav_cmd_topic: /danger_search/nav_cmd_vel
 safety_stop_topic: /danger_search/safety_stop
 elevator_cmd_topic: /danger_search/elevator_cmd_vel
+cmd_mux_reason_topic: /danger_search/cmd_mux_reason
 preflight_ready_topic: /danger_search/preflight_ready
 
 # ========== 传感器话题（来自SimEnv） ==========

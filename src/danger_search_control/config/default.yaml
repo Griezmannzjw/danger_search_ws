@@ -7,6 +7,7 @@ elevator_cmd_topic: /danger_search/elevator_cmd_vel
 entry_cmd_topic: /danger_search/entry_cmd_vel
 output_cmd_topic: /cmd_vel
 sent_cmd_topic: /danger_search/cmd_vel_sent
+reason_topic: /danger_search/cmd_mux_reason
 safety_stop_topic: /danger_search/safety_stop
 posture_fallen_topic: /danger_search/posture_fallen
 posture_reason_topic: /danger_search/posture_safety_reason
