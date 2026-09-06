@@ -1003,6 +1003,15 @@ class ExplorationPlanner:
         self.fixed_elevator_pre_align_fallback_count = int(rospy.get_param(
             "~fixed_elevator_pre_align_fallback_count", 2
         ))
+        self.fixed_elevator_hall_xy_goal_tolerance_m = float(rospy.get_param(
+            "~fixed_elevator_hall_xy_goal_tolerance_m", 0.15
+        ))
+        self.fixed_elevator_hall_pose_settle_s = float(rospy.get_param(
+            "~fixed_elevator_hall_pose_settle_s", 0.75
+        ))
+        self.fixed_elevator_hall_settle_speed_mps = float(rospy.get_param(
+            "~fixed_elevator_hall_settle_speed_mps", 0.05
+        ))
         self.elevator_car_target_m = float(
             rospy.get_param("~elevator_car_target_m", 1.6)
         )
@@ -1172,6 +1181,9 @@ class ExplorationPlanner:
                 and self.fixed_elevator_pre_align_m > 0.0
                 and self.fixed_elevator_pre_align_fallback_step_m > 0.0
                 and self.fixed_elevator_pre_align_fallback_count >= 0
+                and self.fixed_elevator_hall_xy_goal_tolerance_m > 0.0
+                and self.fixed_elevator_hall_pose_settle_s >= 0.0
+                and self.fixed_elevator_hall_settle_speed_mps >= 0.0
                 and self.elevator_service_timeout_s > 0.0
                 and self.elevator_max_retries >= 1
                 and self.floor_change_timeout_s > 0.0
@@ -1349,6 +1361,9 @@ class ExplorationPlanner:
         self.floor_change_hall_point = None
         self.floor_change_hall_candidate = None
         self.floor_change_approach_m = self.elevator_hall_approach_m
+        self.floor_change_hall_waypoint_stage = 1
+        self.floor_change_hall_front_distance_m = self.elevator_hall_approach_m
+        self.floor_change_hall_pose_settle_since = rospy.Time(0)
         self.floor_change_car_point = None
         self.floor_change_stable_since = rospy.Time(0)
         self._floor_change_goal_succeeded = False
@@ -1865,6 +1880,14 @@ class ExplorationPlanner:
             # attempt.  This also isolates late recovery events from the
             # ordinary goal canceled when floor transit starts.
             if self.floor_change_active:
+                if getattr(self, "floor_change_step", None) == "TO_HALL":
+                    diagnostics = getattr(self, "floor_change_diagnostics", {})
+                    self.floor_change_diagnostics = diagnostics
+                    diagnostics[
+                        "to_hall_recovery_event_count"
+                    ] = int(diagnostics.get(
+                        "to_hall_recovery_event_count", 0
+                    )) + 1
                 return
 
             # RecoveryEvent is latched and navigation is also used by Mission.
@@ -3000,6 +3023,11 @@ class ExplorationPlanner:
                         self.floor_change_diagnostics[
                             "to_hall_diagnostic"
                         ] = "TO_HALL_DWA_BLOCKED"
+                    self.floor_change_diagnostics[
+                        "to_hall_dwa_failure_count"
+                    ] = int(self.floor_change_diagnostics.get(
+                        "to_hall_dwa_failure_count", 0
+                    )) + 1
                 self.current_goal = None
                 return
             if state == actionlib.GoalStatus.SUCCEEDED:
@@ -4527,12 +4555,18 @@ class ExplorationPlanner:
             "service_last_outcome": "",
             "service_last_message": "",
             "to_hall_diagnostic": "NONE",
+            "to_hall_dwa_failure_count": 0,
+            "to_hall_recovery_event_count": 0,
+            "hall_goal_completion_source": "",
         }
         self.floor_change_progress_last_m = 0.0
         self.floor_change_progress_last_changed = rospy.Time(0)
         self.floor_change_diagnostic_last_log = ""
         self.floor_change_hall_candidate = None
         self.floor_change_approach_m = self.elevator_hall_approach_m
+        self.floor_change_hall_waypoint_stage = 1
+        self.floor_change_hall_front_distance_m = self.elevator_hall_approach_m
+        self.floor_change_hall_pose_settle_since = rospy.Time(0)
         self._invalidate_service()
         self._stop_elevator_motion()
 
@@ -4568,7 +4602,13 @@ class ExplorationPlanner:
         return str(getattr(candidate, "source", "")) == "fixed_test"
 
     def _hall_approach_distances(self, candidate):
-        """Return bounded outer waypoints, nearest safe point first."""
+        """Return bounded fixed-hall waypoints, outer point first.
+
+        The fixed simulation hall is approached in two stages: the first
+        point stays in the open area, then a short second goal puts the robot
+        at the door stand-off used by ALIGN_HALL.  Detected halls retain their
+        existing single-waypoint behavior.
+        """
         if (bool(getattr(self, "fixed_elevator_hall_enabled", False))
                 and self._is_fixed_hall_candidate(candidate)):
             base = max(
@@ -4587,7 +4627,11 @@ class ExplorationPlanner:
                     self, "fixed_elevator_pre_align_fallback_count", 2
                 )),
             )
-            return [base + step * index for index in range(count + 1)]
+            distances = [base + step]
+            distances.extend(base + step * (index + 2)
+                             for index in range(max(0, count - 1)))
+            distances.append(base)
+            return distances
         return [float(getattr(self, "elevator_hall_approach_m", 0.8))]
 
     @staticmethod
@@ -4708,6 +4752,16 @@ class ExplorationPlanner:
             self.floor_change_hall_point = (hx, hy, into_yaw)
             self.floor_change_hall_candidate = candidate
             self.floor_change_approach_m = approach_distance
+            front_distance = max(
+                float(getattr(self, "fixed_elevator_pre_align_m", 1.35)),
+                float(getattr(self, "elevator_hall_approach_m", 0.8)),
+            )
+            self.floor_change_hall_front_distance_m = front_distance
+            self.floor_change_hall_waypoint_stage = int(
+                self._is_fixed_hall_candidate(candidate)
+                and approach_distance > front_distance + 1.0e-3
+            )
+            self.floor_change_hall_pose_settle_since = rospy.Time(0)
             self.floor_change_car_point = (
                 hx + self.elevator_car_target_m * math.cos(into_yaw),
                 hy + self.elevator_car_target_m * math.sin(into_yaw),
@@ -4730,17 +4784,24 @@ class ExplorationPlanner:
                 approach_waypoint=[round(float(approach_x), 4),
                                    round(float(approach_y), 4)],
                 approach_distance_m=round(approach_distance, 4),
+                hall_waypoint_stage=(
+                    "REMOTE" if self.floor_change_hall_waypoint_stage == 1
+                    else "FRONT"
+                ),
                 plan_available=True,
                 plan_length_m=round(path_length, 4),
                 plan_failure_reason="",
                 to_hall_diagnostic="NONE",
             )
+            # Set the deadline before handing the goal to actionlib.  A
+            # callback/timer can run immediately after send_goal; leaving a
+            # zero deadline here creates a spurious instant hall timeout.
+            self.floor_change_hall_deadline = (
+                rospy.Time.now() + rospy.Duration(navigation_timeout)
+            )
             if self._send_goal(
                     approach_x, approach_y, goal_yaw,
                     planned_path_length=path_length):
-                self.floor_change_hall_deadline = (
-                    rospy.Time.now() + rospy.Duration(navigation_timeout)
-                )
                 self._set_floor_change_phase(
                     "TO_HALL", "navigate_to_elevator_hall"
                 )
@@ -4816,6 +4877,147 @@ class ExplorationPlanner:
             self._set_floor_change_phase(phase, "retry_" + phase.lower())
             return
         self._floor_change_fail(failure_code, message)
+
+    def _fixed_hall_pose_settled(self, now):
+        """Accept a fixed-hall position goal once the pose is stably stopped.
+
+        DWA's normal success path is still preferred.  This narrow fallback is
+        only for the second fixed-hall waypoint and requires truth odometry,
+        a fresh low-speed sample, and a continuous settle interval.  It does
+        not bypass the later ALIGN_HALL, laser, footprint, or door gates.
+        """
+        candidate = getattr(self, "floor_change_hall_candidate", None)
+        if not (bool(getattr(self, "fixed_elevator_hall_enabled", False))
+                and self._is_fixed_hall_candidate(candidate)
+                and int(getattr(self, "floor_change_hall_waypoint_stage", 1)) == 0
+                and candidate is not None
+                and bool(getattr(self, "waiting_for_result", False))):
+            return False
+        odom = getattr(self, "last_execution_odom", None)
+        if odom is None:
+            return False
+        odom_time = getattr(self, "last_execution_odom_time", rospy.Time(0))
+        if odom_time != rospy.Time(0) and (now - odom_time).to_sec() > 1.0:
+            return False
+        pose = getattr(self, "current_pose", None)
+        if pose is None:
+            return False
+        target_x, target_y = self._hall_approach_point(
+            candidate, self._floor_change_approach_distance()
+        )
+        error_m = math.hypot(
+            float(pose.position.x) - target_x,
+            float(pose.position.y) - target_y,
+        )
+        linear = getattr(getattr(odom, "twist", None), "twist", None)
+        linear = getattr(linear, "linear", None)
+        speed_mps = math.hypot(
+            float(getattr(linear, "x", 0.0)),
+            float(getattr(linear, "y", 0.0)),
+        ) if linear is not None else float("inf")
+        diagnostics = getattr(self, "floor_change_diagnostics", {})
+        self.floor_change_diagnostics = diagnostics
+        diagnostics.update({
+            "hall_position_error_m": round(error_m, 4),
+            "hall_speed_mps": round(speed_mps, 4),
+        })
+        tolerance = float(getattr(
+            self, "fixed_elevator_hall_xy_goal_tolerance_m", 0.15
+        ))
+        speed_limit = float(getattr(
+            self, "fixed_elevator_hall_settle_speed_mps", 0.05
+        ))
+        if error_m > tolerance or speed_mps > speed_limit:
+            self.floor_change_hall_pose_settle_since = rospy.Time(0)
+            diagnostics["hall_pose_stable_s"] = 0.0
+            return False
+        since = getattr(self, "floor_change_hall_pose_settle_since", rospy.Time(0))
+        if since == rospy.Time(0):
+            self.floor_change_hall_pose_settle_since = now
+            diagnostics["hall_pose_stable_s"] = 0.0
+            return False
+        stable_s = max(0.0, (now - since).to_sec())
+        diagnostics["hall_pose_stable_s"] = round(stable_s, 3)
+        if stable_s < float(getattr(
+                self, "fixed_elevator_hall_pose_settle_s", 0.75)):
+            return False
+        self.goal_id += 1  # ignore a late PREEMPTED callback from actionlib
+        self.move_base_client.cancel_goal()
+        self.waiting_for_result = False
+        self.current_goal = None
+        self.nav_has_active_goal = False
+        self._floor_change_goal_succeeded_set(True)
+        diagnostics["hall_goal_completion_source"] = "POSE_SETTLED"
+        diagnostics["to_hall_diagnostic"] = "NONE"
+        rospy.loginfo(
+            "[exploration] fixed hall front waypoint settled: error=%.3fm "
+            "speed=%.3fm/s stable=%.2fs",
+            error_m, speed_mps, stable_s,
+        )
+        return True
+
+    def _dispatch_fixed_hall_front_waypoint(self, now):
+        """Dispatch the short fixed-hall door-front waypoint."""
+        candidate = getattr(self, "floor_change_hall_candidate", None)
+        if candidate is None:
+            return False
+        distance = max(
+            float(getattr(self, "fixed_elevator_pre_align_m", 1.35)),
+            float(getattr(self, "elevator_hall_approach_m", 0.8)),
+        )
+        approach_x, approach_y = self._hall_approach_point(candidate, distance)
+        map_x, map_y = self._world_to_map(approach_x, approach_y)
+        if not self._is_free(map_x, map_y):
+            self._record_to_hall_plan_diagnostic(
+                plan_available=False,
+                plan_failure_reason="front_waypoint_occupied_or_unknown",
+                to_hall_diagnostic="TO_HALL_PLAN_UNAVAILABLE",
+            )
+            return False
+        path_state = self._check_path(
+            self.current_pose.position.x, self.current_pose.position.y,
+            approach_x, approach_y,
+        )
+        if path_state != "reachable":
+            self._record_to_hall_plan_diagnostic(
+                plan_available=False,
+                plan_length_m=None,
+                plan_failure_reason="front_make_plan_%s" % path_state,
+                to_hall_diagnostic="TO_HALL_PLAN_UNAVAILABLE",
+            )
+            return False
+        metrics = dict(self.last_checked_path_metrics or {})
+        path_length = float(metrics.get(
+            "path_length", math.hypot(
+                approach_x - self.current_pose.position.x,
+                approach_y - self.current_pose.position.y,
+            )
+        ))
+        navigation_timeout = min(
+            self.elevator_hall_navigation_max_s,
+            max(30.0, 20.0 + 2.5 * path_length
+                / self.elevator_hall_nominal_speed_mps),
+        )
+        orientation = getattr(self.current_pose, "orientation", None)
+        goal_yaw = self._yaw_from_quaternion(orientation) if orientation else 0.0
+        self.floor_change_approach_m = distance
+        self.floor_change_hall_waypoint_stage = 0
+        self.floor_change_hall_pose_settle_since = rospy.Time(0)
+        self._floor_change_goal_succeeded = None
+        self.floor_change_hall_deadline = now + rospy.Duration(navigation_timeout)
+        self._record_to_hall_plan_diagnostic(
+            approach_waypoint=[round(float(approach_x), 4),
+                               round(float(approach_y), 4)],
+            approach_distance_m=round(distance, 4),
+            hall_waypoint_stage="FRONT",
+            plan_available=True,
+            plan_length_m=round(path_length, 4),
+            plan_failure_reason="",
+            to_hall_diagnostic="NONE",
+        )
+        return self._send_goal(
+            approach_x, approach_y, goal_yaw, planned_path_length=path_length
+        )
 
     def _rotation_clearance_hit(self):
         """Return the nearest lidar point swept by an in-place rotation."""
@@ -5399,14 +5601,30 @@ class ExplorationPlanner:
 
         if step == "TO_HALL":
             if self.waiting_for_result:
-                if now > self.floor_change_hall_deadline:
+                # The action can be physically settled a few centimetres from
+                # the goal while DWA has no legal final sample.  Only the
+                # fixed-hall front waypoint may use this evidence-backed
+                # completion path.
+                if self._fixed_hall_pose_settled(now):
+                    pass
+                elif (self.floor_change_hall_deadline != rospy.Time(0)
+                      and now > self.floor_change_hall_deadline):
                     self.goal_id += 1
                     self.move_base_client.cancel_goal()
                     self.waiting_for_result = False
                     self.current_goal = None
-                    self.floor_change_diagnostics[
-                        "to_hall_diagnostic"
-                    ] = "TO_HALL_GOAL_NOT_REACHED"
+                    if (self.floor_change_diagnostics.get(
+                            "to_hall_dwa_failure_count", 0) > 0
+                            or getattr(self, "nav_stuck", False)
+                            or self.floor_change_diagnostics.get(
+                                "to_hall_recovery_event_count", 0) > 0):
+                        self.floor_change_diagnostics[
+                            "to_hall_diagnostic"
+                        ] = "TO_HALL_DWA_BLOCKED"
+                    else:
+                        self.floor_change_diagnostics[
+                            "to_hall_diagnostic"
+                        ] = "TO_HALL_GOAL_NOT_REACHED"
                     self._retry_hall_or_fail(
                         "UNREACHABLE_HALL", "hall navigation timed out"
                     )
@@ -5418,9 +5636,27 @@ class ExplorationPlanner:
                     "UNREACHABLE_HALL", "hall navigation failed"
                 )
                 return
+            if (bool(getattr(self, "fixed_elevator_hall_enabled", False))
+                    and int(getattr(
+                        self, "floor_change_hall_waypoint_stage", 0
+                    )) == 1):
+                if self._dispatch_fixed_hall_front_waypoint(now):
+                    return
+                self._retry_current_hall_or_fail(
+                    "UNREACHABLE_HALL",
+                    "fixed hall front waypoint is not reachable",
+                )
+                return
             if self.nav_has_active_goal:
                 return
             self.elevator_hall_found = self.floor_change_hall_point
+            diagnostics = getattr(self, "floor_change_diagnostics", {})
+            self.floor_change_diagnostics = diagnostics
+            diagnostics[
+                "hall_goal_completion_source"
+            ] = diagnostics.get(
+                "hall_goal_completion_source", "ACTION_SUCCEEDED"
+            ) or "ACTION_SUCCEEDED"
             self.floor_change_alignment_stable_since = rospy.Time(0)
             self._set_floor_change_phase("ALIGN_HALL", "align_with_elevator_door")
             self.floor_change_stage_deadline = now + rospy.Duration(

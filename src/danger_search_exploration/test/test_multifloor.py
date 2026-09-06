@@ -822,7 +822,9 @@ class TransitStateMachineTest(unittest.TestCase):
         planner._send_goal.assert_called_once()
         sent_x, sent_y, sent_yaw = planner._send_goal.call_args.args
         self.assertAlmostEqual(sent_x, -2.40)
-        self.assertAlmostEqual(sent_y, -0.30)
+        # Fixed mode starts in the open area (1.70 m from the hall), then
+        # dispatches the 1.35 m door-front waypoint after this goal succeeds.
+        self.assertAlmostEqual(sent_y, 0.05)
         # Fixed-mode TO_HALL only positions the robot; ALIGN_HALL handles
         # the final elevator heading.
         self.assertAlmostEqual(sent_yaw, 0.0)
@@ -893,6 +895,44 @@ class TransitStateMachineTest(unittest.TestCase):
         self.assertAlmostEqual(
             (planner.floor_change_stage_deadline - now).to_sec(), 12.0
         )
+
+    def test_fixed_hall_remote_success_dispatches_front_waypoint(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_deadline = MODULE.rospy.Time.from_sec(100.0)
+        planner.floor_change_step = "TO_HALL"
+        planner.waiting_for_result = False
+        planner._floor_change_goal_succeeded = True
+        planner.nav_has_active_goal = False
+        planner.current_pose = SimpleNamespace(
+            position=SimpleNamespace(x=-2.4, y=0.05),
+            orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+        )
+        planner.floor_change_hall_point = (-2.40, -1.65, -math.pi / 2.0)
+        planner.floor_change_hall_candidate = MODULE.ElevatorHallCandidate(
+            -2.40, -1.65, -math.pi / 2.0,
+            score=1.0, source="fixed_test", confidence=1.0,
+        )
+        planner.floor_change_hall_waypoint_stage = 1
+        planner.floor_change_approach_m = 1.70
+        planner.fixed_elevator_hall_enabled = True
+        planner.fixed_elevator_pre_align_m = 1.35
+        planner.elevator_hall_approach_m = 0.8
+        planner.elevator_hall_navigation_max_s = 180.0
+        planner.elevator_hall_nominal_speed_mps = 0.25
+        planner._world_to_map = Mock(return_value=(54, 495))
+        planner._is_free = Mock(return_value=True)
+        planner._check_path = Mock(return_value="reachable")
+        planner.last_checked_path_metrics = {"path_length": 0.3}
+        planner._send_goal = Mock(return_value=True)
+        planner.floor_change_diagnostics = {}
+
+        planner._advance_floor_change(MODULE.rospy.Time.from_sec(1.0))
+
+        planner._send_goal.assert_called_once()
+        sent_x, sent_y, _sent_yaw = planner._send_goal.call_args.args
+        self.assertAlmostEqual(sent_x, -2.40)
+        self.assertAlmostEqual(sent_y, -0.30)
+        self.assertEqual(planner.floor_change_hall_waypoint_stage, 0)
 
     def test_fixed_hall_open_success_waits_then_starts_direct_crossing(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
