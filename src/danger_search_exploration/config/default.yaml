@@ -132,6 +132,9 @@ fixed_elevator_front_approach_target_progress_m: 0.30
 fixed_elevator_front_approach_timeout_s: 20.0
 fixed_elevator_front_approach_settle_s: 0.75
 fixed_elevator_front_approach_stall_timeout_s: 3.0
+# In the narrow simulation doorway, carry a small residual yaw error through
+# the front approach instead of rotating in place against the jamb.
+fixed_elevator_alignment_yaw_tolerance_rad: 0.25
 elevator_car_target_m: 1.6      # 进轿厢后停靠位置（门缝向井道内推进距离）
 
 # 电梯操作
@@ -144,6 +147,8 @@ elevator_crossing_timeout_s: 20.0
 elevator_crossing_speed_mps: 0.40
 elevator_crossing_distance_m: 1.40
 elevator_crossing_min_progress_m: 0.80
+# Used as a diagnostic threshold during ENTER/EXIT.  It is not a standalone
+# stop condition; footprint sweep and pose/sensor freshness remain authoritative.
 elevator_crossing_clearance_m: 0.32
 elevator_alignment_yaw_tolerance_rad: 0.10
 elevator_alignment_lateral_tolerance_m: 0.20

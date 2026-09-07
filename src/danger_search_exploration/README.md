@@ -51,6 +51,10 @@ TO_HALL -> OPEN_CURRENT -> VERIFY_HALL -> ENTER -> CLOSE_CURRENT
   取消、超时或新 action generation 会忽略迟到响应。
 - 进入和退出轿厢各限 20 秒，默认门槛穿越速度为 `0.40 m/s`，使用局部激光避障，速度只发布到
   `/danger_search/elevator_cmd_vel`；control 以短租约仲裁。
+- `ENTER/EXIT` 阶段的前方 40° 扇区最小距离只作为
+  `crossing_min_sector_clearance_m` 诊断值，不单独触发停车；安全停车由新鲜激光、横向/航向
+  限制和带 margin 的 footprint 直线扫掠命中决定。扫掠只覆盖机器人尾部越过门平面所需距离，
+  不把轿厢后壁当作门口障碍。闭门前的 `TO_HALL_FRONT_APPROACH` 仍保留扇区和 footprint 双重保护。
 - `/localization/switch_floor` 成功后要求 epoch 增加，并等待至少两个目标层
   新地图版本、active-map 原子身份、定位健康以及 navigation 完成当前 epoch
   的 costmap reset，再进行 15 秒稳定保持。探索不直接调用清图服务。
@@ -75,6 +79,11 @@ floor/epoch/map-load identity 内允许地图版本增长；换层开门后直�
 
 `/exploration/status` 的 JSON 还包含 `elevator_candidate_count`、`elevator_binding`
 （坐标、来源、置信度和验证状态）以及 `initial_hall_discovery`。
+
+`simulation_truth.launch` 的固定门厅坐标使用 `GazeboTruthCore` 的启动位姿相对坐标：
+当前 SimEnv 默认出生点 `(0, 5, yaw=pi/2)` 对应门厅 `(1.65, -2.40, yaw=-pi/2)`。
+如果通过 `robot_x/robot_y/robot_yaw` 改变出生点，必须同步覆盖
+`fixed_elevator_hall_x/y/into_yaw`；正式 `competition.launch` 不启用固定门厅。
 
 固定失败码：
 

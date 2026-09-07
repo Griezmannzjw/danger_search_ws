@@ -112,9 +112,12 @@
     <param name="localization_backend" value="$(arg localization_backend)" />
     <param name="multifloor_enabled" value="$(arg multifloor_enabled)" />
     <param name="explicit_floor_switching" value="$(arg multifloor_enabled)" />
-    <!-- Truth scans and poses share timestamps; do not extrapolate TF into the future. -->
+    <!-- Under Gazebo load the scan callback can arrive a few tens of
+         milliseconds after the adapter timer.  A small bounded future
+         tolerance prevents move_base's map->odom lookup from racing the
+         publisher without masking a real timestamp fault. -->
     <param name="tf_publish_future_tolerance_s"
-           value="$(eval 0.0 if arg('localization_backend') == 'gazebo_truth' else 0.5)" />
+           value="$(eval 0.20 if arg('localization_backend') == 'gazebo_truth' else 0.5)" />
     <!-- Gazebo truth is already mission-relative and must not be low-pass lagged. -->
     <param name="pose_stabilizer_mode"
            value="$(eval 'trusted_passthrough' if arg('localization_backend') == 'gazebo_truth' else 'filtered_anchored')" />

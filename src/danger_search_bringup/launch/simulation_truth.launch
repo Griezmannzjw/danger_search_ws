@@ -8,8 +8,12 @@
   <arg name="entry_enabled" default="true" />
   <arg name="open_main_entrance" default="true" />
   <arg name="fixed_elevator_hall_enabled" default="false" />
-  <arg name="fixed_elevator_hall_x" default="-2.40" />
-  <arg name="fixed_elevator_hall_y" default="-1.65" />
+  <!-- GazeboTruthCore publishes displacement from SimEnv's public start
+       (0, 5, yaw=pi/2).  The elevator threshold is (1.65, 2.60), so its
+       map-frame hall is (1.65, -2.40) and the relative entry yaw is -pi/2.
+       Formal competition never enables this simulation-only override. -->
+  <arg name="fixed_elevator_hall_x" default="1.65" />
+  <arg name="fixed_elevator_hall_y" default="-2.40" />
   <arg name="fixed_elevator_hall_into_yaw" default="-1.5707963" />
 
   <include file="$(find danger_search_bringup)/launch/system.launch">

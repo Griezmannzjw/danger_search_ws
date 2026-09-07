@@ -822,9 +822,9 @@ class TransitStateMachineTest(unittest.TestCase):
         planner._send_goal.assert_called_once()
         sent_x, sent_y, sent_yaw = planner._send_goal.call_args.args
         self.assertAlmostEqual(sent_x, -2.40)
-        # Fixed mode starts in the open area (1.70 m from the hall), then
-        # dispatches the 1.35 m door-front waypoint after this goal succeeds.
-        self.assertAlmostEqual(sent_y, 0.05)
+        # Fixed mode starts at the nominal 1.35 m stand-off.  Longer fallback
+        # waypoints are tried only when this nearest safe point is unavailable.
+        self.assertAlmostEqual(sent_y, -0.30)
         # Fixed-mode TO_HALL only positions the robot; ALIGN_HALL handles
         # the final elevator heading.
         self.assertAlmostEqual(sent_yaw, 0.0)
@@ -1120,6 +1120,90 @@ class TransitStateMachineTest(unittest.TestCase):
         self.assertEqual(command.linear.x, 0.40)
         self.assertEqual(command.angular.z, 0.0)
         planner._recover_or_fail_crossing.assert_not_called()
+
+    def test_entry_ignores_sector_only_return_inside_current_footprint(self):
+        """A near self/threshold return must not replace the sweep guard."""
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_crossing_direction = 1.0
+        planner.floor_change_crossing_start = (0.0, 0.0)
+        planner.floor_change_crossing_target_m = 1.4
+        planner.floor_change_hall_point = (0.8, 0.0, 0.0)
+        planner.current_pose = ElevatorClosedLoopGeometryTest.pose(
+            0.0, 0.0, 0.0
+        )
+        planner.floor_change_stage_deadline = MODULE.rospy.Time.from_sec(10.0)
+        planner.floor_change_diagnostics = {}
+        planner.last_scan_time = MODULE.rospy.Time.from_sec(0.9)
+        planner.input_timeout = 2.0
+        planner.latest_scan = ElevatorClosedLoopGeometryTest.scan_with_points(
+            ((0.20, 0.0),)
+        )
+        planner.latest_scan.ranges = planner.latest_scan.ranges.tolist()
+        planner.elevator_crossing_clearance_m = 0.32
+        planner.elevator_crossing_lateral_limit_m = 0.2
+        planner.elevator_crossing_heading_abort_rad = 0.35
+        planner.elevator_crossing_heading_stop_rad = 0.12
+        planner.elevator_crossing_speed_mps = 0.40
+        planner.elevator_footprint_min_x = -0.35
+        planner.elevator_footprint_max_x = 0.30
+        planner.elevator_footprint_min_y = -0.15
+        planner.elevator_footprint_max_y = 0.15
+        planner.elevator_footprint_margin_m = 0.08
+        planner.fixed_elevator_hall_enabled = True
+        planner.elevator_cmd_pub = Mock()
+        planner._recover_or_fail_crossing = Mock()
+
+        planner._advance_crossing(MODULE.rospy.Time.from_sec(1.0))
+
+        command = planner.elevator_cmd_pub.publish.call_args.args[0]
+        self.assertAlmostEqual(command.linear.x, 0.40)
+        self.assertEqual(command.angular.z, 0.0)
+        planner._recover_or_fail_crossing.assert_not_called()
+        self.assertTrue(
+            planner.floor_change_diagnostics["crossing_clearance_blocked"]
+        )
+        self.assertIsNone(
+            planner.floor_change_diagnostics.get("crossing_swept_hit")
+        )
+
+    def test_entry_still_stops_for_return_in_future_swept_footprint(self):
+        planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)
+        planner.floor_change_crossing_direction = 1.0
+        planner.floor_change_crossing_start = (0.0, 0.0)
+        planner.floor_change_crossing_target_m = 1.4
+        planner.floor_change_hall_point = (0.8, 0.0, 0.0)
+        planner.current_pose = ElevatorClosedLoopGeometryTest.pose(
+            0.0, 0.0, 0.0
+        )
+        planner.floor_change_stage_deadline = MODULE.rospy.Time.from_sec(10.0)
+        planner.floor_change_diagnostics = {}
+        planner.last_scan_time = MODULE.rospy.Time.from_sec(0.9)
+        planner.input_timeout = 2.0
+        planner.latest_scan = ElevatorClosedLoopGeometryTest.scan_with_points(
+            ((0.80, 0.0),)
+        )
+        planner.latest_scan.ranges = planner.latest_scan.ranges.tolist()
+        planner.elevator_crossing_clearance_m = 0.32
+        planner.elevator_crossing_lateral_limit_m = 0.2
+        planner.elevator_crossing_heading_abort_rad = 0.35
+        planner.elevator_crossing_heading_stop_rad = 0.12
+        planner.elevator_crossing_speed_mps = 0.40
+        planner.elevator_footprint_min_x = -0.35
+        planner.elevator_footprint_max_x = 0.30
+        planner.elevator_footprint_min_y = -0.15
+        planner.elevator_footprint_max_y = 0.15
+        planner.elevator_footprint_margin_m = 0.08
+        planner.elevator_cmd_pub = Mock()
+        planner._recover_or_fail_crossing = Mock()
+
+        planner._advance_crossing(MODULE.rospy.Time.from_sec(1.0))
+
+        planner.elevator_cmd_pub.publish.assert_not_called()
+        planner._recover_or_fail_crossing.assert_called_once()
+        self.assertEqual(
+            planner.floor_change_diagnostics["crossing_swept_hit"],
+            [0.8, 0.0],
+        )
 
     def test_entry_keeps_forward_until_rear_footprint_clears_door(self):
         planner = MODULE.ExplorationPlanner.__new__(MODULE.ExplorationPlanner)

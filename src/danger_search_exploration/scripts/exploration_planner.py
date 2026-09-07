@@ -1021,6 +1021,9 @@ class ExplorationPlanner:
         self.fixed_elevator_front_approach_stall_timeout_s = float(
             rospy.get_param("~fixed_elevator_front_approach_stall_timeout_s", 3.0)
         )
+        self.fixed_elevator_alignment_yaw_tolerance_rad = float(
+            rospy.get_param("~fixed_elevator_alignment_yaw_tolerance_rad", 0.25)
+        )
         self.elevator_car_target_m = float(
             rospy.get_param("~elevator_car_target_m", 1.6)
         )
@@ -1197,6 +1200,7 @@ class ExplorationPlanner:
                 and self.fixed_elevator_front_approach_timeout_s > 0.0
                 and self.fixed_elevator_front_approach_settle_s >= 0.0
                 and self.fixed_elevator_front_approach_stall_timeout_s > 0.0
+                and 0.0 < self.fixed_elevator_alignment_yaw_tolerance_rad < math.pi
                 and self.elevator_service_timeout_s > 0.0
                 and self.elevator_max_retries >= 1
                 and self.floor_change_timeout_s > 0.0
@@ -2205,10 +2209,14 @@ class ExplorationPlanner:
         door_open_confirmed = bool(self.floor_change_diagnostics.get(
             "door_open_confirmed", False
         ))
+        # The 40-degree sector minimum is telemetry only during ENTER/EXIT.
+        # It can be smaller than the actual swept footprint because it may
+        # contain self returns, a threshold return, or a jamb outside the
+        # robot's future footprint.  Only geometric footprint checks should
+        # classify a crossing as blocked.
         geometry_blocked = bool(
             self.floor_change_diagnostics.get("crossing_swept_hit")
             or self.floor_change_diagnostics.get("alignment_rotation_hit")
-            or self.floor_change_diagnostics.get("crossing_clearance_blocked")
         )
         progress = self.floor_change_diagnostics.get("crossing_progress_m")
         if progress is not None:
@@ -4664,10 +4672,13 @@ class ExplorationPlanner:
                     self, "fixed_elevator_pre_align_fallback_count", 2
                 )),
             )
-            distances = [base + step]
-            distances.extend(base + step * (index + 2)
-                             for index in range(max(0, count - 1)))
-            distances.append(base)
+            # Try the nominal stand-off first.  The previous farthest-first
+            # order could select a waypoint behind the robot when the fixed
+            # hall was expressed in the world frame, forcing an unnecessary
+            # reverse/rotate manoeuvre in front of the door.
+            distances = [base]
+            distances.extend(base + step * (index + 1)
+                             for index in range(count))
             return distances
         return [float(getattr(self, "elevator_hall_approach_m", 0.8))]
 
@@ -5059,9 +5070,18 @@ class ExplorationPlanner:
                 self, "fixed_elevator_front_approach_distance_m", 0.35
             )),
         )
+        heading_stop = float(getattr(
+            self, "elevator_crossing_heading_stop_rad", 0.12
+        ))
+        if bool(getattr(self, "fixed_elevator_hall_enabled", False)):
+            heading_stop = max(
+                heading_stop,
+                float(getattr(
+                    self, "fixed_elevator_alignment_yaw_tolerance_rad", 0.25
+                )),
+            )
         if progress >= target_progress:
-            if abs(yaw_error) > float(getattr(
-                    self, "elevator_crossing_heading_stop_rad", 0.12)):
+            if abs(yaw_error) > heading_stop:
                 self.floor_change_front_approach_stable_since = rospy.Time(0)
             else:
                 self._stop_elevator_motion()
@@ -5076,6 +5096,18 @@ class ExplorationPlanner:
                 )
                 if stable_s >= float(getattr(
                         self, "fixed_elevator_front_approach_settle_s", 0.75)):
+                    # The direct approach has consumed part of the original
+                    # outer stand-off.  ALIGN_HALL must validate against the
+                    # remaining distance, otherwise it rejects a physically
+                    # valid front approach by exactly the commanded 0.30 m.
+                    self.floor_change_approach_m = max(
+                        0.10,
+                        float(getattr(
+                            self, "floor_change_hall_front_distance_m",
+                            getattr(self, "floor_change_approach_m", 0.8),
+                        ))
+                        - float(progress),
+                    )
                     self.floor_change_diagnostics.update({
                         "front_approach_command_active": False,
                         "front_approach_safety_blocked": False,
@@ -5139,14 +5171,31 @@ class ExplorationPlanner:
             )
             return
         command = Twist()
-        if abs(yaw_error) <= float(getattr(
-                self, "elevator_crossing_heading_stop_rad", 0.12)):
+        if abs(yaw_error) <= heading_stop:
             command.linear.x = float(getattr(
                 self, "fixed_elevator_front_approach_speed_mps", 0.12
             ))
         else:
             hit = self._rotation_clearance_hit()
             if hit is not None:
+                # A small residual heading error is safe to carry through the
+                # doorway.  Keep translating instead of attempting an
+                # in-place turn whose swept footprint touches the jamb.
+                relaxed = float(getattr(
+                    self, "fixed_elevator_alignment_yaw_tolerance_rad", 0.25
+                ))
+                if abs(yaw_error) <= relaxed:
+                    command.linear.x = float(getattr(
+                        self, "fixed_elevator_front_approach_speed_mps", 0.12
+                    ))
+                    self.floor_change_diagnostics[
+                        "front_approach_rotation_deferred"
+                    ] = True
+                    self.elevator_cmd_pub.publish(command)
+                    self.floor_change_diagnostics[
+                        "front_approach_command_active"
+                    ] = True
+                    return
                 self._stop_elevator_motion()
                 self.floor_change_diagnostics.update({
                     "front_approach_command_active": False,
@@ -5232,7 +5281,15 @@ class ExplorationPlanner:
                 "standoff=%.3f lateral=%.3f" % (stand_off, lateral),
             )
             return
-        if abs(yaw_error) <= self.elevator_alignment_yaw_tolerance_rad:
+        alignment_tolerance = self.elevator_alignment_yaw_tolerance_rad
+        if bool(getattr(self, "fixed_elevator_hall_enabled", False)):
+            alignment_tolerance = max(
+                alignment_tolerance,
+                float(getattr(
+                    self, "fixed_elevator_alignment_yaw_tolerance_rad", 0.25
+                )),
+            )
+        if abs(yaw_error) <= alignment_tolerance:
             self._stop_elevator_motion()
             if self.floor_change_alignment_stable_since == rospy.Time(0):
                 self.floor_change_alignment_stable_since = now
@@ -5354,6 +5411,9 @@ class ExplorationPlanner:
         # These fields describe the current crossing attempt, not a stale
         # obstruction from a previous alignment/recovery retry.
         self.floor_change_diagnostics.pop("crossing_swept_hit", None)
+        self.floor_change_diagnostics.pop(
+            "crossing_min_sector_clearance_m", None
+        )
         self.floor_change_diagnostics.pop("alignment_rotation_hit", None)
         self.floor_change_diagnostics["crossing_clearance_blocked"] = False
         execution_odom = getattr(self, "last_execution_odom", None)
@@ -5489,6 +5549,48 @@ class ExplorationPlanner:
             )
         self.elevator_cmd_pub.publish(command)
 
+    def _crossing_safety_remaining(self, progress):
+        """Return the distance for which a crossing sweep is safety-critical.
+
+        A full ``elevator_crossing_distance_m`` sweep also includes the cabin
+        rear wall.  The safety decision needed while entering/exiting is only
+        whether the trailing edge of the robot can clear the door plane.  Cap
+        the sweep at that point so a valid doorway traversal is not rejected
+        by a return from the cabin interior.
+        """
+        direction = float(self.floor_change_crossing_direction)
+        if direction == 0.0:
+            return 0.0
+        hall_x, hall_y, into_yaw = (
+            float(value) for value in self.floor_change_hall_point
+        )
+        start_x, start_y = (
+            float(value) for value in self.floor_change_crossing_start
+        )
+        axis_x = math.cos(into_yaw)
+        axis_y = math.sin(into_yaw)
+        start_to_door = direction * (
+            (hall_x - start_x) * axis_x
+            + (hall_y - start_y) * axis_y
+        )
+        trailing_extent = (
+            -float(self.elevator_footprint_min_x)
+            if direction > 0.0
+            else float(self.elevator_footprint_max_x)
+        ) + float(self.elevator_footprint_margin_m)
+        rear_clear_progress = max(
+            0.0,
+            start_to_door + trailing_extent,
+        )
+        target_remaining = max(
+            0.0,
+            float(self.floor_change_crossing_target_m) - float(progress),
+        )
+        return max(
+            0.0,
+            min(target_remaining, rear_clear_progress - float(progress)),
+        )
+
     def _advance_crossing(self, now):
         entering = self.floor_change_crossing_direction > 0.0
         failure_code = "ENTER_FAILED" if entering else "EXIT_FAILED"
@@ -5548,7 +5650,7 @@ class ExplorationPlanner:
         window = self._scan_window(self.latest_scan, backward=not entering)
         finite = window[np.isfinite(window)]
         clearance = float(np.min(finite)) if finite.size else float("inf")
-        remaining = max(0.0, self.floor_change_crossing_target_m - progress)
+        remaining = self._crossing_safety_remaining(progress)
         swept_hit = swept_footprint_hit(
             self.latest_scan.ranges,
             self.latest_scan.angle_min,
@@ -5581,12 +5683,13 @@ class ExplorationPlanner:
         self.floor_change_diagnostics["crossing_clearance_blocked"] = bool(
             clearance <= self.elevator_crossing_clearance_m
         )
-        if (clearance <= self.elevator_crossing_clearance_m
-                or swept_hit is not None):
-            if swept_hit is not None:
-                self.floor_change_diagnostics["crossing_swept_hit"] = [
-                    round(swept_hit.x_m, 4), round(swept_hit.y_m, 4)
-                ]
+        self.floor_change_diagnostics[
+            "crossing_min_sector_clearance_m"
+        ] = round(clearance, 4) if math.isfinite(clearance) else None
+        if swept_hit is not None:
+            self.floor_change_diagnostics["crossing_swept_hit"] = [
+                round(swept_hit.x_m, 4), round(swept_hit.y_m, 4)
+            ]
             self._recover_or_fail_crossing(
                 progress, failure_code,
                 "obstacle intersects elevator swept footprint",
